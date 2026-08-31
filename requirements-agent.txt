@@ -1,0 +1,5 @@
+# 로컬 실행 PC 전용 — UI 의존성 + 브라우저 자동화.
+#   .\.venv\Scripts\python.exe -m pip install -r requirements-agent.txt
+#   .\.venv\Scripts\python.exe -m playwright install chromium
+-r requirements.txt
+playwright>=1.46.0

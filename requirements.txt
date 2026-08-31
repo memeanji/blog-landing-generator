@@ -1,0 +1,7 @@
+# Streamlit Community Cloud(=UI/큐 역할)에서 필요한 것만.
+#   화면은 Playwright 를 부르지 않는다(브라우저 자동화는 로컬 에이전트가 한다).
+#   로컬 에이전트를 돌릴 PC 에서는 requirements-agent.txt 를 설치한다.
+streamlit>=1.36
+gspread>=6.1.4
+google-auth>=2.34.0
+python-dotenv>=1.0.1

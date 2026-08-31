@@ -1,0 +1,59 @@
+{
+  "_comment": [
+    "브랜드 목록 = 시트 ID 를 관리하는 유일한 곳. ★브랜드가 늘면 여기에 한 덩어리만 추가하면 된다(코드 수정 없음).",
+    "id                    : 내부 키(영문/숫자/_-). 큐·로그·CLI(--brand)에서 이 값을 쓴다",
+    "label                 : 화면에 보이는 이름(리퓨어리 / 닥터누센트)",
+    "reference_sheet_id    : 블로그 랜딩 기준시트 Spreadsheet ID (매체·결핍·검수용/실전용 랜딩·제품 링크)",
+    "reference_sheet_label : 화면 표시용 시트 이름",
+    "reference_tab         : 기본 기준랜딩 탭. 계정별 탭이 있으면 accounts.json 의 ref_tab 이 우선한다",
+    "utm_sheet_id          : UTM 빌더 Spreadsheet ID (매체별 탭 · 행마다 완성된 최종 제품 URL)",
+    "utm_tab_pattern       : 매체 탭 이름 규칙. {media} 자리에 매체(카카오모먼트/GFA/메타/틱톡)가 들어간다",
+    "utm_media_tabs        : 규칙으로 안 되는 매체만 탭 이름을 직접 지정 (예: {\"GFA\": \"GFA 블로그랜딩\"})",
+    "headers               : UTM 빌더 컬럼명이 다를 때만 채운다. 비우면 리퓨어리와 같은 헤더를 쓴다.",
+    "                        키: link(블로그 링크) · media · date · seq · product(링크) · campaign(utm_campaign)",
+    "                        · product_def(제품_결핍) · changed(블로그 최하단 제품 링크 변경) · production(실전용 블로그 링크)",
+    "enabled               : false 면 화면 목록에서 감춘다",
+    "ready                 : false 면 화면에 '준비 중' 으로 보이고 실행 버튼이 잠긴다. 준비가 끝나면 true 로만 바꾸면 된다",
+    "status_note           : 준비 중인 이유(화면에 그대로 표시된다)",
+    "site                  : 브랜드 공식 사이트(참고용 메모. 화면·실행에는 쓰지 않는다)",
+    "★이 파일은 예시다. 실제 brands.json 은 .gitignore 로 제외된다(구글 시트 ID 가 들어간다).",
+    "로컬  : 이 파일을 brands.json 으로 복사한 뒤 실제 시트 ID 를 채운다.",
+    "클라우드: Secrets 에 BLOG_BRANDS_JSON = <이 파일과 같은 JSON> 을 넣으면 파일 없이 동작한다."
+  ],
+  "brands": [
+    {
+      "id": "repurely",
+      "label": "리퓨어리",
+      "reference_sheet_id": "<기준시트 Spreadsheet ID>",
+      "reference_sheet_label": "리퓨어리 블로그 랜딩 기준시트",
+      "reference_tab": "스마일 현미 기준랜딩",
+      "utm_sheet_id": "<UTM 빌더 Spreadsheet ID>",
+      "utm_sheet_label": "리퓨어리 UTM 빌더",
+      "site": "https://repurely.com/",
+      "utm_tab_pattern": "{media} 블로그 랜딩 UTM 빌더",
+      "utm_media_tabs": {},
+      "headers": {},
+      "enabled": true,
+      "ready": true,
+      "status_note": "",
+      "note": "실제 시트 ID 로 채우세요"
+    },
+    {
+      "id": "doctor_nuscent",
+      "label": "닥터누센트",
+      "reference_sheet_id": "<기준시트 Spreadsheet ID>",
+      "reference_sheet_label": "닥터누센트 블로그 랜딩 기준시트",
+      "reference_tab": "시트1",
+      "utm_sheet_id": "<UTM 빌더 Spreadsheet ID>",
+      "utm_sheet_label": "닥터누센트 UTM 빌더",
+      "site": "https://drnussent.com/",
+      "utm_tab_pattern": "{media} 블로그 랜딩 UTM 빌더",
+      "utm_media_tabs": {},
+      "headers": {},
+      "enabled": true,
+      "ready": false,
+      "status_note": "기준시트 미완성 · UTM 빌더 서비스 계정 권한 추가 예정",
+      "note": "실제 시트 ID 로 채우세요"
+    }
+  ]
+}

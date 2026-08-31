@@ -1,0 +1,67 @@
+# ══════════════════════════════════════════════════════════════
+# 비밀정보 · 로컬 전용 — 절대 커밋 금지
+# ══════════════════════════════════════════════════════════════
+# 환경설정(서비스계정 경로 등)
+.env
+*.env
+!.env.example
+
+# 구글 서비스계정 키 (어떤 이름이든)
+*service*account*.json
+*service-account*.json
+*credential*.json
+*-key.json
+*.pem
+*.p12
+
+# 네이버 로그인 세션(쿠키)·브라우저 프로필
+sessions/
+playwright-profile/
+*profile*/
+
+# 계정 목록 — 운영 계정 식별자가 들어간다(기준랜딩 탭에서 자동 생성되므로 없어도 된다)
+accounts.json
+!accounts.example.json
+
+# 브랜드 설정 — 실제 구글 시트 ID 가 들어간다. 공개 저장소에 두지 않는다.
+#   배포할 때는 Secrets 의 BLOG_BRANDS_JSON 으로 넣는다(brands.example.json 참고).
+brands.json
+!brands.example.json
+
+# 로컬 작업 큐(실행 기록·로그·배치 계획)
+queue/
+
+# 실행 로그 · 스크린샷 · 시트 캐시
+out/
+logs/
+*.log
+
+# ══════════════════════════════════════════════════════════════
+# 파이썬 · 빌드 · 작업 흔적
+# ══════════════════════════════════════════════════════════════
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.spec
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# 작업 중 만든 백업본(*.bak-YYYYMMDD… · *.bak2-… )과 임시 스크립트
+*.bak*
+*.tmp
+*.tmp[0-9]*
+scratch_*.py
+
+# OS·에디터
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+
+# Streamlit 로컬 비밀값(클라우드는 대시보드에서 넣는다)
+.streamlit/secrets.toml
