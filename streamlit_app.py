@@ -219,7 +219,12 @@ def my_device(store) -> dict | None:
         if dev:
             st.session_state["device_id"] = dev["device_id"]
             return dev
-    # 로컬 모드 편의 — 이 PC 에서 도는 Agent 가 하나면 그것을 쓴다
+    # 자동으로 잡아 주는 건 **내 PC 에서 띄운 화면**일 때만이다.
+    #   ★서버 화면에서도 이렇게 했더니, 팀 비밀번호만 아는 사람이 들어와
+    #     [실행] 을 누르면 **남의 PC 에서 그 사람 네이버 계정으로** 글이 올라갔다.
+    #     서버 화면에서는 아래 '어느 PC 에서 돌릴지' 를 직접 고르게 한다.
+    if not sys.platform.startswith("win"):
+        return None
     alive = [a for a in store.agents(max_age_sec=30)
              if a.get("alive") and a.get("state") != "stopped"]
     if len(alive) == 1:
@@ -279,6 +284,25 @@ def render_agent_panel(store) -> dict | None:
         st.caption("그 PC 를 켜고 작업표시줄에 **블로그 랜딩 Agent** 가 있는지 "
                    "확인해 주세요.")
         return dev
+
+    # 이미 등록된 PC 가 있으면, 그중 내 PC 를 고르게 한다(한 번 고르면 기억한다)
+    known = [a for a in store.agents(max_age_sec=30)
+             if a.get("state") != "stopped"]
+    if known:
+        st.info("어느 PC 에서 돌릴지 골라 주세요.")
+        def _name(a):
+            mark = "🟢" if a.get("alive") else "🔴"
+            return f"{mark} {a.get('label') or a.get('host') or a.get('agent')}"
+        pick = st.selectbox("내 PC", known, format_func=_name,
+                            index=None, placeholder="PC 선택",
+                            key="device_pick")
+        if pick is not None and st.button("이 PC 로 연결", use_container_width=True,
+                                          type="primary"):
+            link_device(pick["agent"])
+            st.rerun()
+        st.caption("한 번 고르면 이 브라우저는 계속 그 PC 를 씁니다. "
+                   "**내 PC 가 목록에 없으면** 아래에서 설치하고 연결해 주세요.")
+        st.divider()
 
     st.error("🔴 Agent 연결 안 됨")
     st.link_button("⬇ Windows Agent 설치", AGENT_DOWNLOAD_URL,
@@ -723,10 +747,13 @@ if _gap:
              "**Settings → Secrets** 에 다음 항목을 넣고 저장해 주세요 → "
              + ", ".join(f"`{k}`" for k in _gap))
 elif not agent_ready:
-    st.warning("⚠ **이 컴퓨터에 Agent 가 연결돼 있지 않습니다.**"
-               f"{chr(10)}{chr(10)}실행하려면 컴퓨터마다 **한 번만** Agent 를 설치해야 합니다. "
-               "왼쪽 **[⬇ Windows Agent 설치]** → 설치 → **[연결 코드 받기]** 의 6자리 입력. "
-               "자세한 방법은 위 **도움말**을 펼쳐 보세요.")
+    st.warning("⚠ **아직 어느 PC 에서 돌릴지 정해지지 않았습니다.**"
+               f"{chr(10)}{chr(10)}왼쪽 **내 PC** 에서 본인 컴퓨터를 고르세요. "
+               "목록에 없으면 그 컴퓨터에 Agent 를 **한 번만** 설치하면 됩니다 — "
+               "**[⬇ Windows Agent 설치]** → 설치 → **[연결 코드 받기]** 의 6자리 입력. "
+               "자세한 방법은 위 **도움말**을 펼쳐 보세요."
+               f"{chr(10)}{chr(10)}※ 다른 사람 PC 를 고르면 **그 사람 컴퓨터에서 "
+               "그 사람 네이버 계정으로** 글이 올라갑니다. 꼭 본인 PC 를 고르세요.")
 
 left, right = st.columns([3, 2], gap="large")
 
