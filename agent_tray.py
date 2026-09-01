@@ -232,6 +232,58 @@ def install_chromium(notify=None) -> bool:
 # ══════════════════════════════════════════════════════════════════
 # 대화상자 (tkinter — 파이썬 기본 포함)
 # ══════════════════════════════════════════════════════════════════
+class Gui:
+    """창을 담당하는 스레드. 프로그램이 켜져 있는 동안 하나만 산다.
+
+    ★tkinter 는 창을 만든 스레드에서만 그 창을 다룰 수 있다. 창을 열 때마다
+      새 스레드에서 새로 만들었더니 **글씨가 안 써지는** 일이 생겼다
+      (창은 그려지는데 키 입력 처리가 제대로 안 붙는다).
+      여기서는 스레드 하나를 계속 두고 모든 창을 그 안에서만 만든다.
+    """
+
+    def __init__(self) -> None:
+        self.ready = threading.Event()
+        self.root = None
+        threading.Thread(target=self._run, daemon=True, name="gui").start()
+        self.ready.wait(20)
+
+    def _run(self) -> None:
+        import tkinter as tk
+
+        try:
+            self.root = tk.Tk()
+            self.root.withdraw()                 # 이 창 자체는 안 보인다
+            self.ready.set()
+            self.root.mainloop()
+        except Exception as exc:                                # noqa: BLE001
+            log(f"[창] 창 담당 스레드가 멈췄습니다: {type(exc).__name__}: {exc}")
+            self.ready.set()
+
+    def call(self, fn, *args, timeout: float = 900):
+        """창 담당 스레드에서 `fn` 을 실행하고 결과를 받아 온다."""
+        if self.root is None:
+            raise RuntimeError("창을 띄울 수 없습니다.")
+        box, done = {}, threading.Event()
+
+        def run():
+            try:
+                box["value"] = fn(*args)
+            except Exception as exc:                            # noqa: BLE001
+                box["error"] = exc
+            finally:
+                done.set()
+
+        self.root.after(0, run)
+        if not done.wait(timeout):
+            raise RuntimeError("창이 응답하지 않습니다.")
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+
+GUI = Gui()
+
+
 def _force_foreground(win) -> None:
     """만든 창이 **키보드 입력을 실제로 받도록** 앞으로 끌어온다.
 
@@ -261,7 +313,9 @@ def _force_foreground(win) -> None:
         front = user32.GetForegroundWindow()
         tid_front = user32.GetWindowThreadProcessId(front, None)
         tid_mine = kernel32.GetCurrentThreadId()
-        attached = bool(user32.AttachThreadInput(tid_front, tid_mine, True))
+        # 같은 스레드끼리는 이 방법이 규칙상 실패한다(그래서 예전에 안 먹었다)
+        attached = (tid_front != tid_mine
+                    and bool(user32.AttachThreadInput(tid_front, tid_mine, True)))
         user32.BringWindowToTop(hwnd)
         user32.SetForegroundWindow(hwnd)
         user32.SetActiveWindow(hwnd)
@@ -276,11 +330,18 @@ def _prompt(message: str, *, initial: str = "", digits: int = 0,
     """한 줄 입력창. 취소하거나 창을 닫으면 빈 문자열을 돌려준다.
 
     `digits` 를 주면 그 자릿수의 숫자만 받는다(다른 글자는 자동으로 걸러진다).
+    실제 창은 **창 담당 스레드**에서 만든다(그래야 키 입력이 정상으로 먹는다).
     """
+    return GUI.call(_prompt_ui, message, initial, digits, hint, allow_empty)
+
+
+def _prompt_ui(message: str, initial: str, digits: int,
+               hint: str, allow_empty: bool) -> str:
+    """★창 담당 스레드에서만 부른다."""
     import tkinter as tk
     from tkinter import ttk
 
-    win = tk.Tk()
+    win = tk.Toplevel(GUI.root)
     win.title(APP_NAME)
     win.resizable(False, False)
     try:
@@ -327,9 +388,11 @@ def _prompt(message: str, *, initial: str = "", digits: int = 0,
             entry.focus_force()
             return
         result[0] = value
+        log("[입력창] 확인 — 값 받음")
         win.destroy()
 
     def cancel(*_):
+        log(f"[입력창] 취소 — 그때 글자 수 {len(var.get())}")
         win.destroy()
 
     def paste(*_):
@@ -353,6 +416,22 @@ def _prompt(message: str, *, initial: str = "", digits: int = 0,
             entry.select_range(0, "end")
             return "break"
         return None
+
+    # ── 원인 파악용 기록 ──────────────────────────────────────
+    #    키가 창까지 오는지 / 와서도 글자가 안 들어가는지를 가른다.
+    def spy(event):
+        try:
+            log(f"[입력] 키={event.keysym!r} 글자={event.char!r} "
+                f"코드={event.keycode} · 칸={var.get()!r} "
+                f"· 초점={str(win.focus_get())!r}")
+        except Exception:                                      # noqa: BLE001
+            pass
+
+    if os.getenv("BLOG_TRAY_DEBUG"):        # 문제를 볼 때만 켠다
+        entry.bind("<KeyPress>", spy, add="+")
+        win.bind("<KeyPress>", lambda e: log(f"[입력·창] 키={e.keysym!r}"), add="+")
+    log(f"[입력창] 열림 · 상태={entry.cget('state')!r} "
+        f"· 종류={entry.winfo_class()}")
 
     entry.bind("<Control-KeyPress>", on_ctrl)
     entry.bind("<<Paste>>", paste)
@@ -393,7 +472,12 @@ def _prompt(message: str, *, initial: str = "", digits: int = 0,
                 pass
 
     win.bind("<Destroy>", stop_grabbing)
-    win.mainloop()
+    win.transient(GUI.root)
+    try:
+        win.grab_set()                       # 이 창을 쓰는 동안 다른 창은 잠근다
+    except Exception:                                          # noqa: BLE001
+        pass
+    win.wait_window()                        # 닫힐 때까지 여기서 기다린다
     return result[0]
 
 
@@ -410,27 +494,21 @@ def ask_name(default: str = "") -> str:
 
 
 def ask_file(title: str) -> str:
-    import tkinter as tk
-    from tkinter import filedialog
+    def ui():
+        from tkinter import filedialog
 
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    path = filedialog.askopenfilename(title=title, parent=root,
-                                      filetypes=[("JSON 파일", "*.json")])
-    root.destroy()
-    return path or ""
+        return filedialog.askopenfilename(title=title, parent=GUI.root,
+                                          filetypes=[("JSON 파일", "*.json")])
+    return GUI.call(ui) or ""
 
 
 def show(title: str, body: str) -> None:
-    import tkinter as tk
-    from tkinter import messagebox
+    def ui():
+        from tkinter import messagebox
 
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    messagebox.showinfo(title, body, parent=root)
-    root.destroy()
+        GUI.root.attributes("-topmost", True)
+        messagebox.showinfo(title, body, parent=GUI.root)
+    GUI.call(ui)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -448,6 +526,32 @@ def pair_hint(exc: Exception) -> str:
     if "connect" in text or "timeout" in text or "resolve" in text:
         return "인터넷 연결을 확인해 주세요."
     return f"{exc}"
+
+
+def already_running() -> bool:
+    """이미 이 프로그램이 돌고 있으면 True.
+
+    ★아이콘이 여러 개 뜨면 어느 것이 최신인지 알 수 없어 아주 헷갈린다
+      (실제로 옛 아이콘을 눌러 '고쳤는데 그대로' 로 보인 적이 있다).
+      윈도우에 이름표를 하나 걸어 두고, 이미 있으면 새로 뜨지 않는다.
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import ctypes
+
+        # use_last_error 를 켜야 오류번호를 제대로 읽는다(안 그러면 지워진다)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                          ctypes.c_wchar_p]
+        # 이름표는 프로세스가 죽으면 자동으로 없어진다
+        handle = kernel32.CreateMutexW(None, 0, "BlogLandingAgent_single")
+        err = ctypes.get_last_error()
+        globals()["_SINGLE_LOCK"] = handle          # 살아 있는 동안 붙잡아 둔다
+        return err == 183                           # 183 = 이미 있음
+    except Exception:                                          # noqa: BLE001
+        return False
 
 
 def promote_tray_icon() -> bool:
@@ -501,6 +605,7 @@ class TrayAgent:
         self.icon = None
         self.stop = threading.Event()
         self.worker: threading.Thread | None = None
+        self.dialog_open = False       # 창이 두 개 겹쳐 뜨지 않게
 
     # ── 상태 ────────────────────────────────────────────────────
     def connected(self) -> bool:
@@ -521,6 +626,30 @@ class TrayAgent:
         return "\n".join(lines)
 
     # ── 메뉴 동작 ───────────────────────────────────────────────
+    def _dialog(self, flow, *args) -> None:
+        """대화상자는 **메뉴 처리와 분리된 스레드**에서 연다.
+
+        pystray 는 메뉴를 닫자마자 자기 창을 맨 앞에 둔 채 이 함수를 부른다.
+        그 안에서 창을 만들면 초점을 넘겨받지 못해 **커서만 깜빡이고 글씨가
+        안 써진다**. 여기서 스레드를 갈라 두면 메뉴 처리가 먼저 끝나고,
+        창은 정상적으로 키보드를 받는다.
+        """
+        if self.dialog_open:
+            log("[트레이] 이미 열려 있는 창이 있습니다.")
+            return
+
+        def run():
+            self.dialog_open = True
+            try:
+                time.sleep(0.2)          # 메뉴가 완전히 닫히기를 기다린다
+                flow(*args)
+            except Exception as exc:                           # noqa: BLE001
+                log(f"[트레이] 창 처리 중 오류: {type(exc).__name__}: {exc}")
+            finally:
+                self.dialog_open = False
+
+        threading.Thread(target=run, daemon=True, name="tray-dialog").start()
+
     def on_status(self, *_):
         show(APP_NAME, self.status_text())
 
@@ -660,10 +789,14 @@ class TrayAgent:
 
         def menu_items():
             return pystray.Menu(
-                pystray.MenuItem("상태 보기", self.on_status, default=True),
-                pystray.MenuItem("이 PC 연결(6자리 코드)", self.on_pair),
-                pystray.MenuItem("PC 이름 바꾸기…", self.on_rename),
-                pystray.MenuItem("구글 시트 인증 파일…", self.on_google),
+                pystray.MenuItem("상태 보기",
+                                 lambda *_: self._dialog(self.on_status), default=True),
+                pystray.MenuItem("이 PC 연결(6자리 코드)",
+                                 lambda *_: self._dialog(self.on_pair)),
+                pystray.MenuItem("PC 이름 바꾸기…",
+                                 lambda *_: self._dialog(self.on_rename)),
+                pystray.MenuItem("구글 시트 인증 파일…",
+                                 lambda *_: self._dialog(self.on_google)),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("로그 폴더 열기", self.on_logs),
                 pystray.MenuItem("윈도우 시작 시 자동 실행", self.on_autostart,
@@ -673,7 +806,8 @@ class TrayAgent:
             )
 
         self.icon = pystray.Icon("blog_landing_agent", make_icon(self.connected()),
-                                 f"{APP_NAME} 실행 중", menu_items())
+                                 os.getenv("BLOG_TRAY_TAG")
+                                 or f"{APP_NAME} 실행 중", menu_items())
 
         def setup(icon):
             icon.visible = True
@@ -703,6 +837,9 @@ class TrayAgent:
 
 
 def main() -> int:
+    if already_running():
+        log("[트레이] 이미 실행 중입니다 — 새로 띄우지 않습니다.")
+        return 0
     return TrayAgent().run()
 
 
