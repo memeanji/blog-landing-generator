@@ -26,6 +26,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent          # blog_landing_generator/
 BRANDS_PATH = ROOT / "brands.json"
+NL = chr(10)
 
 # UTM 빌더 탭 이름 규칙 — 리퓨어리 실측(`카카오모먼트 블로그 랜딩 UTM 빌더`).
 DEFAULT_UTM_TAB_PATTERN = "{media} 블로그 랜딩 UTM 빌더"
@@ -267,9 +268,17 @@ def load_brands(path: Path | str | None = None,
     if not p.exists():
         if strict:
             raise BrandConfigError(
-                f"브랜드 설정 파일이 없습니다: {p}{chr(10)}"
-                f"       브랜드마다 기준시트/UTM 빌더가 달라 임의로 대체할 수 없습니다. "
-                f"파일을 복구한 뒤 다시 열어 주세요.")
+                f"브랜드 설정을 찾지 못했습니다.{NL}"
+                f"       · 파일 : {p} (없음){NL}"
+                f"       · Secrets/환경변수 : BLOG_BRANDS_JSON (비어 있음){NL}{NL}"
+                f"       브랜드마다 기준시트/UTM 빌더가 달라 "
+                f"임의의 기본값으로 대체하지 않습니다.{NL}"
+                f"       · 로컬            : brands.example.json 을 "
+                f"brands.json 으로 복사해 시트 ID 를 채우세요.{NL}"
+                f"       · Streamlit Cloud : 앱 Settings → Secrets 에 "
+                f"BLOG_BRANDS_JSON 을 넣으세요{NL}"
+                f"                           (brands.json 은 시트 ID 때문에 "
+                f"저장소에 올리지 않습니다).")
     else:
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
