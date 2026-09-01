@@ -327,7 +327,8 @@ class LocalStore(JobStore):
         """agents() 중 이 device 하나(화면의 '내 PC Agent' 표시용)."""
         for a in self.agents(max_age_sec=60):
             if a.get("agent") == device_id:
-                return {"device_id": a.get("agent"), "label": a.get("host") or "",
+                return {"device_id": a.get("agent"),
+                        "label": a.get("label") or a.get("host") or "",
                         "state": a.get("state") or "idle", "alive": bool(a.get("alive")),
                         "version": a.get("version", ""), "last_seen": a.get("at", "")}
         return None

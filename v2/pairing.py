@@ -143,12 +143,48 @@ def pair_with_code(code: str, label: str = "") -> dict:
     return data
 
 
+def rename(label: str) -> tuple[bool, str]:
+    """화면에 보일 이 PC 이름을 바꾼다.
+
+    · 로컬 모드  — device.json 만 고치면 끝난다.
+    · 원격 모드  — 하트비트가 이름을 함께 보내므로 다음 하트비트(몇 초)에 반영된다.
+                   (서버에 `rename_device` 함수가 있으면 즉시 반영한다)
+    """
+    label = (label or "").strip()
+    if not label:
+        return False, "이름이 비어 있습니다."
+    dev = load_device()
+    if not dev:
+        return False, "아직 연결되지 않았습니다."
+    dev["label"] = label
+    save_device(dev)
+    if dev.get("mode") != "supabase":
+        return True, "화면을 새로고침하면 바뀐 이름이 보입니다."
+
+    try:                                   # 서버에 즉시 반영(함수가 있을 때만)
+        import requests
+
+        cfg = _config()
+        r = requests.post(f"{cfg['url'].rstrip('/')}/rest/v1/rpc/rename_device",
+                          headers={"apikey": cfg["key"],
+                                   "Authorization": f"Bearer {cfg['key']}",
+                                   "Content-Type": "application/json"},
+                          json={"p_token": dev.get("device_token"), "p_label": label},
+                          timeout=15)
+        if r.ok:
+            return True, "화면에 바로 반영됩니다."
+    except Exception:                                          # noqa: BLE001
+        pass
+    return True, "다음 연결 신호(몇 초 뒤)에 화면 이름이 바뀝니다."
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="이 PC 를 화면(Streamlit)과 연결한다")
     p.add_argument("--code", help="화면에 뜬 6자리 페어링 코드")
     p.add_argument("--label", default="", help="PC 이름(기본: 컴퓨터 이름)")
     p.add_argument("--status", action="store_true", help="연결 상태 보기")
     p.add_argument("--reset", action="store_true", help="연결 해제(토큰 삭제)")
+    p.add_argument("--rename", metavar="이름", help="화면에 보일 이 PC 이름 바꾸기")
     args = p.parse_args(argv)
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -158,6 +194,10 @@ def main(argv=None) -> int:
     if args.reset:
         print("연결 해제:", "완료" if clear_device() else "연결된 적이 없습니다")
         return 0
+    if args.rename:
+        okay, msg = rename(args.rename)
+        print(("이름 변경 완료 — " if okay else "실패 — ") + msg)
+        return 0 if okay else 1
     if args.status or not args.code:
         cfg, dev = _config(), load_device()
         print(f"접속 설정 : {'있음' if cfg['url'] and cfg['key'] else '없음'} "

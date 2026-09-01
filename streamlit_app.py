@@ -33,7 +33,7 @@ from v2 import (accounts, batch_plan, brands, catalog, landing_sheet,  # noqa: E
                 queue_store, session_store, sheets)
 from v2.job import FLOWS, KINDS, PROD_MODES, Job, python_exe              # noqa: E402
 
-st.set_page_config(page_title="블로그 랜딩 생성기", page_icon="📝", layout="wide")
+st.set_page_config(page_title="시리즈빌더", page_icon="📝", layout="wide")
 
 # ── 표시용 CSS (기능과 무관) ──────────────────────────────────────
 #   · 제목은 기본보다 살짝 작게
@@ -224,7 +224,8 @@ def my_device(store) -> dict | None:
              if a.get("alive") and a.get("state") != "stopped"]
     if len(alive) == 1:
         a = alive[0]
-        return {"device_id": a["agent"], "label": a.get("host") or a["agent"],
+        return {"device_id": a["agent"],
+                "label": a.get("label") or a.get("host") or a["agent"],
                 "state": a.get("state", "idle"), "alive": True,
                 "version": a.get("version", ""), "last_seen": a.get("at", "")}
     return None

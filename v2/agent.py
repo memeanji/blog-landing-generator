@@ -133,7 +133,8 @@ def serve(store: JobStore, agent_id: str, once: bool = False,
         while True:
             if time.time() - last_beat > HEARTBEAT_SEC:
                 store.heartbeat(agent_id, pid=os.getpid(), state="idle",
-                                version=pairing.AGENT_VERSION)
+                                version=pairing.AGENT_VERSION,
+                                label=pairing.load_device().get("label", ""))
                 last_beat = time.time()
             rec = store.claim(agent_id)
             if rec is None:

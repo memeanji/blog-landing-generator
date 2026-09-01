@@ -228,6 +228,24 @@ def ask_code() -> str:
     return (code or "").strip()
 
 
+def ask_name(default: str = "") -> str:
+    """이 PC 를 화면에서 어떻게 부를지. 비워 두면 컴퓨터 이름을 쓴다."""
+    import tkinter as tk
+    from tkinter import simpledialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    name = simpledialog.askstring(
+        APP_NAME,
+        "이 컴퓨터를 화면에서 어떻게 표시할까요?\n"
+        "(예: 민지 사무실 PC · 집 노트북)\n"
+        "비워 두면 컴퓨터 이름을 씁니다.",
+        initialvalue=default, parent=root)
+    root.destroy()
+    return (name or "").strip()
+
+
 def ask_file(title: str) -> str:
     import tkinter as tk
     from tkinter import filedialog
@@ -300,14 +318,33 @@ class TrayAgent:
         code = ask_code()
         if not code:
             return
+        import socket
+
+        name = ask_name(pairing.load_device().get("label") or socket.gethostname())
         try:
-            data = pairing.pair_with_code(code)
+            data = pairing.pair_with_code(code, label=name)
             show(APP_NAME, f"연결됐습니다.\n\nPC: {data['label']}\n"
                            f"이제 화면에서 실행하면 이 컴퓨터에서 돕니다.")
             log(f"[연결] {data['label']} · {data['device_id'][:8]}")
             self.restart_worker()
         except Exception as exc:                               # noqa: BLE001
             show(APP_NAME, f"연결하지 못했습니다.\n\n{exc}")
+
+    def on_rename(self, *_):
+        """연결한 뒤에도 화면에 보일 이름을 바꾼다."""
+        import socket
+
+        dev = pairing.load_device()
+        if not dev:
+            show(APP_NAME, "아직 연결되지 않았습니다.\n"
+                           "먼저 '이 PC 연결(6자리 코드)' 을 해 주세요.")
+            return
+        name = ask_name(dev.get("label") or socket.gethostname())
+        if not name:
+            return
+        okay, msg = pairing.rename(name)
+        show(APP_NAME, f"이름을 '{name}' 으로 바꿨습니다.\n\n{msg}")
+        log(f"[이름] {name} — {msg}")
 
     def on_google(self, *_):
         path = ask_file("구글 서비스계정 JSON 파일 선택")
@@ -393,6 +430,7 @@ class TrayAgent:
             return pystray.Menu(
                 pystray.MenuItem("상태 보기", self.on_status, default=True),
                 pystray.MenuItem("이 PC 연결(6자리 코드)", self.on_pair),
+                pystray.MenuItem("PC 이름 바꾸기…", self.on_rename),
                 pystray.MenuItem("구글 시트 인증 파일…", self.on_google),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("로그 폴더 열기", self.on_logs),

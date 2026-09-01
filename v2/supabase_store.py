@@ -271,6 +271,14 @@ class SupabaseStore(JobStore):
                       {"p_state": info.get("state") or "idle",
                        "p_job": info.get("job") or None,
                        "p_version": str(info.get("version") or "")})
+            # 이름이 바뀌었으면 함께 알린다(서버에 함수가 있을 때만 동작)
+            label = str(info.get("label") or "")
+            if label and label != getattr(self, "_last_label", ""):
+                try:
+                    self._rpc("rename_device", {"p_label": label})
+                    self._last_label = label
+                except Exception:                              # noqa: BLE001
+                    self._last_label = label
         except Exception:                                      # noqa: BLE001
             pass
 
