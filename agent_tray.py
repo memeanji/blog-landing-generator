@@ -29,6 +29,7 @@ from pathlib import Path
 APP_NAME = "블로그 랜딩 Agent"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "BlogLandingAgent"
+NOTIFY_KEY = r"Control Panel\NotifyIconSettings"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -103,14 +104,30 @@ LOG_FILE = LOG_DIR / "agent_tray.log"
 _events: "queue.Queue[str]" = queue.Queue()
 
 
+# 콘솔이 cp949 여도 한글·기호가 깨지지 않게(설치본은 콘솔이 아예 없을 수도 있다)
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
 def log(msg: str) -> None:
+    """어떤 경우에도 예외를 내지 않는다.
+
+    ★예전에는 cp949 콘솔에서 `-` 같은 특수문자를 찍다가 UnicodeEncodeError 가 나서
+      **작업을 감시하는 스레드가 그대로 죽었다**(그래서 실행을 눌러도 반응이 없었다).
+    """
     line = f"{time.strftime('%H:%M:%S')} {msg}"
     try:
         with LOG_FILE.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except Exception:                                          # noqa: BLE001
         pass
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except Exception:                                          # noqa: BLE001
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -273,6 +290,39 @@ def show(title: str, body: str) -> None:
 # ══════════════════════════════════════════════════════════════════
 # 트레이
 # ══════════════════════════════════════════════════════════════════
+def promote_tray_icon() -> bool:
+    """윈도우 11 은 새 트레이 아이콘을 **숨김(^) 영역**에 넣는다.
+
+    사용자가 아이콘을 못 찾는 일이 잦아, 이 앱 항목만 '항상 표시' 로 돌려 둔다.
+    (다른 앱 설정은 건드리지 않는다. 실패해도 그냥 넘어간다.)
+    """
+    try:
+        import winreg
+
+        exe = sys.executable.casefold()
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, NOTIFY_KEY) as root:
+            i = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(root, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    with winreg.OpenKey(root, name, 0,
+                                        winreg.KEY_READ | winreg.KEY_SET_VALUE) as k:
+                        path, _ = winreg.QueryValueEx(k, "ExecutablePath")
+                        if str(path).casefold() != exe:
+                            continue
+                        winreg.SetValueEx(k, "IsPromoted", 0, winreg.REG_DWORD, 1)
+                        return True
+                except Exception:                              # noqa: BLE001
+                    continue
+    except Exception:                                          # noqa: BLE001
+        pass
+    return False
+
+
 def make_icon(connected: bool):
     from PIL import Image, ImageDraw
 
@@ -393,10 +443,16 @@ class TrayAgent:
         self.worker.start()
 
     def _serve(self) -> None:
+        try:
+            self._serve_loop()
+        except Exception as exc:                               # noqa: BLE001
+            log(f"[에이전트] 스레드가 멈췄습니다: {type(exc).__name__}: {exc}")
+
+    def _serve_loop(self) -> None:
         dev = pairing.apply_env()
         agent_id = dev.get("device_id") or host_name()
         store = get_store()
-        log(f"[에이전트] 시작 — {agent_id} · 큐={type(store).__name__}")
+        log(f"[에이전트] 시작 - {agent_id} · 큐={type(store).__name__}")
         while not self.stop.is_set():
             try:
                 serve(store, agent_id, once=True, poll=2.0, quiet=True)
@@ -445,6 +501,13 @@ class TrayAgent:
 
         def setup(icon):
             icon.visible = True
+            promote_tray_icon()                    # 숨김 영역에 묻히지 않게
+            try:                                   # 실행 중임을 한 번 알려 준다
+                icon.notify("실행 중입니다. 작업표시줄 오른쪽 아이콘에서 "
+                            "'이 PC 연결' 을 눌러 주세요.", APP_NAME)
+            except Exception:                      # noqa: BLE001
+                pass
+            log("[트레이] 아이콘 표시 완료")
             threading.Thread(target=install_chromium, daemon=True,
                              args=(lambda m: log(f"[크롬] {m}"),)).start()
             self.restart_worker()
