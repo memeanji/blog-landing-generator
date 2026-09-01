@@ -232,35 +232,181 @@ def install_chromium(notify=None) -> bool:
 # ══════════════════════════════════════════════════════════════════
 # 대화상자 (tkinter — 파이썬 기본 포함)
 # ══════════════════════════════════════════════════════════════════
-def ask_code() -> str:
-    import tkinter as tk
-    from tkinter import simpledialog
+def _force_foreground(win) -> None:
+    """만든 창이 **키보드 입력을 실제로 받도록** 앞으로 끌어온다.
 
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    code = simpledialog.askstring(
-        APP_NAME, "화면에 뜬 6자리 연결 코드를 입력하세요.", parent=root)
-    root.destroy()
-    return (code or "").strip()
+    윈도우는 지금 쓰고 있지 않은 프로그램이 화면 앞을 제멋대로 차지하지 못하게
+    막는다. 트레이 아이콘에서 연 창이 여기 걸리면 **창은 보이고 커서도 깜빡이는데
+    글씨는 안 써지는** 상태가 된다(예전 증상). 그 잠금을 정식 절차로 풀어 준다.
+    """
+    try:
+        win.update_idletasks()
+        win.deiconify()
+        win.lift()
+        win.attributes("-topmost", True)
+        win.focus_force()
+    except Exception:                                          # noqa: BLE001
+        pass
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+
+        user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+        hwnd = int(win.wm_frame(), 16)
+        # ① ALT 를 살짝 눌렀다 떼면 윈도우가 "사용자가 조작 중" 으로 보고 잠금을 푼다
+        user32.keybd_event(0x12, 0, 0, 0)
+        user32.keybd_event(0x12, 0, 2, 0)
+        # ② 지금 앞에 있는 창과 입력을 잠깐 묶어 두고 초점을 넘겨받는다
+        front = user32.GetForegroundWindow()
+        tid_front = user32.GetWindowThreadProcessId(front, None)
+        tid_mine = kernel32.GetCurrentThreadId()
+        attached = bool(user32.AttachThreadInput(tid_front, tid_mine, True))
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        user32.SetActiveWindow(hwnd)
+        if attached:
+            user32.AttachThreadInput(tid_front, tid_mine, False)
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+def _prompt(message: str, *, initial: str = "", digits: int = 0,
+            hint: str = "", allow_empty: bool = False) -> str:
+    """한 줄 입력창. 취소하거나 창을 닫으면 빈 문자열을 돌려준다.
+
+    `digits` 를 주면 그 자릿수의 숫자만 받는다(다른 글자는 자동으로 걸러진다).
+    """
+    import tkinter as tk
+    from tkinter import ttk
+
+    win = tk.Tk()
+    win.title(APP_NAME)
+    win.resizable(False, False)
+    try:
+        win.attributes("-topmost", True)
+    except Exception:                                          # noqa: BLE001
+        pass
+
+    box = ttk.Frame(win, padding=(20, 18, 20, 14))
+    box.pack(fill="both", expand=True)
+    ttk.Label(box, text=message, justify="left").pack(anchor="w")
+
+    var = tk.StringVar(value=initial)
+    opts = {"textvariable": var, "width": 30}
+    if digits:                                   # 코드는 크고 시원하게
+        opts.update(width=14, font=("Malgun Gothic", 20), justify="center")
+    entry = ttk.Entry(box, **opts)
+    entry.pack(fill="x", pady=(12, 4), ipady=4)
+
+    err = ttk.Label(box, text=hint, foreground="#8a8a8a", justify="left")
+    err.pack(anchor="w")
+
+    result = [""]
+
+    def clean(*_):
+        """숫자만 남긴다. 붙여넣은 "123 456" · "123-456" 도 그대로 받아 준다."""
+        if not digits:
+            return
+        keep = "".join(c for c in var.get() if c.isdigit())[:digits]
+        if keep != var.get():
+            var.set(keep)
+            entry.icursor("end")
+
+    var.trace_add("write", clean)
+
+    def submit(*_):
+        value = var.get().strip()
+        if digits and len(value) != digits:
+            err.config(text=f"숫자 {digits}자리를 입력해 주세요."
+                            f"  (지금 {len(value)}자리)", foreground="#c0392b")
+            entry.focus_force()
+            return
+        if not value and not allow_empty:
+            err.config(text="값을 입력해 주세요.", foreground="#c0392b")
+            entry.focus_force()
+            return
+        result[0] = value
+        win.destroy()
+
+    def cancel(*_):
+        win.destroy()
+
+    def paste(*_):
+        """Ctrl+V. 한글 자판에서는 기본 붙여넣기가 안 먹어서 직접 처리한다."""
+        try:
+            text = win.clipboard_get()
+        except Exception:                                      # noqa: BLE001
+            return "break"
+        if digits:
+            var.set("".join(c for c in text if c.isdigit())[:digits])
+        else:
+            entry.insert("insert", text.strip())
+        entry.icursor("end")
+        return "break"
+
+    def on_ctrl(event):
+        # keycode 로 본다 — 한글/영문 자판이 뭐든 V 자리는 86 이다
+        if event.keycode == 86:
+            return paste()
+        if event.keycode == 65:                                # Ctrl+A 전체 선택
+            entry.select_range(0, "end")
+            return "break"
+        return None
+
+    entry.bind("<Control-KeyPress>", on_ctrl)
+    entry.bind("<<Paste>>", paste)
+    for key in ("<Return>", "<KP_Enter>"):
+        win.bind(key, submit)
+    win.bind("<Escape>", cancel)
+    win.protocol("WM_DELETE_WINDOW", cancel)
+
+    bar = ttk.Frame(box)
+    bar.pack(fill="x", pady=(14, 0))
+    ttk.Button(bar, text="취소", command=cancel).pack(side="right")
+    ttk.Button(bar, text="확인", command=submit).pack(side="right", padx=(0, 8))
+
+    win.update_idletasks()                       # 화면 가운데 위쪽에 띄운다
+    w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+    win.geometry(f"{w}x{h}+{(win.winfo_screenwidth() - w) // 2}"
+                 f"+{(win.winfo_screenheight() - h) // 3}")
+
+    def grab_focus():
+        """트레이 메뉴가 닫히며 초점을 도로 가져가는 경우가 있어 몇 번 더 잡는다."""
+        try:
+            if not win.winfo_exists():
+                return
+            _force_foreground(win)
+            entry.focus_force()
+        except Exception:                                      # noqa: BLE001
+            pass
+
+    grab_focus()
+    entry.select_range(0, "end")
+    pending = [win.after(d, grab_focus) for d in (120, 400, 900)]
+
+    def stop_grabbing(*_):        # 창이 닫힌 뒤 예약된 일이 튀지 않게
+        for job in pending:
+            try:
+                win.after_cancel(job)
+            except Exception:                                  # noqa: BLE001
+                pass
+
+    win.bind("<Destroy>", stop_grabbing)
+    win.mainloop()
+    return result[0]
+
+
+def ask_code() -> str:
+    return _prompt("화면에 뜬 6자리 연결 코드를 입력하세요.", digits=6,
+                   hint="붙여넣기(Ctrl+V) · Enter 로 확인")
 
 
 def ask_name(default: str = "") -> str:
     """이 PC 를 화면에서 어떻게 부를지. 비워 두면 컴퓨터 이름을 쓴다."""
-    import tkinter as tk
-    from tkinter import simpledialog
-
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    name = simpledialog.askstring(
-        APP_NAME,
-        "이 컴퓨터를 화면에서 어떻게 표시할까요?\n"
-        "(예: 민지 사무실 PC · 집 노트북)\n"
-        "비워 두면 컴퓨터 이름을 씁니다.",
-        initialvalue=default, parent=root)
-    root.destroy()
-    return (name or "").strip()
+    return _prompt("이 컴퓨터를 화면에서 어떻게 표시할까요?",
+                   initial=default, allow_empty=True,
+                   hint="예: 민지 사무실 PC · 집 노트북   (비워 두면 컴퓨터 이름)")
 
 
 def ask_file(title: str) -> str:
@@ -290,6 +436,20 @@ def show(title: str, body: str) -> None:
 # ══════════════════════════════════════════════════════════════════
 # 트레이
 # ══════════════════════════════════════════════════════════════════
+def pair_hint(exc: Exception) -> str:
+    """연결이 안 될 때, 다음에 뭘 해야 하는지 알려 준다."""
+    text = f"{exc}".lower()
+    if "expired" in text or "만료" in text:
+        return ("코드가 만료됐습니다." + chr(10) +
+                "화면에서 [연결 코드 받기] 를 다시 눌러 새 코드를 받아 주세요.")
+    if "not found" in text or "invalid" in text or "no rows" in text:
+        return ("코드가 맞지 않습니다." + chr(10) +
+                "화면에 떠 있는 6자리를 다시 확인해 주세요.")
+    if "connect" in text or "timeout" in text or "resolve" in text:
+        return "인터넷 연결을 확인해 주세요."
+    return f"{exc}"
+
+
 def promote_tray_icon() -> bool:
     """윈도우 11 은 새 트레이 아이콘을 **숨김(^) 영역**에 넣는다.
 
@@ -378,7 +538,8 @@ class TrayAgent:
             log(f"[연결] {data['label']} · {data['device_id'][:8]}")
             self.restart_worker()
         except Exception as exc:                               # noqa: BLE001
-            show(APP_NAME, f"연결하지 못했습니다.\n\n{exc}")
+            show(APP_NAME, "연결하지 못했습니다.\n\n" + pair_hint(exc))
+            log(f"[연결 실패] {type(exc).__name__}: {exc}")
 
     def on_rename(self, *_):
         """연결한 뒤에도 화면에 보일 이름을 바꾼다."""
