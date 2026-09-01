@@ -156,7 +156,8 @@ def serve(store: JobStore, agent_id: str, once: bool = False,
         _say("중단했습니다.")
         return 130
     finally:
-        store.heartbeat(agent_id, pid=os.getpid(), state="stopped")
+        if not once:             # 한 바퀴만 도는 호출은 멈춘 게 아니다
+            store.heartbeat(agent_id, pid=os.getpid(), state="stopped")
 
 
 def parse_args(argv=None):

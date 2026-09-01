@@ -604,17 +604,32 @@ class TrayAgent:
         self.worker.start()
 
     def _serve(self) -> None:
-        try:
-            self._serve_loop()
-        except Exception as exc:                               # noqa: BLE001
-            log(f"[에이전트] 스레드가 멈췄습니다: {type(exc).__name__}: {exc}")
+        """작업 감시는 **무슨 일이 있어도 다시 살아난다**.
 
-    def _serve_loop(self) -> None:
+        예전에 콘솔로 들어온 Ctrl+C 같은 신호에 스레드가 조용히 죽어서,
+        프로그램은 켜져 있는데 실행을 눌러도 아무 일이 없는 상태가 됐다.
+        (Exception 이 아닌 신호는 아래 except 로 잡히지 않았다)
+        """
+        token = self.stop            # 내가 따를 중단 신호(교체돼도 안 헷갈리게)
+        while not token.is_set():
+            try:
+                self._serve_loop(token)
+            except BaseException as exc:                       # noqa: BLE001
+                log(f"[에이전트] 작업 감시가 멈췄습니다: "
+                    f"{type(exc).__name__}: {exc}")
+            if token.is_set():
+                break
+            log("[에이전트] 3초 뒤 다시 시작합니다.")
+            time.sleep(3)
+        log("[에이전트] 작업 감시를 마칩니다.")
+
+    def _serve_loop(self, token=None) -> None:
         dev = pairing.apply_env()
         agent_id = dev.get("device_id") or host_name()
         store = get_store()
         log(f"[에이전트] 시작 - {agent_id} · 큐={type(store).__name__}")
-        while not self.stop.is_set():
+        token = token or self.stop
+        while not token.is_set():
             try:
                 serve(store, agent_id, once=True, poll=2.0, quiet=True)
             except Exception as exc:                           # noqa: BLE001
