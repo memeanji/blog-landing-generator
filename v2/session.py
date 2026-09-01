@@ -32,6 +32,9 @@ def parse_args(argv=None):
     p.add_argument("--clear", metavar="ACCOUNT", help="저장 세션 삭제")
     p.add_argument("--profile", action="store_true", help="--clear 시 프로필 폴더까지 삭제")
     p.add_argument("--relogin", action="store_true", help="--login 시 저장 세션을 먼저 지운다")
+    p.add_argument("--ref-tab", metavar="탭이름",
+                   help="이 기준랜딩 탭의 계정을 쓴다(없으면 이 PC 에 만든다)")
+    p.add_argument("--brand", metavar="브랜드", help="--ref-tab 과 함께 쓴다")
     return p.parse_args(argv)
 
 
@@ -84,6 +87,32 @@ async def _open(acc, log, headless: bool, relogin: bool) -> int:
                 pass
 
 
+def account_for(key, ref_tab: str = "", brand: str = "", log=None):
+    """쓸 계정을 정한다. 없으면 **이 PC 에** 만든다.
+
+    ★계정(세션 폴더)은 로그인이 실제로 일어나는 PC 에 있어야 한다.
+      화면 쪽에서 만들면 클라우드 서버 안에만 생겨서, PC 에서는
+      "계정을 찾지 못했습니다" 가 났다.
+      탭 이름이 같으면 id 도 언제나 같으므로 화면이 보낸 id 와 어긋나지 않는다.
+    """
+    # ★탭으로 먼저 찾는다. 그래야 이미 쓰던 계정(과 그 세션)을 그대로 쓴다.
+    #   id 로 먼저 찾으면, 화면이 계산해 보낸 새 id 때문에 기존 계정을 두고
+    #   빈 계정을 새로 만들어 버린다.
+    if ref_tab:
+        found = accounts.ensure_for_tab(ref_tab, brand or None, create=False)
+        if found is not None:
+            return found
+    try:
+        return accounts.resolve(key)
+    except Exception:                                          # noqa: BLE001
+        if not ref_tab:
+            raise
+    acc = accounts.ensure_for_tab(ref_tab, brand or None, create=True)
+    if log:
+        log(f"[계정] 이 PC 에 새로 등록했습니다 — {acc.title} ({acc.id})")
+    return acc
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     settings = load_settings()
@@ -93,7 +122,8 @@ def main(argv=None) -> int:
             return cmd_list(log)
 
         key = args.adopt or args.login or args.check or args.clear
-        acc = accounts.resolve(key)
+        acc = account_for(key, getattr(args, "ref_tab", ""),
+                          getattr(args, "brand", ""), log)
 
         if args.adopt:
             src = args.from_profile or None

@@ -514,11 +514,19 @@ def ensure_agent(store) -> bool:
 
 
 def submit_session_job(store, brand, account, action: str,
-                       device_id: str = "") -> str:
-    """세션 작업(`--login` / `--check`)을 **내 PC 의 Agent** 앞으로 넣는다."""
+                       device_id: str = "", ref_tab: str = "") -> str:
+    """세션 작업(`--login` / `--check`)을 **내 PC 의 Agent** 앞으로 넣는다.
+
+    ★어느 기준랜딩 탭인지도 함께 보낸다. 계정(세션 폴더)이 그 PC 에 아직
+      없으면 **그 PC 에서** 만들어 쓰기 위해서다(여기서 만들면 서버 안에만 생긴다).
+    """
     titles = {"--login": "로그인", "--check": "세션 확인"}
+    tab = ref_tab or getattr(account, "ref_tab", "") or ""
+    extra = [action, account.id]
+    if tab:
+        extra += ["--ref-tab", tab, "--brand", brand.id]
     return store.submit(
-        Job(brand=brand.id, account=account.id, extra=[action, account.id]),
+        Job(brand=brand.id, account=account.id, extra=extra),
         kind="session", title=f"{titles.get(action, action)} — {account.title}",
         target_agent=device_id)
 
@@ -1027,8 +1035,10 @@ with left:
         #     그 PC 의 에이전트가 로그인 창을 연다. 로그인은 사람이 직접 한다.
         info = session_store.describe(account) if account else {
             "state_exists": False, "cookies": 0, "saved_at": "", "profile": ""}
-        logged_in = bool(info["state_exists"])
         job_state = session_job_state(store, account) if account else ""
+        # ★세션은 그 PC 안에만 있다. 서버에서 도는 화면은 폴더를 볼 수 없으므로,
+        #   로그인 작업이 성공으로 끝났으면 준비된 것으로 본다.
+        logged_in = bool(info["state_exists"]) or job_state == "done"
         ready = bool(agent_ready) and logged_in
 
         st.divider()
@@ -1048,9 +1058,16 @@ with left:
                           "실행 준비가 끝납니다"):
             # ★이 기준랜딩 탭에 계정(세션 폴더)이 아직 없으면 여기서 만든다.
             #   기존 계정이 있으면 그대로 쓴다(세션 재사용).
-            account = accounts.ensure_for_tab(ref_tab, brand, create=True)
+            # 계정이 없으면 **로그인하는 PC 에서** 만든다. 여기(서버)서 만들면
+            # 서버 안에만 생겨서 PC 는 "계정을 찾지 못했습니다" 가 난다.
+            # 탭 이름이 같으면 id 도 같으므로 미리 계산해 보내면 어긋나지 않는다.
+            account = accounts.ensure_for_tab(ref_tab, brand, create=False) \
+                or accounts.Account(id=accounts.tab_slug(ref_tab, brand),
+                                    label=brand.account_name_of(ref_tab) or ref_tab,
+                                    blog_id="", ref_tab=ref_tab, brand=brand.id)
             jid = submit_session_job(store, brand, account, "--login",
-                                     device["device_id"] if device else "")
+                                     device["device_id"] if device else "",
+                                     ref_tab=ref_tab)
             st.session_state["job_id"] = jid
             st.toast("실행 준비를 시작했습니다 — 로그인 창을 확인해 주세요.")
             st.rerun()
