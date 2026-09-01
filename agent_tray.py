@@ -180,15 +180,18 @@ def browsers_dir() -> Path:
 
 
 def chromium_ready() -> bool:
-    """설치 여부만 본다 — 드라이버를 띄우지 않는다(느리고 경고가 남는다)."""
-    for base in (browsers_dir(),
-                 Path(os.getenv("LOCALAPPDATA") or "") / "ms-playwright"):
-        try:
-            for d in base.glob("chromium-*"):
-                if any(d.rglob("chrome.exe")):
-                    return True
-        except Exception:                                      # noqa: BLE001
-            continue
+    """설치 여부만 본다 — 드라이버를 띄우지 않는다(느리고 경고가 남는다).
+
+    ★**실제로 찾을 곳 한 군데만** 본다. 예전에는 개발용 위치까지 뒤져서
+      "있다" 고 판단해 내려받기를 건너뛰었는데, 정작 실행할 때는 그 위치를
+      보지 않아 "크롬이 없다" 며 로그인 창이 뜨지 않았다.
+    """
+    try:
+        for d in browsers_dir().glob("chromium*"):
+            if any(d.rglob("chrome.exe")):
+                return True
+    except Exception:                                          # noqa: BLE001
+        pass
     return False
 
 
