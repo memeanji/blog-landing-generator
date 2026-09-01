@@ -632,6 +632,31 @@ def render_steps(events: list[dict]) -> None:
 if not require_password():          # ★팀 공용 비밀번호(Secrets)
     st.stop()
 
+def cloud_not_wired() -> list[str]:
+    """서버에서 도는 화면인데 원격 큐에 안 붙어 있으면, 빠진 설정 이름을 돌려준다.
+
+    ★이 상태를 알아채기가 아주 어려웠다 — [연결 코드 받기] 는 멀쩡히 6자리를
+      만들어 주지만, 그 코드는 **서버가 아니라 이 화면 안에만** 있어서 PC 에서
+      아무리 입력해도 붙지 않는다. 그래서 화면에 대놓고 적어 둔다.
+    """
+    if sys.platform.startswith("win"):
+        return []                          # 각자 PC 에서 띄운 화면이면 정상이다
+    if type(store).__name__ != "LocalStore":
+        return []                          # 이미 원격 큐에 붙어 있다
+    need = ("BLOG_QUEUE_BACKEND", "SUPABASE_URL", "SUPABASE_SERVICE_KEY")
+    missing = []
+    for key in need:
+        got = os.getenv(key)
+        if not got:
+            try:
+                got = st.secrets.get(key)
+            except Exception:                                  # noqa: BLE001
+                got = None
+        if not got:
+            missing.append(key)
+    return missing or list(need)
+
+
 store = get_store()
 
 # ══════════════════════════════════════════════════════════════════
@@ -688,7 +713,16 @@ st.markdown(info_block(("브랜드", brand.title),
 
 render_help()                              # ❓ 처음 사용하시나요?
 
-if not agent_ready:
+_gap = cloud_not_wired()
+if _gap:
+    st.error("🔌 **이 화면이 아직 각자 PC 와 이어져 있지 않습니다.**"
+             + chr(10) + chr(10) +
+             "지금은 [연결 코드 받기] 를 눌러도 그 코드가 이 화면 안에만 "
+             "만들어져서, PC 에서 입력해도 연결되지 않습니다."
+             + chr(10) + chr(10) +
+             "**Settings → Secrets** 에 다음 항목을 넣고 저장해 주세요 → "
+             + ", ".join(f"`{k}`" for k in _gap))
+elif not agent_ready:
     st.warning("⚠ **이 컴퓨터에 Agent 가 연결돼 있지 않습니다.**"
                f"{chr(10)}{chr(10)}실행하려면 컴퓨터마다 **한 번만** Agent 를 설치해야 합니다. "
                "왼쪽 **[⬇ Windows Agent 설치]** → 설치 → **[연결 코드 받기]** 의 6자리 입력. "
