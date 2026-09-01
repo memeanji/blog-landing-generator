@@ -18,7 +18,7 @@ import sys
 import threading
 from pathlib import Path
 
-from .job import Job, python_exe
+from .job import Job, module_command
 from .logger import EVENT_PREFIX
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -49,7 +49,8 @@ class Runner:
         return self.proc is not None and self.proc.poll() is None
 
     # ── 실행 ─────────────────────────────────────────────────────
-    def start(self, job: Job | list[str], label: str = "") -> list[str]:
+    def start(self, job: Job | list[str], label: str = "",
+              env_extra: dict | None = None) -> list[str]:
         if self.running:
             raise RuntimeError("이미 실행 중입니다. 끝나거나 중단한 뒤에 다시 눌러 주세요.")
         cmd = job.command() if isinstance(job, Job) else list(job)
@@ -58,6 +59,7 @@ class Runner:
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
+        env.update({k: str(v) for k, v in (env_extra or {}).items() if v})
 
         self.proc = subprocess.Popen(
             cmd, cwd=str(ROOT), env=env,
@@ -69,9 +71,11 @@ class Runner:
         self._thread.start()
         return cmd
 
-    def start_module(self, module: str, args: list[str], label: str = "") -> list[str]:
+    def start_module(self, module: str, args: list[str], label: str = "",
+                     env_extra: dict | None = None) -> list[str]:
         """`python -m <module> <args…>` 를 그대로 돌린다(계정 로그인·세션 확인용)."""
-        return self.start([python_exe(), "-m", module, *args], label=label)
+        return self.start(module_command(module, args), label=label,
+                          env_extra=env_extra)
 
     # ── 중단 ─────────────────────────────────────────────────────
     def stop(self) -> bool:

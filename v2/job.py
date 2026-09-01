@@ -17,7 +17,7 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+from .appdir import SRC_ROOT as ROOT   # venv 탐색용(소스 폴더)
 
 FLOWS = {
     "review": {"module": "v2.run", "label": "검수용 랜딩 생성 (새 글)"},
@@ -25,6 +25,21 @@ FLOWS = {
 }
 KINDS = ("검수용", "실전용")
 PROD_MODES = {"convert": "기존 검수용 글을 수정", "create": "새 글로 만들기"}
+
+
+def module_command(module: str, args: list[str],
+                   python: str | None = None) -> list[str]:
+    """`python -m <module> …` 을 만든다.
+
+    ★설치본(PyInstaller)에는 python.exe 가 없다. 그때는 **자기 자신**을
+      `BlogLandingAgent.exe --module v2.run …` 형태로 다시 부른다
+      (`agent_tray.py` 가 맨 앞에서 이 인자를 받아 그 모듈을 실행한다).
+    """
+    import sys as _sys
+
+    if getattr(_sys, "frozen", False) and not python:
+        return [_sys.executable, "--module", module, *args]
+    return [python or python_exe(), "-m", module, *args]
 
 
 def python_exe() -> str:
@@ -42,6 +57,9 @@ class Job:
     # ★브랜드 = 기준시트 + UTM 빌더 한 세트. 비우면 기본 브랜드(리퓨어리) = 기존 동작.
     #   큐에 들어간 Job 만 보고도 어느 브랜드 작업인지 알 수 있어야 한다.
     brand: str = ""
+    # ★설치본 PC 에는 brands.json 이 없다. 화면이 고른 브랜드 설정을 그대로 실어 보내
+    #   에이전트가 환경변수(BLOG_BRANDS_JSON)로 넘겨 준다. CLI 인자로는 나가지 않는다.
+    brand_config: str = ""
     account: str = ""
     media: str = ""
     deficiency: str = ""
@@ -152,7 +170,7 @@ class Job:
         return FLOWS[self.flow]["module"]
 
     def command(self, python: str | None = None) -> list[str]:
-        return [python or python_exe(), "-m", self.module(), *self.to_argv()]
+        return module_command(self.module(), self.to_argv(), python)
 
     def command_line(self, python: str | None = None) -> str:
         """사람이 터미널에 그대로 붙여넣을 수 있는 한 줄(로그·재현용)."""

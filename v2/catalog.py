@@ -13,7 +13,7 @@ from pathlib import Path
 from . import brands, landing_sheet, sheets
 from .config import load_settings
 
-ROOT = Path(__file__).resolve().parent.parent
+from .appdir import ROOT      # 개발 PC=프로젝트 폴더 / 설치본=%APPDATA%\BlogLandingAgent
 
 
 def _slug(text: str) -> str:

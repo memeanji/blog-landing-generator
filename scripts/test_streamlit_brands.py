@@ -182,9 +182,27 @@ with tempfile.TemporaryDirectory() as tmp:
 # ══════════════════════════════════════════════════════════════════
 print()
 print("5) Streamlit UI — 실제 스크립트 런")
-at = AppTest.from_file(str(ROOT / "streamlit_app.py"), default_timeout=120)
-at.run()
+def open_app(timeout: int = 120):
+    """앱을 열고 팀 공용 비밀번호 게이트를 통과한다(값은 secrets 에서 읽는다)."""
+    a = AppTest.from_file(str(ROOT / "streamlit_app.py"), default_timeout=timeout)
+    a.run()
+    gate = [t for t in a.text_input if t.key == "gate_pw"]
+    if gate:
+        import tomllib
+
+        f = ROOT / ".streamlit" / "secrets.toml"
+        pw = ""
+        if f.exists():
+            conf = tomllib.loads(f.read_text(encoding="utf-8"))
+            pw = conf.get("TEAM_PASSWORD") or conf.get("APP_PASSWORD") or ""
+        gate[0].set_value(pw).run()
+        [b for b in a.button if b.label == "들어가기"][0].click().run()
+    return a
+
+
+at = open_app()
 check("예외 없이 렌더링", not at.exception, str(at.exception)[:200] if at.exception else "")
+check("비밀번호 게이트 통과", any(s.key == "brand_id" for s in at.selectbox))
 
 sel = {s.key: s for s in at.selectbox}
 check("최상단 브랜드 선택이 있다", "brand_id" in sel, str(list(sel)))
@@ -261,8 +279,7 @@ check("실전 실행은 준비 완료 전까지만 잠긴다(체크박스 없이
       any(b.label == "실전 실행" and b.disabled for b in at.button))
 
 # 브랜드를 닥터누센트로 바꾼다 → 기준시트가 비어 있으므로 '깨끗한 안내'가 떠야 한다
-at2 = AppTest.from_file(str(ROOT / "streamlit_app.py"), default_timeout=120)
-at2.run()
+at2 = open_app()
 at2.selectbox(key="brand_id").set_value("doctor_nuscent").run()
 check("브랜드를 바꿔도 앱이 죽지 않는다", not at2.exception,
       str(at2.exception)[:200] if at2.exception else "")
@@ -280,8 +297,7 @@ check("닥터누센트는 시트를 읽지 않는다(기준시트 오류가 안 
       not any("읽지 못했" in m for m in msgs))
 
 # ── 실전용으로 바꾸면 실전용 CLI 옵션이 붙는다 ─────────────────────
-at3 = AppTest.from_file(str(ROOT / "streamlit_app.py"), default_timeout=120)
-at3.run()
+at3 = open_app()
 at3.radio(key="flow").set_value("production").run()
 check("실전용 전환 후에도 예외 없음", not at3.exception,
       str(at3.exception)[:200] if at3.exception else "")

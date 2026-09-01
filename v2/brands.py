@@ -24,7 +24,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent          # blog_landing_generator/
+from .appdir import ROOT      # 개발 PC=프로젝트 폴더 / 설치본=%APPDATA%\BlogLandingAgent
 BRANDS_PATH = ROOT / "brands.json"
 NL = chr(10)
 

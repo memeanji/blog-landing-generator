@@ -16,6 +16,7 @@ r"""블로그 랜딩 생성기 — Streamlit UI.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -54,6 +55,9 @@ st.markdown("""
   .info-label { font-size: 1rem; font-weight: 700; line-height: 1.35;
                 color: inherit; }
   .info-value { font-size: 1rem; line-height: 1.35; color: inherit; }
+  .pair-code  { font-size: 2rem; font-weight: 700; letter-spacing: .35em;
+                text-align: center; padding: .5rem 0; margin: .3rem 0;
+                border: 1px dashed currentColor; border-radius: .5rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -154,6 +158,246 @@ def preview_rows(brand_id: str, flow: str, media: str, deficiency: str, kind: st
     return out
 
 
+# ══════════════════════════════════════════════════════════════════
+# 접근 · 내 PC(Agent) — 실행은 언제나 **사용자 PC 의 Agent** 가 한다.
+#   화면은 큐에 넣기만 하고, Playwright 는 클라우드에서 절대 돌지 않는다.
+# ══════════════════════════════════════════════════════════════════
+AGENT_DOWNLOAD_URL = ("https://github.com/memeanji/blog-landing-generator/"
+                      "releases/latest/download/BlogLandingAgentSetup.exe")
+AGENT_RELEASES_URL = "https://github.com/memeanji/blog-landing-generator/releases/latest"
+
+
+# 비밀번호를 담는 키 이름(먼저 찾은 것을 쓴다). ★값은 코드에 두지 않는다.
+PASSWORD_KEYS = ("TEAM_PASSWORD", "APP_PASSWORD")
+
+
+def app_password() -> str:
+    """팀 공용 비밀번호 — `.streamlit/secrets.toml` 또는 Streamlit Secrets 에서 읽는다.
+
+    로컬:      .streamlit/secrets.toml   TEAM_PASSWORD = "…"
+    클라우드:  앱 Settings → Secrets      TEAM_PASSWORD = "…"
+    ★코드·로그·화면 어디에도 값이 남지 않는다(비교만 한다).
+    """
+    for key in PASSWORD_KEYS:
+        try:
+            v = st.secrets.get(key, "")
+        except Exception:                                      # noqa: BLE001
+            v = ""
+        v = str(v or os.getenv(key) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def require_password() -> bool:
+    """비밀번호가 설정돼 있으면 통과할 때까지 화면을 막는다."""
+    want = app_password()
+    if not want:                       # 설정 전(로컬 개발 등) — 막지 않는다
+        return True
+    if st.session_state.get("authed"):
+        return True
+    st.title("네이버 블로그 랜딩 생성기")
+    st.markdown(info_block(("접근", "팀 공용 비밀번호를 입력해 주세요")),
+                unsafe_allow_html=True)
+    with st.form("gate"):
+        pw = st.text_input("비밀번호", type="password", key="gate_pw")
+        if st.form_submit_button("들어가기", type="primary"):
+            if pw == want:
+                st.session_state["authed"] = True
+                st.rerun()
+            else:
+                st.error("비밀번호가 다릅니다.")
+    st.caption("비밀번호는 앱 Secrets 에만 저장됩니다(저장소·코드에는 없습니다).")
+    return False
+
+
+def my_device(store) -> dict | None:
+    """이 브라우저가 연결한 PC. 링크(?device=…) → 살아 있는 Agent 순으로 찾는다."""
+    want = (st.query_params.get("device") or st.session_state.get("device_id") or "")
+    if want:
+        dev = store.device(want) if hasattr(store, "device") else None
+        if dev:
+            st.session_state["device_id"] = dev["device_id"]
+            return dev
+    # 로컬 모드 편의 — 이 PC 에서 도는 Agent 가 하나면 그것을 쓴다
+    alive = [a for a in store.agents(max_age_sec=30)
+             if a.get("alive") and a.get("state") != "stopped"]
+    if len(alive) == 1:
+        a = alive[0]
+        return {"device_id": a["agent"], "label": a.get("host") or a["agent"],
+                "state": a.get("state", "idle"), "alive": True,
+                "version": a.get("version", ""), "last_seen": a.get("at", "")}
+    return None
+
+
+def link_device(device_id: str) -> None:
+    st.session_state["device_id"] = device_id
+    try:
+        st.query_params["device"] = device_id      # 새로고침해도 유지되게
+    except Exception:                              # noqa: BLE001
+        pass
+
+
+def running_job(store, device) -> str:
+    """이 PC 에서 지금 돌고 있는 작업 제목(없으면 빈 문자열) — 중복 실행 방지용."""
+    if not device:
+        return ""
+    want = device.get("device_id")
+    for rec in store.list_jobs(limit=12):
+        if rec.get("status") not in (queue_store.PENDING, queue_store.RUNNING):
+            continue
+        if rec.get("target_agent") in ("", want) or rec.get("agent") == want:
+            return str(rec.get("title") or rec.get("id"))
+    return ""
+
+
+def render_agent_panel(store) -> dict | None:
+    """사이드바 — 🟢/🔴 상태 · 설치 버튼 · 6자리 페어링."""
+    st.header("내 PC Agent")
+    dev = my_device(store)
+    if dev and dev.get("alive"):
+        st.success("🟢 연결됨")
+        st.markdown(info_block(("PC 이름", dev.get("label") or dev["device_id"]),
+                               ("마지막 연결", (dev.get("last_seen") or "")[11:16] or "-")),
+                    unsafe_allow_html=True)
+        if dev.get("version"):
+            st.caption(f"Agent 버전 {dev['version']}")
+        if st.button("연결 해제", use_container_width=True):
+            st.session_state.pop("device_id", None)
+            try:
+                st.query_params.pop("device")
+            except Exception:                      # noqa: BLE001
+                pass
+            st.rerun()
+        return dev
+
+    if dev and not dev.get("alive"):
+        st.warning("🟡 연결은 돼 있지만 Agent 가 꺼져 있습니다")
+        st.markdown(info_block(("PC 이름", dev.get("label") or dev["device_id"])),
+                    unsafe_allow_html=True)
+        st.caption("그 PC 를 켜고 작업표시줄에 **블로그 랜딩 Agent** 가 있는지 "
+                   "확인해 주세요.")
+        return dev
+
+    st.error("🔴 Agent 연결 안 됨")
+    st.link_button("⬇ Windows Agent 설치", AGENT_DOWNLOAD_URL,
+                   use_container_width=True, type="primary")
+    st.caption(f"[릴리스 페이지 열기]({AGENT_RELEASES_URL})")
+
+    code = st.session_state.get("pair_code")
+    if st.button("연결 코드 받기", use_container_width=True):
+        try:
+            got = store.create_pairing(minutes=10)
+            st.session_state["pair_code"] = got["code"]
+            code = got["code"]
+        except Exception as exc:                   # noqa: BLE001
+            st.error(f"코드를 만들지 못했습니다: {exc}")
+    if code:
+        st.markdown(f"<div class='pair-code'>{code}</div>", unsafe_allow_html=True)
+        st.caption("설치 후 트레이 아이콘 → **연결** 에 이 번호를 입력하세요 (10분간 유효)")
+        got = None
+        try:
+            got = store.pairing_result(code)
+        except Exception:                          # noqa: BLE001
+            got = None
+        if got:
+            link_device(got["device_id"])
+            st.session_state.pop("pair_code", None)
+            st.success(f"연결됐습니다 — {got.get('label') or got['device_id']}")
+            st.rerun()
+        else:
+            st.caption("연결을 기다리는 중…")
+            if st.button("연결 확인", use_container_width=True):
+                st.rerun()
+    return None
+
+
+def render_help() -> None:
+    """❓ 처음 사용하시나요? — 설치부터 실행까지."""
+    with st.expander("❓ 처음 사용하시나요? — 도움말 보기", expanded=False):
+        st.markdown(f"""
+### ① Windows Agent 설치
+이 화면은 **작업을 지시하기만** 하고, 실제 네이버 자동화는 **여러분 컴퓨터**에서 돕니다.
+그래서 컴퓨터마다 **한 번만** Agent 를 설치하면 됩니다.
+
+1. 왼쪽 **[⬇ Windows Agent 설치]** 를 누릅니다 → `BlogLandingAgentSetup.exe` 가 받아집니다
+2. 받은 파일을 실행해 설치합니다
+3. 설치가 끝나면 Agent 가 **자동으로 실행**되고, 다음부터는 **컴퓨터를 켤 때 자동 실행**됩니다
+
+> Python 이나 Playwright 를 따로 설치할 필요는 없습니다. 처음 실행할 때 크롬(Chromium)만
+> 자동으로 내려받습니다.
+
+### ② Agent 연결 확인
+설치 후 왼쪽 **[연결 코드 받기]** 로 나온 **6자리 숫자**를 트레이 아이콘 → **연결** 에 입력하면
+화면에 **🟢 연결됨** 이 표시됩니다.
+
+**🔴 Agent 연결 안 됨** 이면 —
+- Agent 가 설치돼 있는지
+- 작업표시줄 오른쪽 트레이에 **블로그 랜딩 Agent** 가 떠 있는지
+- 필요하면 Agent 를 다시 시작(트레이 아이콘 → 종료 후 시작 메뉴에서 재실행)
+
+### ③ 처음 계정을 사용하는 경우
+**[실행 준비]** 를 누릅니다.
+
+> ### ※ 로그인창은 이 화면 안에 뜨지 않습니다.
+> ### Agent 가 설치된 **그 컴퓨터의 바탕화면**에 Chromium 창이 열립니다.
+
+창이 안 보이면 — 작업표시줄 확인 / 다른 창 뒤에 가려졌는지 확인 / Agent 연결 상태 확인
+
+### ④ 네이버 로그인
+열린 Chromium 창에서 **원하는 네이버 계정으로 직접 로그인**합니다.
+
+- 로그인 후 세션은 **그 PC 안에만** 저장됩니다 (`sessions/<계정>/`)
+- 비밀번호는 이 화면에도, 서버에도, 데이터베이스에도 **저장하지 않습니다**
+- 쿠키·브라우저 프로필도 **외부로 올리지 않습니다**
+- 한 번 로그인하면 다음부터는 보통 다시 로그인하지 않아도 됩니다
+
+### ⑤ Dry-run
+**실제로 글을 올리지 않습니다.** 시트에서 어떤 행이 잡히는지, 어떤 제품 링크가 들어가는지,
+계정·기준시트 연결이 맞는지만 미리 확인하는 단계입니다.
+
+> **Dry-run = 발행 없음**
+
+### ⑥ 실전 실행
+**[실전 실행]** 을 누르면 그 PC 의 Agent 가 실제 Playwright 자동화를 실행합니다.
+화면에서는 이렇게 보입니다.
+
+`작업 요청됨` → `Agent 수신` → `실행 중` → `완료`
+
+건수를 넣으면 **{batch_plan.BATCH_SIZE}개씩 순서대로** 나눠 실행하고,
+배치가 바뀔 때마다 다시 로그인합니다(오래 도는 세션을 만들지 않기 위해서입니다).
+
+### ⑦ 컴퓨터를 바꿔서 사용하는 경우
+**그 컴퓨터에도 Agent 를 1회 설치**해야 합니다.
+
+- 회사 PC 에 설치 → 회사 PC 에서 실행
+- 집 PC 에 설치 → 집 PC 에서 실행
+
+Agent 가 설치되지 않은 컴퓨터에서는 **로그인창도 뜨지 않고 자동화도 실행되지 않습니다.**
+
+### ⑧ 자주 생기는 문제
+**Q. 실행 준비를 눌렀는데 로그인창이 안 떠요.**
+- 왼쪽 Agent 연결 상태(🟢) 확인
+- 작업표시줄/트레이에 Agent 가 있는지 확인
+- **Agent 가 설치된 PC 에서** 보고 계신지 확인
+- Chromium 창이 다른 창 뒤에 가려졌는지 확인
+
+**Q. 다른 사람 컴퓨터에 로그인창이 떠요.**
+- 연결된 PC 가 잘못된 경우입니다. 왼쪽 **PC 이름**을 확인하고,
+  다르면 **[연결 해제]** 후 내 PC 의 코드로 다시 연결하세요
+
+**Q. 한 번 로그인했는데 또 로그인하라고 나와요.**
+- 네이버 세션이 만료됐거나 프로필이 손상된 경우입니다. **[실행 준비]** 로 다시 로그인하면 됩니다
+
+**Q. 다른 컴퓨터에서도 쓸 수 있나요?**
+- 가능합니다. 그 컴퓨터에 Agent 를 **최초 1회** 설치하면 됩니다
+
+**Q. Streamlit 창을 닫아도 되나요?**
+- 실제 자동화는 Agent 가 하므로 창을 닫아도 실행은 계속됩니다
+- 다만 **진행 상황을 보려면 열어 두시는 것을 권장**합니다
+""")
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def brand_names() -> dict:
     """내부 브랜드 키 → 화면 표시명 (repurely → 리퓨어리 …)."""
@@ -213,12 +457,14 @@ def ensure_agent(store) -> bool:
     return True
 
 
-def submit_session_job(store, brand, account, action: str) -> str:
-    """세션 작업(`--login` / `--check`)을 큐에 넣는다. 실행은 에이전트가 한다."""
+def submit_session_job(store, brand, account, action: str,
+                       device_id: str = "") -> str:
+    """세션 작업(`--login` / `--check`)을 **내 PC 의 Agent** 앞으로 넣는다."""
     titles = {"--login": "로그인", "--check": "세션 확인"}
     return store.submit(
         Job(brand=brand.id, account=account.id, extra=[action, account.id]),
-        kind="session", title=f"{titles.get(action, action)} — {account.title}")
+        kind="session", title=f"{titles.get(action, action)} — {account.title}",
+        target_agent=device_id)
 
 
 def session_job_state(store, account) -> str:
@@ -297,20 +543,21 @@ def advance_plan(store, plan: dict) -> dict:
         total = len(plan.get("batches") or [])
         return store.submit(
             Job.from_dict(batch_plan.job_for(plan, batch)),
-            title=f"{plan.get('title')} — 배치 {batch['no']}/{total}")
+            title=f"{plan.get('title')} — 배치 {batch['no']}/{total}",
+            target_agent=plan.get("device") or "")
 
     plan, changed = batch_plan.advance(
         plan, job_status=lambda jid: _job_status(store, jid), submit_run=submit_run)
     return batch_plan.save(plan) if changed else plan
 
 
-def start_batch_login(store, plan: dict, brand, account) -> None:
+def start_batch_login(store, plan: dict, brand, account,
+                      device_id: str = "") -> None:
     """다음 배치를 위한 **수동 로그인**을 띄운다(사용자가 버튼을 눌렀을 때만)."""
     if batch_plan.current(plan) is None:
         return
-    ensure_agent(store)                      # 이미 돌고 있으면 띄우지 않는다
     batch_plan.mark_logging_in(
-        plan, submit_session_job(store, brand, account, "--login"))
+        plan, submit_session_job(store, brand, account, "--login", device_id))
 
 
 def job_summary(rec: dict) -> dict:
@@ -332,7 +579,8 @@ def job_summary(rec: dict) -> dict:
         "작업": kind_label,
         "매체": job.get("media") or "",
         "결핍": job.get("deficiency") or "",
-        "건수": job.get("count") if job.get("count") is not None else "",
+        # 표는 열마다 형이 같아야 한다(숫자·빈칸이 섞이면 경고가 뜬다)
+        "건수": str(job.get("count")) if job.get("count") is not None else "",
         "결과": BADGE.get(rec.get("status"), rec.get("status") or ""),
         "발행": len(rec.get("published") or []),
         "실패 사유": (err[0][:80] if err else ""),
@@ -380,6 +628,9 @@ def render_steps(events: list[dict]) -> None:
     st.markdown("  \n".join(lines[-60:]))
 
 
+if not require_password():          # ★팀 공용 비밀번호(Secrets)
+    st.stop()
+
 store = get_store()
 
 # ══════════════════════════════════════════════════════════════════
@@ -411,6 +662,10 @@ with st.sidebar:
                            ("UTM 빌더", brand.utm_title)),
                 unsafe_allow_html=True)
 
+    st.divider()
+    device = render_agent_panel(store)      # 🟢/🔴 · 설치 · 6자리 페어링
+    agent_ready = bool(device and device.get("alive"))
+
     st.caption("네이버 로그인 세션은 실행하는 PC 안에만 저장됩니다"
                "(큐로 나가지 않습니다).")
 
@@ -429,6 +684,14 @@ st.markdown(info_block(("브랜드", brand.title),
                        ("기준시트", brand.reference_title),
                        ("UTM 빌더", brand.utm_title)),
             unsafe_allow_html=True)
+
+render_help()                              # ❓ 처음 사용하시나요?
+
+if not agent_ready:
+    st.warning("⚠ **이 컴퓨터에 Agent 가 연결돼 있지 않습니다.**"
+               f"{chr(10)}{chr(10)}실행하려면 컴퓨터마다 **한 번만** Agent 를 설치해야 합니다. "
+               "왼쪽 **[⬇ Windows Agent 설치]** → 설치 → **[연결 코드 받기]** 의 6자리 입력. "
+               "자세한 방법은 위 **도움말**을 펼쳐 보세요.")
 
 left, right = st.columns([3, 2], gap="large")
 
@@ -671,7 +934,7 @@ with left:
             "state_exists": False, "cookies": 0, "saved_at": "", "profile": ""}
         logged_in = bool(info["state_exists"])
         job_state = session_job_state(store, account) if account else ""
-        ready = bool(alive) and logged_in
+        ready = bool(agent_ready) and logged_in
 
         st.divider()
         if ready:
@@ -682,14 +945,17 @@ with left:
         else:
             st.warning("○ 준비 필요 — 아래 [실행 준비] 를 눌러 주세요")
 
+        st.caption("※ 로그인창은 **이 화면 안에 뜨지 않습니다.** "
+                   "Agent 가 설치된 PC 의 바탕화면에 Chromium 창이 열립니다.")
         if st.button("실행 준비", type="primary", use_container_width=True,
+                     disabled=not agent_ready,
                      help="네이버 로그인 창을 엽니다. 직접 로그인하면 세션이 저장되고 "
                           "실행 준비가 끝납니다"):
-            started = ensure_agent(store)        # ★이미 돌고 있으면 띄우지 않는다
             # ★이 기준랜딩 탭에 계정(세션 폴더)이 아직 없으면 여기서 만든다.
             #   기존 계정이 있으면 그대로 쓴다(세션 재사용).
             account = accounts.ensure_for_tab(ref_tab, brand, create=True)
-            jid = submit_session_job(store, brand, account, "--login")
+            jid = submit_session_job(store, brand, account, "--login",
+                                     device["device_id"] if device else "")
             st.session_state["job_id"] = jid
             st.toast("실행 준비를 시작했습니다 — 로그인 창을 확인해 주세요.")
             st.rerun()
@@ -699,23 +965,35 @@ with left:
                     if logged_in else "· 로그인 세션: 없음")
                    + f"{chr(10)}· 네이버 로그인은 매번 직접 하셔야 합니다.")
 
-        if not ready:
-            st.info("**실행 준비** 를 먼저 끝내 주세요 — "
-                    "로그인 세션과 실행 준비가 완료되면 실행 버튼이 활성화됩니다.")
+        if not agent_ready:
+            st.info("이 컴퓨터의 **Agent 가 연결되면** 실행 버튼이 열립니다 "
+                    "(왼쪽에서 설치·연결).")
+        elif not ready:
+            st.info("**실행 준비**(네이버 로그인)를 끝내면 [실전 실행] 이 열립니다. "
+                    "Dry-run 은 로그인 없이도 지금 눌러 볼 수 있습니다.")
 
+        # ★Dry-run 은 시트만 읽고 브라우저를 켜지 않는다 → **네이버 로그인 전에도 가능**.
+        #   실전 실행만 로그인 세션까지 요구한다.
+        busy = running_job(store, device)
         b1, b2 = st.columns(2)
-        if b1.button("Dry-run (브라우저 안 켬)", use_container_width=True,
-                     disabled=bool(problems) or not ready):
+        if busy:
+            st.info(f"⏳ 지금 이 PC 에서 작업이 돌고 있습니다 — {busy}"
+                    f"{chr(10)}끝나거나 중단한 뒤에 다시 실행할 수 있습니다.")
+        if b1.button("Dry-run (발행 없음)", use_container_width=True,
+                     disabled=bool(problems) or not agent_ready or bool(busy),
+                     help="실제로 글을 올리지 않습니다. 시트에서 어떤 행이 잡히는지만 "
+                          "확인합니다(네이버 로그인 없이도 됩니다)"):
             job = build_job(dry=True)
             st.session_state["job_id"] = store.submit(
                 job, title=f"[dry][{brand.title}] {FLOWS[flow]['label']} · "
-                           f"{media}/{deficiency}")
+                           f"{media}/{deficiency}",
+                target_agent=device["device_id"] if device else "")
             st.rerun()
 
         # ★확인 체크박스는 두지 않는다(2026-08-31 사용자 요청).
         #   오발행 방지는 **실행 준비 완료 상태에서만 버튼이 열리는 것**으로 갈음한다.
         if b2.button("실전 실행", type="primary", use_container_width=True,
-                     disabled=bool(problems) or not ready):
+                     disabled=bool(problems) or not ready or bool(busy)):
             job = build_job(dry=False)
             title = (f"[{brand.title}] {FLOWS[flow]['label']} · "
                      f"{media}/{deficiency}")
@@ -725,12 +1003,15 @@ with left:
                 plan = batch_plan.create(
                     job.to_dict(), int(count), title=title, brand=brand.id,
                     account=account.id if account else "", flow=flow,
-                    mode=prod_mode)
+                    mode=prod_mode,
+                    device=device["device_id"] if device else "")
                 st.session_state["plan_id"] = plan["id"]
                 st.session_state.pop("job_id", None)
             else:
                 # 건수 0(=전부)은 총 건수를 알 수 없어 나누지 않는다(기존 동작).
-                st.session_state["job_id"] = store.submit(job, title=title)
+                st.session_state["job_id"] = store.submit(
+                    job, title=title,
+                    target_agent=device["device_id"] if device else "")
             st.rerun()
         st.caption(f"버튼을 누르면 **큐에 넣기만** 합니다. 실제 실행은 에이전트가 합니다."
                    f"{chr(10)}건수를 넣으면 **{batch_plan.BATCH_SIZE}개씩 순차로** 나눠 "
@@ -817,7 +1098,8 @@ with left:
                         title=f"{plan.get('title')} · 실패 {res['fail']}건 재실행",
                         brand=plan.get("brand", ""), account=plan.get("account", ""),
                         flow=plan.get("flow", "review"),
-                        mode=plan.get("mode", "convert"))
+                        mode=plan.get("mode", "convert"),
+                        device=plan.get("device", ""))
                     st.session_state["plan_id"] = new_plan["id"]
                     st.rerun()
                 if cc[1].button("배치 진행 닫기", use_container_width=True):
@@ -839,7 +1121,8 @@ with left:
                                 use_container_width=True):
                     batch_plan.prepare_retry(plan)      # 발행된 만큼 건너뛴다
                     acc = accounts.ensure_for_tab(ref_tab, brand, create=True)
-                    start_batch_login(store, plan, brand, acc)
+                    start_batch_login(store, plan, brand, acc,
+                                      device["device_id"] if device else "")
                     st.rerun()
                 if rc[1].button("여기서 중단", use_container_width=True):
                     batch_plan.cancel(plan)
@@ -852,7 +1135,8 @@ with left:
                 if st.button("로그인하고 이어서 실행", type="primary",
                              use_container_width=True):
                     acc = accounts.ensure_for_tab(ref_tab, brand, create=True)
-                    start_batch_login(store, plan, brand, acc)
+                    start_batch_login(store, plan, brand, acc,
+                                      device["device_id"] if device else "")
                     st.rerun()
             elif cur and cur.get("status") == batch_plan.LOGGING_IN:
                 st.info("🔑 로그인 창에서 로그인해 주세요 — 끝나면 이 배치가 "

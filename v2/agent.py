@@ -22,6 +22,7 @@ import threading
 import time
 import traceback
 
+from . import pairing
 from .job import Job
 from .queue_store import (CANCELED, DONE, FAILED, JobStore, get_store, host_name,
                           now_iso)
@@ -75,12 +76,16 @@ def run_record(store: JobStore, rec: dict, agent_id: str) -> int:
         done.set()
 
     runner = Runner(on_line=on_line, on_event=on_event, on_exit=on_exit)
+    # ★설치본 PC 에는 brands.json 이 없다 — 화면이 실어 보낸 브랜드 설정을
+    #   자식 프로세스의 환경변수로 넘긴다(파일이 있으면 파일이 우선).
+    env_extra = {"BLOG_BRANDS_JSON": job.brand_config} if job.brand_config else None
     try:
         if kind == "session":
             # 세션 작업은 `v2.session` 을 그대로 돌린다(로그인 창은 이 PC 에 뜬다).
-            cmd = runner.start_module("v2.session", list(job.extra), label="session")
+            cmd = runner.start_module("v2.session", list(job.extra), label="session",
+                                      env_extra=env_extra)
         else:
-            cmd = runner.start(job)
+            cmd = runner.start(job, env_extra=env_extra)
     except Exception as exc:                                   # noqa: BLE001
         store.append_log(job_id, f"[agent] 실행하지 못했습니다: {exc}")
         store.update(job_id, error=str(exc))
@@ -113,19 +118,28 @@ def run_record(store: JobStore, rec: dict, agent_id: str) -> int:
 
 
 def serve(store: JobStore, agent_id: str, once: bool = False,
-          poll: float = POLL_SEC) -> int:
-    _say(f"에이전트 시작 — id={agent_id} · pid={os.getpid()} · 큐={type(store).__name__}")
-    _say("큐를 봅니다. Ctrl+C 로 종료합니다.")
+          poll: float = POLL_SEC, quiet: bool = False) -> int:
+    """큐를 보고 작업을 실행한다.
+
+    `quiet` — 트레이에서 짧은 주기로 반복 호출할 때 시작/대기 문구를 생략한다
+              (작업을 실제로 집었을 때의 로그는 그대로 남는다).
+    """
+    if not quiet:
+        _say(f"에이전트 시작 — id={agent_id} · pid={os.getpid()} "
+             f"· 큐={type(store).__name__}")
+        _say("큐를 봅니다. Ctrl+C 로 종료합니다.")
     last_beat = 0.0
     try:
         while True:
             if time.time() - last_beat > HEARTBEAT_SEC:
-                store.heartbeat(agent_id, pid=os.getpid(), state="idle")
+                store.heartbeat(agent_id, pid=os.getpid(), state="idle",
+                                version=pairing.AGENT_VERSION)
                 last_beat = time.time()
             rec = store.claim(agent_id)
             if rec is None:
                 if once:
-                    _say("처리할 작업이 없습니다(--once).")
+                    if not quiet:
+                        _say("처리할 작업이 없습니다(--once).")
                     return 0
                 time.sleep(poll)
                 continue
@@ -157,8 +171,17 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+
+    # ★이 PC 가 화면과 연결(페어링)돼 있으면 그 토큰으로 **원격 큐**에 붙는다.
+    #   연결 전이거나 설정이 없으면 예전처럼 로컬 큐로 돈다(기존 동작 보존).
+    dev = pairing.apply_env()
     store = get_store()
-    agent_id = args.agent_id or host_name()
+    agent_id = args.agent_id or dev.get("device_id") or host_name()
+    if dev.get("device_id"):
+        _say(f"연결된 PC — {dev.get('label')} · device {dev['device_id'][:8]}…")
+    elif type(store).__name__ != "LocalStore":
+        _say("[안내] 아직 이 PC 가 화면과 연결되지 않았습니다 "
+             "(`-m v2.pairing --code <6자리>`).")
 
     if args.status:
         rows = store.agents(max_age_sec=30)
@@ -170,7 +193,7 @@ def main(argv=None) -> int:
                  f"· {r.get('at')}")
         return 0
 
-    if not args.force:
+    if not args.force and type(store).__name__ == "LocalStore":
         for r in store.agents(max_age_sec=20):
             if r.get("agent") == agent_id and r.get("alive") \
                     and r.get("pid") != os.getpid() and r.get("state") != "stopped":

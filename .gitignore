@@ -46,6 +46,7 @@ venv/
 build/
 dist/
 *.spec
+!installer/agent.spec        # 빌드 설정은 저장소에 둔다
 .pytest_cache/
 .mypy_cache/
 .ipynb_checkpoints/
@@ -65,3 +66,10 @@ desktop.ini
 
 # Streamlit 로컬 비밀값(클라우드는 대시보드에서 넣는다)
 .streamlit/secrets.toml
+
+# ── Agent 빌드 산출물 (설치파일은 GitHub Releases 로만 배포) ──────
+installer/dist/
+installer/build/
+installer/out/
+installer/payload/
+*.exe

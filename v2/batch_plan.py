@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+from .appdir import ROOT      # 개발 PC=프로젝트 폴더 / 설치본=%APPDATA%\BlogLandingAgent
 PLANS_DIR = ROOT / "queue" / "plans"
 
 # ★한 배치의 최대 건수. 화면에 노출하지 않는다(사용자는 총 건수만 입력한다).
@@ -92,7 +92,7 @@ def path_of(plan_id: str) -> Path:
 
 def create(job_dict: dict, total: int, *, title: str = "", brand: str = "",
            account: str = "", flow: str = "review", mode: str = "convert",
-           size: int = BATCH_SIZE) -> dict:
+           size: int = BATCH_SIZE, device: str = "") -> dict:
     """총 건수를 배치로 쪼갠 계획을 만든다(아직 아무것도 큐에 넣지 않는다).
 
     · `start` 는 **convert(기존 글 수정)** 에서만 이어서 센다. create/검수용은
@@ -112,6 +112,7 @@ def create(job_dict: dict, total: int, *, title: str = "", brand: str = "",
     plan = {
         "id": new_plan_id(), "created_at": now_iso(), "title": title,
         "brand": brand, "account": account, "flow": flow, "mode": mode,
+        "device": device,          # 이 계획을 실행할 PC(Agent)
         "total": int(total), "size": int(size), "sizes": sizes,
         "job": dict(job_dict or {}), "batches": batches, "index": 0,
         "status": RUNNING if batches else DONE,

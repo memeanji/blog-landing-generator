@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent          # blog_landing_generator/
+from .appdir import ROOT      # 개발 PC=프로젝트 폴더 / 설치본=%APPDATA%\BlogLandingAgent
 ACCOUNTS_PATH = ROOT / "accounts.json"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
