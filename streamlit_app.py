@@ -213,7 +213,10 @@ def require_password() -> bool:
 
 def my_device(store) -> dict | None:
     """이 브라우저가 연결한 PC. 링크(?device=…) → 살아 있는 Agent 순으로 찾는다."""
-    want = (st.query_params.get("device") or st.session_state.get("device_id") or "")
+    want = st.query_params.get("device") or st.session_state.get("device_id") or ""
+    if isinstance(want, (list, tuple)):   # 주소에 같은 이름이 여러 번 올 수 있다
+        want = want[0] if want else ""
+    want = str(want).strip()
     if want:
         dev = store.device(want) if hasattr(store, "device") else None
         if dev:
@@ -237,9 +240,35 @@ def my_device(store) -> dict | None:
 
 
 def link_device(device_id: str) -> None:
+    """이 브라우저가 쓸 PC 를 정한다.
+
+    ★주소(query params)는 여기서 바꾸지 않는다. 화면을 그리는 도중에 바꾸면
+      그것만으로도 다시 그리기가 걸려, 방금 그린 요소와 부딪혀 빨간 오류
+      (removeChild)가 났다. 바꾸는 일은 맨 위 `sync_address()` 에서 한 번만 한다.
+    """
     st.session_state["device_id"] = device_id
+    st.session_state["_address"] = device_id       # 다음 그리기 때 주소에 반영
+    st.session_state["_just_linked"] = device_id   # 알림도 다음 그리기 때
+
+
+def unlink_device() -> None:
+    """연결을 끊는다(주소 정리는 마찬가지로 맨 위에서 한 번만)."""
+    st.session_state.pop("device_id", None)
+    st.session_state["_address"] = ""
+    st.session_state.pop("_just_linked", None)
+
+
+def sync_address() -> None:
+    """주소를 세션 상태에 맞춘다 — **화면을 그리기 전에 한 번만** 부른다."""
+    want = st.session_state.pop("_address", None)
+    if want is None:
+        return
     try:
-        st.query_params["device"] = device_id      # 새로고침해도 유지되게
+        if want:
+            if st.query_params.get("device") != want:
+                st.query_params["device"] = want
+        else:
+            st.query_params.pop("device", None)
     except Exception:                              # noqa: BLE001
         pass
 
@@ -261,6 +290,9 @@ def render_agent_panel(store) -> dict | None:
     """사이드바 — 🟢/🔴 상태 · 설치 버튼 · 6자리 페어링."""
     st.header("내 PC Agent")
     dev = my_device(store)
+    just = st.session_state.pop("_linked_name", None)
+    if just:
+        st.toast(f"연결됐습니다 — {just}")
     if dev and dev.get("alive"):
         st.success("🟢 연결됨")
         st.markdown(info_block(("PC 이름", dev.get("label") or dev["device_id"]),
@@ -269,11 +301,7 @@ def render_agent_panel(store) -> dict | None:
         if dev.get("version"):
             st.caption(f"Agent 버전 {dev['version']}")
         if st.button("연결 해제", use_container_width=True):
-            st.session_state.pop("device_id", None)
-            try:
-                st.query_params.pop("device")
-            except Exception:                      # noqa: BLE001
-                pass
+            unlink_device()
             st.rerun()
         return dev
 
@@ -326,9 +354,12 @@ def render_agent_panel(store) -> dict | None:
         except Exception:                          # noqa: BLE001
             got = None
         if got:
+            # 알림은 다음 그리기에서 보여 준다(여기서 그리면 곧 지워질 요소가
+            # 다시 그리기와 부딪혀 빨간 오류가 났다)
+            st.session_state["_linked_name"] = (got.get("label")
+                                                or got["device_id"])
             link_device(got["device_id"])
             st.session_state.pop("pair_code", None)
-            st.success(f"연결됐습니다 — {got.get('label') or got['device_id']}")
             st.rerun()
         else:
             st.caption("연결을 기다리는 중…")
@@ -655,6 +686,8 @@ def render_steps(events: list[dict]) -> None:
 
 if not require_password():          # ★팀 공용 비밀번호(Secrets)
     st.stop()
+
+sync_address()                      # ★화면을 그리기 전에 주소를 한 번만 맞춘다
 
 def cloud_not_wired() -> list[str]:
     """서버에서 도는 화면인데 원격 큐에 안 붙어 있으면, 빠진 설정 이름을 돌려준다.
