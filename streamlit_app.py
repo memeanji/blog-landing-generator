@@ -491,6 +491,26 @@ with left:
         # 이 탭을 쓰는 계정(=세션 폴더). 아직 없으면 [실행 준비] 때 만든다.
         account = accounts.ensure_for_tab(ref_tab, brand, create=False)
 
+        # ── 참고용 랜딩 기준 시트 바로가기 · 선택 계정의 로그인 ID ──
+        #   ★URL 은 하드코딩하지 않고 **선택한 브랜드 설정**에서 만든다.
+        #   ★로그인 ID 는 accounts.json(git 제외)에서 읽어 **표시만** 한다.
+        #     비밀번호는 저장하지도 보여주지도 않는다.
+        lcol, icol = st.columns([1, 2])
+        ref_url = brand.sheet_url(brand.reference_sheet_id)
+        if ref_url:
+            lcol.link_button(f"📄 {brand.title} 참고용 랜딩 기준 시트 열기", ref_url,
+                             use_container_width=True,
+                             help="새 탭에서 기준시트가 열립니다")
+        if account and account.login_id:
+            icol.markdown(info_block((account.title, f"ID: {account.login_id}")),
+                          unsafe_allow_html=True)
+        elif account:
+            icol.caption(f"{account.title} · 로그인 ID 미등록"
+                         f"(accounts.json 의 login_id 에 적으면 여기에 표시됩니다)")
+        else:
+            icol.caption("이 기준랜딩 탭은 아직 계정이 없습니다 — "
+                         "[실행 준비] 를 누르면 만들어집니다")
+
         try:
             cat = load_catalog(brand.id, account.id if account else "", ref_tab)
         except Exception as exc:                               # noqa: BLE001

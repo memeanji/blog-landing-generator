@@ -25,6 +25,7 @@ class Account:
     id: str
     label: str = ""
     blog_id: str = ""
+    login_id: str = ""           # 네이버 로그인 ID — **화면 표시용**(비밀번호는 저장 안 함)
     ref_tab: str = ""            # 계정별 기준랜딩 탭(sheets.set_tab 에 넣는다)
     brand: str = ""              # ★이 ref_tab 이 속한 브랜드. 비우면 기본 브랜드(리퓨어리).
                                  #   다른 브랜드로 실행하면 ref_tab 을 쓰지 않는다(혼용 방지)
@@ -39,6 +40,7 @@ class Account:
 
     def to_dict(self) -> dict:
         return {"id": self.id, "label": self.label, "blog_id": self.blog_id,
+                "login_id": self.login_id,
                 "ref_tab": self.ref_tab, "brand": self.brand, "media": self.media,
                 "note": self.note, "enabled": self.enabled,
                 "profile_dir": self.profile_dir}
@@ -73,6 +75,7 @@ def _from_raw(raw: dict) -> Account | None:
         id=ident,
         label=str(raw.get("label") or "").strip(),
         blog_id=str(raw.get("blog_id") or "").strip(),
+        login_id=str(raw.get("login_id") or "").strip(),
         ref_tab=str(raw.get("ref_tab") or ""),          # ★끝 공백이 의미 있는 탭이 있다 — strip 금지
         brand=str(raw.get("brand") or "").strip(),
         media=str(raw.get("media") or "").strip(),
