@@ -124,6 +124,28 @@ def _suggest_for_account(settings, blog_id: str, log) -> None:
 DELAY_MIN, DELAY_MAX = 10, 50
 
 
+async def _log_state(ctx, src, log, when: str) -> None:
+    """지금 무엇을 들고 있는지 한 줄로 남긴다.
+
+    ★배치가 바뀔 때 앞 배치 것을 물려받았는지 눈으로 가리려면 이게 있어야 한다.
+      예전에는 이 정보가 없어 '내용 문제인지 상태 문제인지' 를 가릴 수 없었다.
+    """
+    try:
+        pages = list(getattr(ctx, "pages", []) or [])
+        urls = [(pg.url or "")[:60] for pg in pages]
+        chars = sum(int(getattr(c, "chars", 0) or 0)
+                    for c in (getattr(src, "components", None) or []))
+        log(f"[상태] {when} — 열린 탭 {len(pages)}개 · 기준글 "
+            f"{(getattr(getattr(src, 'page', None), 'url', '') or '')[:60]}")
+        log(f"       기준글 컴포넌트 {len(getattr(src, 'components', []) or [])}개 "
+            f"· {chars}자 · 제목 {getattr(src, 'title', '')!r} "
+            f"· extra_images={getattr(src, 'extra_images', 0)}")
+        for i, u in enumerate(urls[:12]):
+            log(f"       탭#{i} {u}")
+    except Exception as exc:                                   # noqa: BLE001
+        log(f"[상태] {when} — 남기지 못했습니다({type(exc).__name__})")
+
+
 async def build_ready(ctx, src, blog_id, no, total, log, out_dir,
                       product_url: str = ""):
     """새 글 1개를 READY 까지만 만든다(발행하지 않는다). 탭은 열어 둔 채 반환.
@@ -137,7 +159,9 @@ async def build_ready(ctx, src, blog_id, no, total, log, out_dir,
 
     await post.switch_to_mobile()
     await post.ensure_mobile()
+    await post.log_targets(f"[{no}/{total}] 제목 입력 전")
     await post.type_title(src.title)
+    await post.log_targets(f"[{no}/{total}] 제목 입력 후")
 
     # ★본문은 '한 번에' 복사/붙여넣기한다(2026-08-21 사용자 시연 방식).
     #   컴포넌트를 나눠 여러 번 복사하면 네이버가 [출처] 문구를 붙인다.
@@ -149,6 +173,7 @@ async def build_ready(ctx, src, blog_id, no, total, log, out_dir,
     #   다음 글의 검증이 '이미지 4/5' 로 실패한다(2026-08-21 사고).
     src.extra_images = 0
     await post.paste_all(src)
+    await post.log_targets(f"[{no}/{total}] 붙여넣기 후")
 
     await post.verify_body(src)
     if product_url:
@@ -350,6 +375,16 @@ async def main_async(args, settings, log) -> int:
                 log(f"──── 배치 {start // size + 1} — {group[0]}~{group[-1]}번 "
                     f"(탭 {len(group)}개) ────")
 
+            # ★두 번째 배치부터는 **앞 배치 상태를 쓰지 않는다**.
+            #   기준글 프레임·컴포넌트·본문을 전부 다시 읽는다.
+            if start > 0:
+                before = len(src.components)
+                await src.scan()
+                src.extra_images = 0
+                log(f"[배치] 기준글을 다시 읽었습니다 — 컴포넌트 {before}개 → "
+                    f"{len(src.components)}개")
+            await _log_state(ctx, src, log, f"배치 {start // size + 1} 시작 전")
+
             posts = []
             for no in group:
                 try:
@@ -366,6 +401,7 @@ async def main_async(args, settings, log) -> int:
                             f"그대로 남아 있습니다: {published}")
                     raise
             made += len(posts)
+            await _log_state(ctx, src, log, f"배치 {start // size + 1} 작성 끝")
 
             log("")
             log(f"[작성] {len(posts)}건 READY — 탭 {len(posts)}개가 열려 있습니다")

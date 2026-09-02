@@ -129,8 +129,12 @@ SCAN_JS = r"""(opt) => {
        }
      });
      const productLinks = comps.filter(el => el.querySelector('.se-image-link-icon')).length;
+     // ★본문 전체 글자도 함께 넘긴다 — '제목 문구가 원래 있었는지' 를 앞 40자만
+     //   보고 판단하면 멀쩡한 글이 막힌다(2026-09-02 티눈 사례).
+     const bodyText = comps.map(el => (el.innerText || ''))
+                           .join(' ').replace(/\s+/g, ' ').trim();
      return {title: titleTxt, total: comps.length, items: info,
-             productLinks: productLinks};
+             productLinks: productLinks, bodyText: bodyText};
    }"""
 
 
@@ -160,6 +164,7 @@ class SourcePost:
         self.frame = frame
         self.log = log
         self.title = ""
+        self.body_text = ""            # 기준글 본문 전체(제목 문구 오탐 방지용)
         self.components: list[Component] = []
         self.product_link_count = 0           # 제품링크 이미지 개수(복사 제외, URL 로 재생성)
 
@@ -219,6 +224,7 @@ class SourcePost:
         res = await fr.evaluate(SCAN_JS, {"minChars": MIN_TEXT_CHARS,
                                           "ph": list(PLACEHOLDER_TEXTS)})
         self.title = res["title"]
+        self.body_text = str(res.get("bodyText") or "")
         self.components = [
             Component(idx=it["idx"], kind=it["kind"], chars=it["chars"],
                       imgs=it["imgs"], head=it["head"], cls=it["cls"],

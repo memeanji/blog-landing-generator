@@ -596,6 +596,29 @@ class NewPost:
         self.log(f"      캐럿 이탈 감지(focus={state['focused']} inBody={state['inBody']}) — 다시 잡습니다")
         await self.prepare_body_caret()
 
+    async def log_targets(self, tag: str = "") -> None:
+        """지금 제목칸·본문칸이 어떤 상태인지 남긴다.
+
+        ★제목이 본문으로 새어 드는 일이 있었는데, 이 기록이 없어 '자리를 잘못
+          잡은 것' 인지 '내용 문제' 인지 가릴 수 없었다(2026-09-02).
+        """
+        try:
+            fr = await self._fr()
+            info = await fr.evaluate(
+                "() => {"
+                " const norm = t => (t||'').replace(/\\s+/g,' ').trim();"
+                " const t = document.querySelector('.se-title-text, .se-documentTitle');"
+                " const b = document.querySelector('.se-main-container');"
+                " return {title: t ? norm(t.innerText).slice(0,40) : '(없음)',"
+                "         titleLen: t ? norm(t.innerText).length : -1,"
+                "         bodyLen: b ? norm(b.innerText).length : -1,"
+                "         comps: b ? b.querySelectorAll('.se-component').length : -1};"
+                "}")
+            self.log(f"[자리] {tag} 제목칸={info['title']!r}({info['titleLen']}자)"
+                     f" · 본문 {info['bodyLen']}자/{info['comps']}개")
+        except Exception as exc:                               # noqa: BLE001
+            self.log(f"[자리] {tag} 확인 실패({type(exc).__name__})")
+
     async def paste_all(self, src, img_timeout_ms: int = 60_000) -> dict:
         """기준글 본문 전체를 **한 번에** 붙여넣고 검증한다 (2026-08-21 사용자 시연 방식).
 
@@ -691,9 +714,15 @@ class NewPost:
         #   실패로 볼 것은 **제목 컴포넌트가 본문으로 복사된 경우**뿐이다.
         fr = await self._fr()
         tc = await fr.evaluate(TITLE_COMP_IN_BODY_JS, src.title or "")
+        # ★기준글에 원래 같은 문구가 있었는지 본다. 예전에는 각 문단의 **앞 40자**만
+        #   봐서, 문단 중간에 있으면 '새로 생긴 문구' 로 잘못 판정했다
+        #   (2026-09-02 '티눈에 대한 일반적인 정보' — 멀쩡한 글이 막혔다).
+        source_body = _norm(getattr(src, "body_text", "") or "")
         heads = [_norm(getattr(c, "head", "")) for c in (getattr(src, "components", None) or [])]
         key = title[:30]
-        in_source = bool(key) and any(h.startswith(key) or key in h for h in heads if h)
+        in_source = bool(key) and (
+            (key in source_body)
+            or any(h.startswith(key) or key in h for h in heads if h))
 
         if tc.get("titleComp"):
             problems.append(
@@ -703,6 +732,22 @@ class NewPost:
         elif tc.get("firstEqualsTitle") and not in_source:
             problems.append(f"본문 첫 문단이 제목과 통째로 같습니다: {title!r}")
         elif len(title) >= 6 and title in body and not in_source:
+            # ★어디서 온 문구인지 남긴다. 이게 없어서 '제목이 본문으로 새어 든 것'
+            #   인지 '원래 있던 문구' 인지 가리는 데 오래 걸렸다(2026-09-02).
+            at = body.find(title)
+            around = body[max(0, at - 40):at + len(title) + 40]
+            self.log(f"[검증] 제목 문구 위치 — 본문 {at}번째 글자")
+            self.log(f"        …{around}…")
+            self.log(f"        본문 {len(body)}자 / 기준글 본문 {len(source_body)}자")
+            try:
+                head_txt = await fr.evaluate(
+                    "() => { const t = document.querySelector("
+                    "'.se-title-text, .se-documentTitle');"
+                    " return t ? (t.innerText||'').replace(/" + chr(92) + "s+/g,' ').trim()"
+                    " : '(제목칸 못 찾음)'; }")
+                self.log(f"        지금 제목칸 = {head_txt!r}")
+            except Exception:                                  # noqa: BLE001
+                pass
             problems.append(f"원본에 없던 제목 문구가 본문에 생겼습니다: {title!r}")
         elif len(title) >= 6 and title in body and in_source:
             self.log(f"[검증] 본문에 제목과 같은 문구가 있지만 **원본에도 있는 문구**라 정상 "

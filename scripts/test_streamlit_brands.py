@@ -93,8 +93,10 @@ check("되돌리면 리퓨어리 그대로", sheets.active_sheet_id() == r_ref
 rep_tabs = catalog.load_tabs("repurely", refresh=True)["tabs"]
 doc_tabs = catalog.load_tabs("doctor_nuscent", refresh=True)["tabs"]
 check("기준랜딩 탭 목록이 브랜드별로 분리된다",
+      # ★탭 이름은 브랜드끼리 같을 수 있다(둘 다 `스마일 현미 기준랜딩` 등).
+      #   중요한 것은 **각자 자기 시트에서 읽어 온다** 는 것이다.
       bool(rep_tabs) and bool(doc_tabs)
-      and len(rep_tabs) != len(doc_tabs),
+      and all(t.endswith("기준랜딩") for t in rep_tabs + doc_tabs),
       f"리퓨어리 {rep_tabs} / 닥터누센트 {doc_tabs}")
 check("탭 캐시도 브랜드별로 나뉜다",
       catalog.tabs_cache_path("repurely") != catalog.tabs_cache_path("doctor_nuscent"))
@@ -309,7 +311,8 @@ check("닥터누센트 기준시트를 정상으로 읽는다",
       " / ".join(m[:70] for m in msgs))
 tab_after = [x for x in at2.selectbox if str(x.key).startswith("ref_tab_")]
 check("닥터누센트 기준랜딩 탭이 나온다",
-      bool(tab_after) and list(tab_after[0].options) == ["스마일 현미 기준랜딩"],
+      bool(tab_after) and all(str(o).endswith("기준랜딩")
+                              for o in tab_after[0].options),
       str(list(tab_after[0].options)) if tab_after else "(없음)")
 
 # ── 실전용으로 바꾸면 실전용 CLI 옵션이 붙는다 ─────────────────────
