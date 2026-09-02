@@ -18,8 +18,12 @@ from datetime import datetime
 from pathlib import Path
 
 from .accounts import account_id
+from .appdir import ROOT      # 개발 PC=프로젝트 폴더 / 설치본=%APPDATA%\BlogLandingAgent
 
-ROOT = Path(__file__).resolve().parent.parent
+# ★예전에는 이 파일 위치를 기준으로 삼았다. 설치본에서는 그게 **프로그램 폴더**
+#   (…\BlogLandingAgent\_internal) 라서, 로그인 세션이 거기 저장됐다.
+#   프로그램을 새로 깔면 지워지고, 화면도 그 폴더를 보지 않아 "로그인 안 됨" 으로
+#   보였다. 다른 자료(계정·작업함)와 같은 곳에 두는 것이 맞다.
 SESSIONS_ROOT = ROOT / "sessions"
 LEGACY_PROFILE = ROOT / "playwright-profile"
 

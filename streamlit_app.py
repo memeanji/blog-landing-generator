@@ -71,6 +71,7 @@ def info_block(*pairs: tuple[str, str]) -> str:
     return f"<div class='info-block'>{items}</div>"
 
 RUNNING_STATES = (queue_store.PENDING, queue_store.RUNNING)
+NEWLINE = chr(10)
 BADGE = {queue_store.PENDING: "⏳ 대기", queue_store.RUNNING: "▶ 실행 중",
          queue_store.DONE: "✅ 완료", queue_store.FAILED: "❌ 실패",
          queue_store.CANCELED: "⏹ 중단됨"}
@@ -531,15 +532,72 @@ def submit_session_job(store, brand, account, action: str,
         target_agent=device_id)
 
 
-def session_job_state(store, account) -> str:
-    """이 계정의 최근 세션 작업 상태 — running / pending / done / failed / ''."""
+def session_job(store, account, brand=None) -> dict | None:
+    """이 계정의 가장 최근 세션(로그인) 작업 기록.
+
+    ★화면과 PC 가 같은 계정을 다른 이름으로 부를 수 있다. 화면(클라우드)에는
+      계정 목록이 없어 탭에서 만든 이름을 쓰고, PC 는 원래 쓰던 이름을 쓴다.
+      그래서 **둘 다** 같은 것으로 본다. 아니면 진행 상황을 못 찾는다.
+    """
+    names = {account.id}
+    tab = getattr(account, "ref_tab", "") or ""
+    if tab:
+        try:
+            names.add(accounts.tab_slug(tab, brand))
+        except Exception:                                      # noqa: BLE001
+            pass
     for rec in store.list_jobs(limit=20):
         if rec.get("kind") != "session":
             continue
-        if (rec.get("job") or {}).get("account") != account.id:
+        if (rec.get("job") or {}).get("account") not in names:
             continue
-        return rec.get("status") or ""
-    return ""
+        return rec
+    return None
+
+
+def session_job_state(store, account) -> str:
+    """이 계정의 최근 세션 작업 상태 — running / pending / done / failed / ''."""
+    rec = session_job(store, account, getattr(account, "brand", None))
+    return (rec or {}).get("status") or ""
+
+
+def render_progress(store, rec: dict, title: str = "진행 상황") -> None:
+    """지금 무엇을 하고 있는지 짧게 보여 준다.
+
+    ★사람이 PC 앞에서 기다리는 동안 "돌고는 있나?" 를 알 수 있어야 한다.
+      자세한 내용은 아래 상세 화면에 그대로 있고, 여기서는 마지막 몇 줄만 본다.
+    """
+    if not rec:
+        return
+    status = rec.get("status") or ""
+    started = (rec.get("created_at") or "")[11:19]
+    passed = ""
+    try:
+        t0 = datetime.fromisoformat((rec.get("created_at") or "").replace("Z", ""))
+        sec = int((datetime.now() - t0).total_seconds())
+        passed = f"{sec // 60}분 {sec % 60}초" if sec >= 60 else f"{sec}초"
+    except Exception:                                          # noqa: BLE001
+        pass
+
+    with st.container(border=True):
+        head = st.columns([3, 1])
+        head[0].markdown(f"**{title}** · {BADGE.get(status, status)}")
+        head[1].caption(f"{started} 시작" + (f" · {passed} 지남" if passed else ""))
+
+        try:
+            text, _ = store.read_log(rec["id"])
+        except Exception:                                      # noqa: BLE001
+            text = ""
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        # 사람이 읽을 줄만 남긴다(내부 명령줄·빈 줄은 뺀다)
+        lines = [ln for ln in lines if not ln.startswith("[agent] C:")]
+        st.code(NEWLINE.join(lines[-6:]) or "시작하는 중입니다…", language="log")
+
+        if status in RUNNING_STATES:
+            st.caption("몇 초마다 저절로 갱신됩니다. 이 화면을 그대로 두셔도 됩니다.")
+        elif status == "failed":
+            why = (rec.get("error") or "").strip().splitlines()
+            st.error("실패했습니다" + (f" — {why[0][:150]}" if why else ""))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1035,6 +1093,7 @@ with left:
         #     그 PC 의 에이전트가 로그인 창을 연다. 로그인은 사람이 직접 한다.
         info = session_store.describe(account) if account else {
             "state_exists": False, "cookies": 0, "saved_at": "", "profile": ""}
+        st.session_state["_waiting_login"] = False
         job_state = session_job_state(store, account) if account else ""
         # ★세션은 그 PC 안에만 있다. 서버에서 도는 화면은 폴더를 볼 수 없으므로,
         #   로그인 작업이 성공으로 끝났으면 준비된 것으로 본다.
@@ -1045,6 +1104,9 @@ with left:
         if ready:
             st.success(f"● 실행 준비 완료 — {ref_tab}")
         elif job_state in RUNNING_STATES:
+            # 로그인이 끝나면 저절로 바뀌도록, 이 화면을 잠시 뒤 다시 그린다
+            #   (아래 맨 끝에서 한 번만 건다 — 그리는 도중에 걸면 화면이 깨진다)
+            st.session_state["_waiting_login"] = True
             st.info("▶ 로그인 창이 열렸습니다 — 네이버 로그인을 직접 마쳐 주세요."
                     f"{chr(10)}로그인이 끝나면 세션이 저장되고 자동으로 준비 완료가 됩니다.")
         else:
@@ -1071,6 +1133,11 @@ with left:
             st.session_state["job_id"] = jid
             st.toast("실행 준비를 시작했습니다 — 로그인 창을 확인해 주세요.")
             st.rerun()
+
+        # 지금 어디까지 왔는지 — 버튼 바로 아래에서 보인다
+        watching = session_job(store, account, brand) if account else None
+        if watching:
+            render_progress(store, watching, "실행 준비 진행 상황")
 
         st.caption(("· 로그인 세션: 있음 "
                     f"(쿠키 {info['cookies']}개 · {info['saved_at'][:16]})"
@@ -1347,3 +1414,15 @@ else:
     if auto and status in RUNNING_STATES:
         time.sleep(1.5)
         st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════
+# 로그인을 기다리는 동안 — 스스로 새로고침
+#   ★사람이 PC 에서 로그인을 마치는 순간을 화면은 알 수 없다. 그래서 기다리는
+#     동안만 몇 초마다 다시 그려, 끝나면 저절로 '준비 완료' 가 되게 한다.
+#   ★반드시 **맨 끝에서 한 번만** 건다. 화면을 그리는 도중에 걸면 방금 그린
+#     것과 부딪혀 빨간 오류(removeChild)가 난다.
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.get("_waiting_login"):
+    time.sleep(2.0)
+    st.rerun()
