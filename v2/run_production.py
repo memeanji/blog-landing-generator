@@ -538,6 +538,7 @@ async def main_async(args, settings, log) -> int:
         log.event("run_finished", ok=True, dry_run=True, total=total, published=[],
                   brand=brand.id, failed_rows=failed_rows,
                   rows=[it["row"] for it in items])
+        args.__dict__["_done_ok"] = True   # ★끝까지 마쳤다는 표시
         return 0
 
     pw = ctx = None
@@ -706,6 +707,7 @@ async def main_async(args, settings, log) -> int:
         log.event("run_finished", ok=True, total=total, published=published,
                   brand=brand.id, failed_rows=failed_rows,
                   rows=[d["row"] for d in done])
+        args.__dict__["_done_ok"] = True   # ★끝까지 마쳤다는 표시
         return 0 if not failed_rows else 3
     except Exception as exc:                                   # noqa: BLE001
         failed = True
@@ -784,6 +786,12 @@ def main(argv=None) -> int:
         log.event("run_finished", ok=False, error="사용자 중단")
         return 130
     except Exception as exc:                                   # noqa: BLE001
+        # ★일을 다 마친 뒤 **브라우저를 닫는 과정**에서 나는 오류는 실패가 아니다
+        #   (사람이 창을 직접 닫으면 여기서 파이프 오류가 난다).
+        if getattr(args, "_done_ok", False):
+            log(f"[정리] 창을 닫는 중 문제가 있었지만 작업은 끝났습니다 "
+                f"({type(exc).__name__}). 결과에는 영향이 없습니다.")
+            return 0
         log(f"[오류] {exc}")
         log(traceback.format_exc())
         # ★UI(큐)가 '왜 실패했는지' 를 그대로 받아 볼 수 있게 이벤트로도 남긴다.

@@ -392,6 +392,7 @@ async def main_async(args, settings, log) -> int:
         elif published:
             log("[시트] --sheet-media / --sheet-date 가 없어 기록하지 않았습니다")
         log.event("run_finished", ok=True, made=made, published=published)
+        args.__dict__["_done_ok"] = True   # ★끝까지 마쳤다는 표시
         return 0
     except Exception as exc:                                   # noqa: BLE001
         # ★대기(finally) 앞에서 먼저 남긴다 — 안 그러면 에러가 --hold 초 동안 안 보인다.
@@ -473,6 +474,13 @@ def main(argv=None) -> int:
         log.event("run_finished", ok=False, error="사용자 중단")
         return 130
     except Exception as exc:                                   # noqa: BLE001
+        # ★일을 다 마친 뒤 **브라우저를 닫는 과정**에서 나는 오류는 실패가 아니다.
+        #   (사람이 창을 직접 닫으면 여기서 파이프 오류가 난다. 예전에는 이것 때문에
+        #    발행·시트 기록까지 다 끝난 실행이 '실패' 로 기록됐다.)
+        if getattr(args, "_done_ok", False):
+            log(f"[정리] 창을 닫는 중 문제가 있었지만 작업은 끝났습니다 "
+                f"({type(exc).__name__}). 결과에는 영향이 없습니다.")
+            return 0
         log(f"[오류] {exc}")
         log(traceback.format_exc())
         log.event("run_finished", ok=False, error=f"{type(exc).__name__}: {exc}")
