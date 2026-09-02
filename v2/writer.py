@@ -1097,10 +1097,57 @@ class NewPost:
         self.log("[발행설정] ❌ '댓글' 체크박스를 찾지 못했습니다")
         return False
 
+    async def close_side_panels(self) -> int:
+        """열려 있는 옆 패널·덮개를 닫는다.
+
+        ★네이버 에디터는 오른쪽에 **모바일 화면 미리보기** 같은 패널이 열리면
+          그 아래 발행 버튼을 덮어 버린다. 버튼은 그대로 있으니 '찾았지만
+          클릭이 튕기는' 상태가 되어, 원인을 알기 어려웠다.
+        """
+        closed = 0
+        try:
+            await self.page.keyboard.press("Escape")
+            await self.page.wait_for_timeout(200)
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
+            closed = await self.page.evaluate(r"""() => {
+                const seen = [];
+                const vis = el => {
+                  if (!el) return false;
+                  const r = el.getBoundingClientRect();
+                  return r.width > 0 && r.height > 0 &&
+                         getComputedStyle(el).visibility !== 'hidden';
+                };
+                // 오른쪽 패널 안의 닫기 단추를 찾는다
+                const panels = Array.from(document.querySelectorAll('div,section,aside'))
+                  .filter(el => vis(el) &&
+                          el.getBoundingClientRect().width > 200 &&
+                          el.getBoundingClientRect().right > window.innerWidth - 40 &&
+                          /미리보기|사이드|패널/.test(el.innerText || ''));
+                for (const panel of panels) {
+                  const btns = Array.from(panel.querySelectorAll('button,a,[role="button"]'))
+                    .filter(vis)
+                    .filter(b => /닫기|close/i.test(
+                        (b.getAttribute('aria-label') || '') + ' ' +
+                        (b.className || '') + ' ' + (b.title || '')));
+                  if (btns.length) { btns[0].click(); seen.push(1); }
+                }
+                return seen.length;
+            }""")
+        except Exception:                                      # noqa: BLE001
+            closed = 0
+        if closed:
+            await self.page.wait_for_timeout(600)
+            self.log(f"[발행] 화면을 덮고 있던 패널 {closed}개를 닫았습니다")
+        return closed
+
     async def publish(self, require_comments_off: bool = True) -> str:
         before_url = self.page.url
         await self.page.bring_to_front()
+        await self.close_side_panels()          # ★발행 버튼을 가리는 것부터 치운다
         first = None
+        last_error = ""
         for step in (1, 2):
             cands = await self._publish_candidates()
             clicked = False
@@ -1118,10 +1165,37 @@ class NewPost:
                         first = c["handle"]
                     self.log(f"[발행] {step}단계 버튼 클릭 — {c['desc']}")
                     break
-                except Exception:                              # noqa: BLE001
+                except Exception as exc:                       # noqa: BLE001
+                    why = f"{type(exc).__name__}: {str(exc).splitlines()[0][:80]}"
+                    last_error = f"{c['desc']} → {why}"
                     continue
+
+            if not clicked and cands:
+                # ★무언가가 덮고 있어 튕기는 경우다. 패널을 다시 치우고,
+                #   그래도 안 되면 가려짐을 무시하고 눌러 본다.
+                await self.close_side_panels()
+                for c in cands:
+                    try:
+                        await c["handle"].scroll_into_view_if_needed(timeout=2000)
+                        await c["handle"].click(timeout=3000, force=True)
+                        clicked = True
+                        if step == 1:
+                            first = c["handle"]
+                        self.log(f"[발행] {step}단계 버튼 클릭(가려짐 무시) — {c['desc']}")
+                        break
+                    except Exception as exc:                   # noqa: BLE001
+                        last_error = (f"{c['desc']} → {type(exc).__name__}: "
+                                      f"{str(exc).splitlines()[0][:80]}")
+
             if not clicked:
-                raise RuntimeError(f"[발행] {step}단계 버튼을 찾지 못했습니다(후보 {len(cands)}개)")
+                if cands:
+                    self.log(f"[발행] 후보 {len(cands)}개를 눌러 봤지만 모두 실패했습니다:")
+                    for c in cands[:4]:
+                        self.log(f"        · {c['desc']}")
+                    raise RuntimeError(
+                        f"[발행] {step}단계 버튼이 눌리지 않습니다(후보 {len(cands)}개). "
+                        f"무언가가 버튼을 덮고 있을 수 있습니다 — {last_error}")
+                raise RuntimeError(f"[발행] {step}단계 버튼을 찾지 못했습니다(후보 0개)")
             await self.page.wait_for_timeout(1500)
             if step == 1:
                 ok = await self.disable_comments()
