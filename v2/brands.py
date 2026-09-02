@@ -85,6 +85,8 @@ class Brand:
     reference_tab: str = ""
     # 기준랜딩 탭을 알아보는 표시(이름에 이 말이 들어간 탭 = 기준랜딩 탭)
     reference_tab_mark: str = DEFAULT_REFERENCE_TAB_MARK
+    # 기준랜딩 탭 → 계정 정보(선택). {"행복하서연 기준랜딩": {"name": …, "login_id": …}}
+    accounts: dict = field(default_factory=dict)
     utm_sheet_id: str = ""
     utm_sheet_label: str = ""
     utm_tab_pattern: str = DEFAULT_UTM_TAB_PATTERN
@@ -136,6 +138,28 @@ class Brand:
         """`스마일 현미 기준랜딩` → `스마일 현미` (화면 보조 표기용)."""
         mark = (self.reference_tab_mark or DEFAULT_REFERENCE_TAB_MARK)
         return (title or "").replace(mark, "").strip() or (title or "").strip()
+
+    def account_of(self, tab: str) -> dict:
+        """기준랜딩 탭 → 그 탭을 쓰는 계정 정보.
+
+        ★계정 식별이 **로컬 파일에 있느냐** 에 매이면 안 된다. 클라우드 화면에는
+          accounts.json 이 없어서 계정이 빈칸이 됐고, 그 탓에 로그인 여부 판단이
+          안 돼 [실전 실행] 이 영영 잠겼다.
+          브랜드 설정은 화면(Secrets)과 PC(작업에 실어 보냄) 양쪽에 이미 가 있으므로,
+          여기 적어 두면 어디서든 같은 값을 얻는다.
+
+        `accounts` 는 선택 항목이다. 없으면 탭 이름에서 표시 이름만 뽑아 쓴다
+        (예전 그대로).
+        """
+        want = (tab or "").strip()
+        for key, row in (self.accounts or {}).items():
+            if str(key).strip() == want and isinstance(row, dict):
+                return {"name": str(row.get("name") or self.account_name_of(want)),
+                        "login_id": str(row.get("login_id") or ""),
+                        "blog_id": str(row.get("blog_id") or ""),
+                        "session_id": str(row.get("session_id") or "")}
+        return {"name": self.account_name_of(want), "login_id": "",
+                "blog_id": "", "session_id": ""}
 
     def header(self, key: str, default: str) -> str:
         """UTM 빌더 컬럼명 오버라이드. 브랜드가 다른 헤더를 쓰면 `headers` 로 맞춘다."""
@@ -214,6 +238,9 @@ def _from_raw(raw: dict) -> Brand | None:
         utm_sheet_label=str(raw.get("utm_sheet_label") or "").strip(),
         utm_tab_pattern=str(raw.get("utm_tab_pattern") or DEFAULT_UTM_TAB_PATTERN),
         utm_media_tabs=dict(tabs) if isinstance(tabs, dict) else {},
+        # 기준랜딩 탭 → 계정 정보(선택). 화면과 PC 가 같은 값을 쓰게 하는 근거다.
+        accounts=(dict(raw.get("accounts"))
+                  if isinstance(raw.get("accounts"), dict) else {}),
         headers=dict(heads) if isinstance(heads, dict) else {},
         enabled=bool(raw.get("enabled", True)),
         ready=bool(raw.get("ready", True)),

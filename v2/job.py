@@ -70,6 +70,10 @@ class Job:
     headless: bool | None = None         # None = 각 CLI 기본값 그대로
     events: bool = True
     ref_tab: str = ""
+    # ★계정은 화면에서 이미 확정해 보낸다(로컬 파일에 기대지 않는다).
+    #   실행 기록에도 "계정=행복하서연 (rhksrhf6996)" 처럼 남는다.
+    account_name: str = ""
+    login_id: str = ""
     # ── 검수용(v2.run) 전용 ────────────────────────────────────────
     product_url: str = ""
     url: str = ""

@@ -108,7 +108,12 @@ def get_store():
 def load_catalog(brand_id: str, account_id: str, ref_tab: str,
                  refresh: bool = False) -> dict:
     """★브랜드가 캐시 키의 맨 앞이다 — 브랜드끼리 목록이 섞이면 안 된다."""
-    acc = accounts.resolve(account_id) if account_id else None
+    # ★시트를 읽는 데 필요한 것은 **브랜드와 탭**이다. 계정 목록 파일이 있느냐에
+    #   매이면 안 된다(클라우드에는 그 파일이 없어 시트조차 못 읽었다).
+    try:
+        acc = accounts.resolve(account_id) if account_id else None
+    except Exception:                                          # noqa: BLE001
+        acc = None
     return catalog.load(acc, ref_tab=ref_tab, refresh=refresh, brand=brand_id)
 
 
@@ -165,7 +170,7 @@ def preview_rows(brand_id: str, flow: str, media: str, deficiency: str, kind: st
 # ══════════════════════════════════════════════════════════════════
 # 화면 버전 — 배포할 때마다 바뀐다. "지금 보는 게 최신인가" 를 눈으로 확인하려고 둔다.
 #   (클라우드는 새로고침해도 옛 화면이 잠깐 남을 수 있어, 이 번호로 가른다)
-APP_VERSION = "09-02 10:06"
+APP_VERSION = "09-02 10:18"
 
 AGENT_DOWNLOAD_URL = ("https://github.com/memeanji/blog-landing-generator/"
                       "releases/latest/download/BlogLandingAgentSetup.exe")
@@ -527,13 +532,61 @@ def submit_session_job(store, brand, account, action: str,
     """
     titles = {"--login": "로그인", "--check": "세션 확인"}
     tab = ref_tab or getattr(account, "ref_tab", "") or ""
-    extra = [action, account.id]
+    extra = [action, account.id, "--events"]
     if tab:
         extra += ["--ref-tab", tab, "--brand", brand.id]
+    who = account.label or account.id
+    got_id = getattr(account, "login_id", "") or ""
     return store.submit(
-        Job(brand=brand.id, account=account.id, extra=extra),
-        kind="session", title=f"{titles.get(action, action)} — {account.title}",
+        Job(brand=brand.id, account=account.id, ref_tab=tab,
+            account_name=who, login_id=got_id, extra=extra),
+        kind="session",
+        title=f"{titles.get(action, action)} — {who}"
+              + (f" ({got_id})" if got_id else ""),
         target_agent=device_id)
+
+
+def resolve_account(brand, ref_tab: str):
+    """기준랜딩 탭을 고르면 **그 자리에서** 계정이 정해진다.
+
+    ★예전에는 로컬 accounts.json 을 읽어야만 계정을 알 수 있었다. 클라우드
+      화면에는 그 파일이 없으니 계정이 빈칸이 되고, "로그인했는가" 판단이
+      아예 안 돼서 [실전 실행] 이 영영 잠겼다. 이제 파일에 기대지 않는다.
+
+    찾는 순서
+      1) 로컬 계정 목록 (각자 PC 에서 화면을 띄웠을 때 — 예전 그대로)
+      2) 브랜드 설정의 `accounts` (화면·PC 양쪽에 이미 전달되는 설정)
+      3) 탭 이름에서 만든 값 (설정에 없어도 빈칸이 되지 않게)
+    세션 폴더 id 는 탭 이름에서 만들므로 어디서 계산하든 같다.
+    """
+    tab = (ref_tab or "").strip()
+    found = accounts.ensure_for_tab(tab, brand, create=False)
+    if found is not None:
+        return found
+    info = brand.account_of(tab) if hasattr(brand, "account_of") else {}
+    return accounts.Account(
+        id=info.get("session_id") or accounts.tab_slug(tab, brand),
+        label=info.get("name") or brand.account_name_of(tab) or tab,
+        login_id=info.get("login_id", ""), blog_id=info.get("blog_id", ""),
+        ref_tab=tab, brand=brand.id)
+
+
+def session_ready(store, rec: dict) -> dict:
+    """PC 가 돌려준 '준비 완료' 응답. 없으면 빈 dict.
+
+    ★화면은 로컬 파일이 아니라 **이 응답**으로 로그인 여부를 판단한다.
+    """
+    if not rec or rec.get("status") != "done":
+        return {}
+    try:
+        events, _ = store.read_events(rec["id"])
+    except Exception:                                          # noqa: BLE001
+        return {}
+    for ev in reversed(events or []):
+        if ev.get("stage") == "session_ready" or ev.get("name") == "session_ready":
+            return ev
+    # 옛 Agent 는 이 응답을 보내지 않는다 — 작업이 성공했으면 준비된 것으로 본다
+    return {"session_ready": True, "legacy": True}
 
 
 def session_job(store, account, brand=None) -> dict | None:
@@ -712,7 +765,8 @@ def job_summary(rec: dict) -> dict:
     return {
         "시간": (rec.get("created_at") or "")[5:16].replace("T", " "),
         "브랜드": brand_name(rec.get("brand") or job.get("brand") or ""),
-        "계정": job.get("account") or "",
+        "계정": ((job.get("account_name") or job.get("account") or "")
+                + (f" ({job['login_id']})" if job.get("login_id") else "")),
         "작업": kind_label,
         "매체": job.get("media") or "",
         "결핍": job.get("deficiency") or "",
@@ -928,8 +982,7 @@ with left:
         ref_tab = acol.selectbox("기준 계정", tab_list, key=f"ref_tab_{brand.id}",
                                  help="기준시트의 어느 기준랜딩 탭을 쓸지 고릅니다. "
                                       "목록은 시트에서 자동으로 읽어옵니다")
-        # 이 탭을 쓰는 계정(=세션 폴더). 아직 없으면 [실행 준비] 때 만든다.
-        account = accounts.ensure_for_tab(ref_tab, brand, create=False)
+        account = resolve_account(brand, ref_tab)
 
         # ── 참고용 랜딩 기준 시트 바로가기 · 선택 계정의 로그인 ID ──
         #   ★URL 은 하드코딩하지 않고 **선택한 브랜드 설정**에서 만든다.
@@ -1036,7 +1089,11 @@ with left:
         #       · --batch/--start/--copy-mode/--ref-copy-from → CLI 기본값
         def build_job(dry: bool) -> Job:
             job = Job(flow=flow, brand=brand.id,
-                      account=account.id if account else "",
+                      account=account.id,
+                      # ★계정 이름·로그인 ID 도 함께 싣는다. 실행 기록이
+                      #   "계정=행복하서연 (rhksrhf6996)" 로 남아야 나중에 볼 수 있다.
+                      account_name=account.label or account.id,
+                      login_id=getattr(account, "login_id", "") or "",
                       ref_tab=ref_tab,          # ★고른 기준랜딩 탭을 그대로 넘긴다
                       media=media, deficiency=deficiency, kind=kind,
                       count=int(count), publish=not dry, dry_run=dry,
@@ -1110,15 +1167,21 @@ with left:
         info = session_store.describe(account) if account else {
             "state_exists": False, "cookies": 0, "saved_at": "", "profile": ""}
         st.session_state["_auto_refresh"] = False
-        job_state = session_job_state(store, account) if account else ""
-        # ★세션은 그 PC 안에만 있다. 서버에서 도는 화면은 폴더를 볼 수 없으므로,
-        #   로그인 작업이 성공으로 끝났으면 준비된 것으로 본다.
-        logged_in = bool(info["state_exists"]) or job_state == "done"
+        last_login = session_job(store, account, brand) if account else None
+        job_state = (last_login or {}).get("status") or ""
+        ready_info = session_ready(store, last_login)
+        # ★로컬에 계정 파일이 있느냐로 판단하지 않는다. 그 PC 가 "준비됐다" 고
+        #   돌려준 응답(session_ready)과, 화면에서 고른 계정으로 판단한다.
+        logged_in = bool(info["state_exists"]) or bool(ready_info.get("session_ready"))
         ready = bool(agent_ready) and logged_in
 
         st.divider()
         if ready:
-            st.success(f"● 실행 준비 완료 — {ref_tab}")
+            who = ready_info.get("account_name") or account.label
+            got_id = ready_info.get("login_id") or account.login_id
+            st.success(f"● 실행 준비 완료 — {who}"
+                       + (f" ({got_id})" if got_id else "")
+                       + f" · {ref_tab}")
             # ★로그인 다음은 **자동으로 이어지지 않는다**(실수 발행을 막으려고).
             #   그 사실을 적어 두지 않아 "멈춘 것 같다" 는 이야기가 나왔다.
             st.info("여기서 자동으로 글이 써지지는 않습니다."
@@ -1144,10 +1207,8 @@ with left:
             # 계정이 없으면 **로그인하는 PC 에서** 만든다. 여기(서버)서 만들면
             # 서버 안에만 생겨서 PC 는 "계정을 찾지 못했습니다" 가 난다.
             # 탭 이름이 같으면 id 도 같으므로 미리 계산해 보내면 어긋나지 않는다.
-            account = accounts.ensure_for_tab(ref_tab, brand, create=False) \
-                or accounts.Account(id=accounts.tab_slug(ref_tab, brand),
-                                    label=brand.account_name_of(ref_tab) or ref_tab,
-                                    blog_id="", ref_tab=ref_tab, brand=brand.id)
+            # 계정은 위에서 이미 정해 뒀다(없으면 탭 이름으로 만든 것).
+            #   실제 등록은 **로그인하는 PC 에서** 한다.
             jid = submit_session_job(store, brand, account, "--login",
                                      device["device_id"] if device else "",
                                      ref_tab=ref_tab)

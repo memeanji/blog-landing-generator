@@ -35,6 +35,8 @@ def parse_args(argv=None):
     p.add_argument("--ref-tab", metavar="탭이름",
                    help="이 기준랜딩 탭의 계정을 쓴다(없으면 이 PC 에 만든다)")
     p.add_argument("--brand", metavar="브랜드", help="--ref-tab 과 함께 쓴다")
+    p.add_argument("--events", action="store_true",
+                   help="진행 상황을 `@@EVENT {json}` 로도 알린다(화면이 읽는다)")
     return p.parse_args(argv)
 
 
@@ -93,6 +95,10 @@ async def _open(acc, log, headless: bool, relogin: bool) -> int:
 
         log(f"[결과] ✅ 로그인 확인 — {acc.title} ({blog_id})")
         session_store.write_meta(acc, blog_id=blog_id)
+        # ★화면은 이 응답으로 판단한다(클라우드에는 계정 파일이 없다).
+        log.event("session_ready", session_ready=True, account=acc.id,
+                  account_name=acc.title, login_id=acc.login_id or "",
+                  blog_id=blog_id)
         return 0
     except Exception as exc:                                   # noqa: BLE001
         log(f"[결과] ❌ {exc}")
@@ -136,7 +142,8 @@ def account_for(key, ref_tab: str = "", brand: str = "", log=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
     settings = load_settings()
-    log = Log(settings.out_dir, tag="v2_session")
+    log = Log(settings.out_dir, tag="v2_session",
+              events=bool(getattr(args, "events", False)))
     try:
         if args.list or not any((args.adopt, args.login, args.check, args.clear)):
             return cmd_list(log)
