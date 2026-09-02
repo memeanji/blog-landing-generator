@@ -163,6 +163,10 @@ def preview_rows(brand_id: str, flow: str, media: str, deficiency: str, kind: st
 # 접근 · 내 PC(Agent) — 실행은 언제나 **사용자 PC 의 Agent** 가 한다.
 #   화면은 큐에 넣기만 하고, Playwright 는 클라우드에서 절대 돌지 않는다.
 # ══════════════════════════════════════════════════════════════════
+# 화면 버전 — 배포할 때마다 바뀐다. "지금 보는 게 최신인가" 를 눈으로 확인하려고 둔다.
+#   (클라우드는 새로고침해도 옛 화면이 잠깐 남을 수 있어, 이 번호로 가른다)
+APP_VERSION = "8170b32"
+
 AGENT_DOWNLOAD_URL = ("https://github.com/memeanji/blog-landing-generator/"
                       "releases/latest/download/BlogLandingAgentSetup.exe")
 AGENT_RELEASES_URL = "https://github.com/memeanji/blog-landing-generator/releases/latest"
@@ -828,6 +832,7 @@ with st.sidebar:
 
     st.caption("네이버 로그인 세션은 실행하는 PC 안에만 저장됩니다"
                "(큐로 나가지 않습니다).")
+    st.caption(f"화면 버전 {APP_VERSION}")
 
 # ══════════════════════════════════════════════════════════════════
 # 계정(기준 계정) — 화면에서는 본문의 `기준 계정` 으로 고른다.
