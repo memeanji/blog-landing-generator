@@ -42,7 +42,7 @@ from . import (accounts, brands, browser, edit_post, landing_sheet,
                session_store, sheets, writer)
 
 # 발행 간격 — 사람이 올리는 것처럼. 매 건 이 범위에서 새로 뽑는다.
-DELAY_MIN, DELAY_MAX = 10, 40
+DELAY_MIN, DELAY_MAX = 10, 30
 
 # 실전용 참고글은 이미지가 수십 장이라 업로드가 오래 걸린다(검수용은 4장이라 60초로 충분).
 IMG_WAIT_MS = 240_000

@@ -121,7 +121,7 @@ def _suggest_for_account(settings, blog_id: str, log) -> None:
 
 
 # 발행 간격 — 사람이 올리는 것처럼 들쭉날쭉하게(초). 매 건 이 범위에서 랜덤으로 뽑는다.
-DELAY_MIN, DELAY_MAX = 10, 50
+DELAY_MIN, DELAY_MAX = 10, 30
 
 
 async def _log_state(ctx, src, log, when: str) -> None:
