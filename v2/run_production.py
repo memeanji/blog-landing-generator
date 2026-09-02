@@ -753,7 +753,12 @@ def main(argv=None) -> int:
     try:
         # ★브랜드/계정을 못 찾으면 시트도 브라우저도 건드리기 전에 멈춘다.
         brands.resolve(args.brand or "")
-        args.account_obj = accounts.resolve(args.account) if args.account else None
+        # ★계정은 **기준랜딩 탭 → 키** 순으로 찾는다. 화면이 보낸 값이 이 PC 의
+        #   계정 이름과 달라도(화면에는 계정 목록이 없다) 어긋나지 않는다.
+        args.account_obj = accounts.resolve_for(
+            args.account, getattr(args, "ref_tab", "") or "",
+            args.brand or None) if (args.account
+                                    or getattr(args, "ref_tab", "")) else None
     except Exception as exc:                                   # noqa: BLE001
         print(f"[오류] {exc}")
         return 2

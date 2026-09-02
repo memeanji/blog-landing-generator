@@ -170,7 +170,7 @@ def preview_rows(brand_id: str, flow: str, media: str, deficiency: str, kind: st
 # ══════════════════════════════════════════════════════════════════
 # 화면 버전 — 배포할 때마다 바뀐다. "지금 보는 게 최신인가" 를 눈으로 확인하려고 둔다.
 #   (클라우드는 새로고침해도 옛 화면이 잠깐 남을 수 있어, 이 번호로 가른다)
-APP_VERSION = "09-02 10:18"
+APP_VERSION = "09-02 10:43"
 
 AGENT_DOWNLOAD_URL = ("https://github.com/memeanji/blog-landing-generator/"
                       "releases/latest/download/BlogLandingAgentSetup.exe")
@@ -564,6 +564,9 @@ def resolve_account(brand, ref_tab: str):
     if found is not None:
         return found
     info = brand.account_of(tab) if hasattr(brand, "account_of") else {}
+    # ★계정 키(세션 폴더 이름)는 설정에 적힌 값을 먼저 쓴다. 없을 때만 탭에서
+    #   만든 값을 쓰는데, 그 값은 **PC 가 기준랜딩 탭으로 다시 풀어** 실제 계정을
+    #   찾으므로 어긋나지 않는다(옛 설정이 깔린 화면에서도 안전하다).
     return accounts.Account(
         id=info.get("session_id") or accounts.tab_slug(tab, brand),
         label=info.get("name") or brand.account_name_of(tab) or tab,

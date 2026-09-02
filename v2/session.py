@@ -114,29 +114,21 @@ async def _open(acc, log, headless: bool, relogin: bool) -> int:
 
 
 def account_for(key, ref_tab: str = "", brand: str = "", log=None):
-    """쓸 계정을 정한다. 없으면 **이 PC 에** 만든다.
-
-    ★계정(세션 폴더)은 로그인이 실제로 일어나는 PC 에 있어야 한다.
-      화면 쪽에서 만들면 클라우드 서버 안에만 생겨서, PC 에서는
-      "계정을 찾지 못했습니다" 가 났다.
-      탭 이름이 같으면 id 도 언제나 같으므로 화면이 보낸 id 와 어긋나지 않는다.
-    """
-    # ★탭으로 먼저 찾는다. 그래야 이미 쓰던 계정(과 그 세션)을 그대로 쓴다.
-    #   id 로 먼저 찾으면, 화면이 계산해 보낸 새 id 때문에 기존 계정을 두고
-    #   빈 계정을 새로 만들어 버린다.
-    if ref_tab:
-        found = accounts.ensure_for_tab(ref_tab, brand or None, create=False)
-        if found is not None:
-            return found
+    """쓸 계정을 정한다(공용 해석기를 그대로 쓴다)."""
+    before = None
     try:
-        return accounts.resolve(key)
+        before = find_existing(key, ref_tab, brand)
     except Exception:                                          # noqa: BLE001
-        if not ref_tab:
-            raise
-    acc = accounts.ensure_for_tab(ref_tab, brand or None, create=True)
-    if log:
+        before = None
+    acc = accounts.resolve_for(key, ref_tab, brand or None)
+    if log and before is None and acc is not None:
         log(f"[계정] 이 PC 에 새로 등록했습니다 — {acc.title} ({acc.id})")
     return acc
+
+
+def find_existing(key, ref_tab: str = "", brand: str = ""):
+    """이미 있는 계정만 찾아본다(없으면 None) — 새로 만들지 않는다."""
+    return accounts.resolve_for(key, ref_tab, brand or None, create=False)
 
 
 def main(argv=None) -> int:

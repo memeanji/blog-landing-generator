@@ -183,6 +183,35 @@ def add_account(acc: Account, path: Path | str | None = None) -> Account:
 #   ★계정 목록을 코드에도 화면에도 박지 않는다. 기준시트에 `<이름> 기준랜딩` 탭이 생기면
 #     그 탭에 대응하는 계정(=세션 폴더)을 여기서 만들어 준다. 사람이 accounts.json 을
 #     고칠 필요가 없다. 이미 있는 계정(my_account · seoyeon)은 그대로 재사용된다.
+def resolve_for(key, ref_tab: str = "", brand=None, create: bool = True,
+                path: Path | str | None = None) -> "Account | None":
+    """쓸 계정을 정한다 — **로그인·글쓰기 모든 경로가 이 함수를 쓴다**.
+
+    ★화면이 보낸 값이 그 PC 의 계정 이름과 다를 수 있다(화면에는 계정 목록이
+      없어서 탭에서 만든 값을 보낸다). 예전에는 목록에서만 찾다가 그대로
+      실패했다. 기준랜딩 탭을 함께 받으면 어긋나지 않는다.
+
+    찾는 순서
+      1) 기준랜딩 탭으로 (이미 쓰던 계정 + 저장된 로그인 세션을 그대로 쓴다)
+      2) 받은 키로
+      3) 없으면 이 PC 에 만든다(create=True)
+    """
+    tab = (ref_tab or "").strip()
+    if tab:
+        found = ensure_for_tab(tab, brand, create=False, path=path)
+        if found is not None:
+            return found
+    if key:
+        try:
+            return find_account(str(key), path)
+        except Exception:                                      # noqa: BLE001
+            if not tab or not create:
+                raise
+    if tab and create:
+        return ensure_for_tab(tab, brand, create=True, path=path)
+    return None
+
+
 def set_blog_id(account_id: str, blog_id: str,
                 path: Path | str | None = None) -> bool:
     """계정에 블로그 주소를 적어 둔다(비어 있을 때 한 번).
