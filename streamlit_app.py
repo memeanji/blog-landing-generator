@@ -165,7 +165,7 @@ def preview_rows(brand_id: str, flow: str, media: str, deficiency: str, kind: st
 # ══════════════════════════════════════════════════════════════════
 # 화면 버전 — 배포할 때마다 바뀐다. "지금 보는 게 최신인가" 를 눈으로 확인하려고 둔다.
 #   (클라우드는 새로고침해도 옛 화면이 잠깐 남을 수 있어, 이 번호로 가른다)
-APP_VERSION = "8170b32"
+APP_VERSION = "09-02 10:02"
 
 AGENT_DOWNLOAD_URL = ("https://github.com/memeanji/blog-landing-generator/"
                       "releases/latest/download/BlogLandingAgentSetup.exe")
