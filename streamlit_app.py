@@ -584,6 +584,17 @@ def render_progress(store, rec: dict, title: str = "진행 상황") -> None:
         head[0].markdown(f"**{title}** · {BADGE.get(status, status)}")
         head[1].caption(f"{started} 시작" + (f" · {passed} 지남" if passed else ""))
 
+        total = int(rec.get("total") or 0)
+        made = int(rec.get("made") or 0)
+        published = list(rec.get("published") or [])
+        if total or made or published:
+            m = st.columns(3)
+            m[0].metric("전체", total or "—")
+            m[1].metric("작성", made)
+            m[2].metric("발행", len(published))
+            if total:
+                st.progress(min(1.0, made / total), text=f"{made}/{total}건")
+
         try:
             text, _ = store.read_log(rec["id"])
         except Exception:                                      # noqa: BLE001
@@ -1093,7 +1104,7 @@ with left:
         #     그 PC 의 에이전트가 로그인 창을 연다. 로그인은 사람이 직접 한다.
         info = session_store.describe(account) if account else {
             "state_exists": False, "cookies": 0, "saved_at": "", "profile": ""}
-        st.session_state["_waiting_login"] = False
+        st.session_state["_auto_refresh"] = False
         job_state = session_job_state(store, account) if account else ""
         # ★세션은 그 PC 안에만 있다. 서버에서 도는 화면은 폴더를 볼 수 없으므로,
         #   로그인 작업이 성공으로 끝났으면 준비된 것으로 본다.
@@ -1106,7 +1117,7 @@ with left:
         elif job_state in RUNNING_STATES:
             # 로그인이 끝나면 저절로 바뀌도록, 이 화면을 잠시 뒤 다시 그린다
             #   (아래 맨 끝에서 한 번만 건다 — 그리는 도중에 걸면 화면이 깨진다)
-            st.session_state["_waiting_login"] = True
+            st.session_state["_auto_refresh"] = True
             st.info("▶ 로그인 창이 열렸습니다 — 네이버 로그인을 직접 마쳐 주세요."
                     f"{chr(10)}로그인이 끝나면 세션이 저장되고 자동으로 준비 완료가 됩니다.")
         else:
@@ -1192,6 +1203,14 @@ with left:
                     job, title=title,
                     target_agent=device["device_id"] if device else "")
             st.rerun()
+        # 지금 어디까지 왔는지 — 실행 버튼 바로 아래에서 보인다
+        running_id = st.session_state.get("job_id") or ""
+        watch_run = store.get(running_id) if running_id else None
+        if watch_run:
+            render_progress(store, watch_run, "실행 진행 상황")
+            if watch_run.get("status") in RUNNING_STATES:
+                st.session_state["_auto_refresh"] = True
+
         st.caption(f"버튼을 누르면 **큐에 넣기만** 합니다. 실제 실행은 에이전트가 합니다."
                    f"{chr(10)}건수를 넣으면 **{batch_plan.BATCH_SIZE}개씩 순차로** 나눠 "
                    f"실행하고, 배치가 바뀔 때마다 다시 로그인합니다"
@@ -1417,12 +1436,12 @@ else:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 로그인을 기다리는 동안 — 스스로 새로고침
-#   ★사람이 PC 에서 로그인을 마치는 순간을 화면은 알 수 없다. 그래서 기다리는
-#     동안만 몇 초마다 다시 그려, 끝나면 저절로 '준비 완료' 가 되게 한다.
+# 작업이 도는 동안 — 스스로 새로고침
+#   ★사람이 PC 에서 로그인을 마치거나 글이 올라가는 순간을 화면은 알 수 없다.
+#     그래서 도는 동안만 몇 초마다 다시 그려, 끝나면 저절로 결과가 보이게 한다.
 #   ★반드시 **맨 끝에서 한 번만** 건다. 화면을 그리는 도중에 걸면 방금 그린
 #     것과 부딪혀 빨간 오류(removeChild)가 난다.
 # ══════════════════════════════════════════════════════════════════
-if st.session_state.get("_waiting_login"):
+if st.session_state.get("_auto_refresh"):
     time.sleep(2.0)
     st.rerun()
