@@ -81,7 +81,11 @@ sheets.set_brand("doctor_nuscent"); landing_sheet.set_brand("doctor_nuscent")
 d_ref, d_utm, d_tab = sheets.active_sheet_id(), landing_sheet.active_sheet_id(), sheets.active_tab()
 check("기준시트가 브랜드마다 다르다", r_ref != d_ref, f"{r_ref[:12]}… / {d_ref[:12]}…")
 check("UTM 빌더가 브랜드마다 다르다", r_utm != d_utm)
-check("탭도 함께 바뀐다", r_tab != d_tab, f"{r_tab!r} / {d_tab!r}")
+# ★탭 '이름' 은 브랜드끼리 같을 수 있다(둘 다 `스마일 현미 기준랜딩`).
+#   중요한 것은 **시트+탭이 한 세트로** 바뀌는 것이다.
+check("탭도 브랜드 설정을 따른다",
+      bool(r_tab) and bool(d_tab) and (r_ref, r_tab) != (d_ref, d_tab),
+      f"{r_ref[:8]}…/{r_tab!r} · {d_ref[:8]}…/{d_tab!r}")
 sheets.set_brand("repurely"); landing_sheet.set_brand("repurely")
 check("되돌리면 리퓨어리 그대로", sheets.active_sheet_id() == r_ref
       and sheets.active_tab() == r_tab)
@@ -89,7 +93,9 @@ check("되돌리면 리퓨어리 그대로", sheets.active_sheet_id() == r_ref
 rep_tabs = catalog.load_tabs("repurely", refresh=True)["tabs"]
 doc_tabs = catalog.load_tabs("doctor_nuscent", refresh=True)["tabs"]
 check("기준랜딩 탭 목록이 브랜드별로 분리된다",
-      rep_tabs and rep_tabs != doc_tabs, f"리퓨어리 {rep_tabs} / 닥터누센트 {doc_tabs}")
+      bool(rep_tabs) and bool(doc_tabs)
+      and len(rep_tabs) != len(doc_tabs),
+      f"리퓨어리 {rep_tabs} / 닥터누센트 {doc_tabs}")
 check("탭 캐시도 브랜드별로 나뉜다",
       catalog.tabs_cache_path("repurely") != catalog.tabs_cache_path("doctor_nuscent"))
 # ★계정 id 를 테스트 코드에 적지 않는다(공개 저장소에 남기지 않기 위해).
@@ -122,14 +128,21 @@ check("카탈로그 캐시가 브랜드별로 분리",
       catalog.cache_path("t", "repurely") != catalog.cache_path("t", "doctor_nuscent"))
 
 # ══════════════════════════════════════════════════════════════════
-check("준비 상태 플래그", rep.ready and not doc.ready,
+check("준비된 브랜드는 준비 상태로 나온다", rep.ready and doc.ready,
       f"repurely={rep.ready} doctor_nuscent={doc.ready}")
+# ★'준비 안 됨' 검증은 **가짜 브랜드**로 한다. 실제 브랜드는 열리고 닫히므로
+#   거기에 기대면 시험이 흔들린다(닥터누센트가 열리자 7건이 한꺼번에 깨졌다).
+import dataclasses as _dc                                       # noqa: E402
+
+not_ready = _dc.replace(rep, id="_test_locked", label="시험용(준비 중)",
+                        ready=False, status_note="시험용")
 try:
-    doc.require_ready()
+    not_ready.require_ready()
     check("준비 안 된 브랜드는 CLI 에서도 막힌다", False)
 except RuntimeError as exc:
     check("준비 안 된 브랜드는 CLI 에서도 막힌다", "준비 중" in str(exc))
 rep.require_ready()
+doc.require_ready()
 try:
     brands.load_brands(path=str(ROOT / "없는파일.json"), strict=True)
     check("설정을 못 읽으면 fallback 하지 않는다", False)
@@ -208,8 +221,8 @@ sel = {s.key: s for s in at.selectbox}
 check("최상단 브랜드 선택이 있다", "brand_id" in sel, str(list(sel)))
 if "brand_id" in sel:
     # AppTest 의 options 는 format_func 을 거친 표시명이다(값은 .value 로 본다)
-    check("브랜드 목록에 준비 상태가 보인다",
-          list(sel["brand_id"].options) == ["리퓨어리", "닥터누센트 (준비 중)"],
+    check("브랜드 목록에 두 브랜드가 보인다",
+          list(sel["brand_id"].options) == ["리퓨어리", "닥터누센트"],
           str(sel["brand_id"].options))
     check("기본 선택 = 리퓨어리", sel["brand_id"].value == "repurely")
 ref_key = next((k for k in sel if str(k).startswith("ref_tab_")), "")
@@ -284,17 +297,20 @@ at2.selectbox(key="brand_id").set_value("doctor_nuscent").run()
 check("브랜드를 바꿔도 앱이 죽지 않는다", not at2.exception,
       str(at2.exception)[:200] if at2.exception else "")
 msgs = [w.value for w in at2.warning] + [e.value for e in at2.error]
-check("닥터누센트는 '준비 중' 안내", any("준비 중" in m for m in msgs),
-      " / ".join(m[:70] for m in msgs))
+oks = [x.value for x in at2.success]
+check("닥터누센트가 실행 가능으로 나온다",
+      any("실행 가능" in m and "닥터누센트" in m for m in oks),
+      " / ".join(m[:70] for m in oks))
 media_after = [s for s in at2.selectbox if s.key == "media"]
 check("다른 브랜드 매체 목록이 새어 들어오지 않는다",
       not media_after or list(media_after[0].options) != media_before)
-run_btns = [b for b in at2.button if b.label in ("실전 실행", "Dry-run (브라우저 안 켬)")]
-check("닥터누센트 실행 버튼이 잠겨 있다",
-      len(run_btns) == 2 and all(b.disabled for b in run_btns),
-      str([(b.label, b.disabled) for b in run_btns]))
-check("닥터누센트는 시트를 읽지 않는다(기준시트 오류가 안 뜬다)",
-      not any("읽지 못했" in m for m in msgs))
+check("닥터누센트 기준시트를 정상으로 읽는다",
+      not any("읽지 못했" in m for m in msgs),
+      " / ".join(m[:70] for m in msgs))
+tab_after = [x for x in at2.selectbox if str(x.key).startswith("ref_tab_")]
+check("닥터누센트 기준랜딩 탭이 나온다",
+      bool(tab_after) and list(tab_after[0].options) == ["스마일 현미 기준랜딩"],
+      str(list(tab_after[0].options)) if tab_after else "(없음)")
 
 # ── 실전용으로 바꾸면 실전용 CLI 옵션이 붙는다 ─────────────────────
 at3 = open_app()

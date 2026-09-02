@@ -253,6 +253,22 @@ class BrandConfigError(RuntimeError):
     """`brands.json` 자체를 읽지 못했다 — 다른 브랜드로 넘어가면 안 되는 상황."""
 
 
+def config_json() -> str:
+    """지금 쓰고 있는 브랜드 설정 원문(JSON).
+
+    ★화면이 고른 설정을 **작업에 실어 PC 로 보내기** 위한 것이다. 그러지 않으면
+      화면과 PC 가 각자 다른 설정을 보게 되어, 화면에는 보이는 브랜드가 PC 에서는
+      없는 브랜드가 된다(설치본 PC 에는 brands.json 이 없다).
+    """
+    inline = (os.getenv("BLOG_BRANDS_JSON") or "").strip()
+    if inline:
+        return inline
+    try:
+        return BRANDS_PATH.read_text(encoding="utf-8")
+    except Exception:                                          # noqa: BLE001
+        return ""
+
+
 def load_brands(path: Path | str | None = None,
                 include_disabled: bool = False,
                 strict: bool = False) -> list[Brand]:

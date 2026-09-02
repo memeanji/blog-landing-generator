@@ -170,7 +170,7 @@ def preview_rows(brand_id: str, flow: str, media: str, deficiency: str, kind: st
 # ══════════════════════════════════════════════════════════════════
 # 화면 버전 — 배포할 때마다 바뀐다. "지금 보는 게 최신인가" 를 눈으로 확인하려고 둔다.
 #   (클라우드는 새로고침해도 옛 화면이 잠깐 남을 수 있어, 이 번호로 가른다)
-APP_VERSION = "09-02 10:43"
+APP_VERSION = "09-02 11:27"
 
 AGENT_DOWNLOAD_URL = ("https://github.com/memeanji/blog-landing-generator/"
                       "releases/latest/download/BlogLandingAgentSetup.exe")
@@ -538,7 +538,8 @@ def submit_session_job(store, brand, account, action: str,
     who = account.label or account.id
     got_id = getattr(account, "login_id", "") or ""
     return store.submit(
-        Job(brand=brand.id, account=account.id, ref_tab=tab,
+        Job(brand=brand.id, brand_config=brands.config_json(),
+            account=account.id, ref_tab=tab,
             account_name=who, login_id=got_id, extra=extra),
         kind="session",
         title=f"{titles.get(action, action)} — {who}"
@@ -1092,6 +1093,9 @@ with left:
         #       · --batch/--start/--copy-mode/--ref-copy-from → CLI 기본값
         def build_job(dry: bool) -> Job:
             job = Job(flow=flow, brand=brand.id,
+                      # ★화면이 보고 있는 브랜드 설정을 그대로 실어 보낸다.
+                      #   PC 에 그 브랜드가 없어도 화면과 같은 시트를 쓴다.
+                      brand_config=brands.config_json(),
                       account=account.id,
                       # ★계정 이름·로그인 ID 도 함께 싣는다. 실행 기록이
                       #   "계정=행복하서연 (rhksrhf6996)" 로 남아야 나중에 볼 수 있다.
