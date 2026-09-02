@@ -183,6 +183,30 @@ def add_account(acc: Account, path: Path | str | None = None) -> Account:
 #   ★계정 목록을 코드에도 화면에도 박지 않는다. 기준시트에 `<이름> 기준랜딩` 탭이 생기면
 #     그 탭에 대응하는 계정(=세션 폴더)을 여기서 만들어 준다. 사람이 accounts.json 을
 #     고칠 필요가 없다. 이미 있는 계정(my_account · seoyeon)은 그대로 재사용된다.
+def set_blog_id(account_id: str, blog_id: str,
+                path: Path | str | None = None) -> bool:
+    """계정에 블로그 주소를 적어 둔다(비어 있을 때 한 번).
+
+    ★이게 있어야 "고른 계정과 로그인한 계정이 같은가" 를 확인할 수 있다.
+      비어 있으면 검사가 걸리지 않아, 남의 블로그에 글이 올라갈 수 있다.
+    """
+    import json
+
+    p = Path(path) if path else ACCOUNTS_PATH
+    if not p.exists():
+        return False
+    data = json.loads(p.read_text(encoding="utf-8"))
+    rows = data["accounts"] if isinstance(data, dict) else data
+    changed = False
+    for row in rows:
+        if row.get("id") == account_id and not (row.get("blog_id") or "").strip():
+            row["blog_id"] = blog_id
+            changed = True
+    if changed:
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    return changed
+
+
 def tab_slug(tab: str, brand=None) -> str:
     """탭 이름 → 세션 폴더로 쓸 수 있는 **안정적인** id.
 

@@ -65,13 +65,33 @@ async def _open(acc, log, headless: bool, relogin: bool) -> int:
     settings = replace(load_settings(account=acc), headless=headless)
     pw = ctx = None
     try:
+        if acc.login_id:
+            log(f"[로그인] ★이 계정으로 들어가 주세요 — {acc.title} · {acc.login_id}")
         pw, ctx, blog_id = await browser.open_session(settings, log, relogin=relogin)
         log("")
-        log(f"[결과] ✅ 로그인 확인 — 계정 {blog_id}")
+        log(f"[결과] 로그인된 계정 — {blog_id}")
+
         if acc.blog_id and blog_id.casefold() != acc.blog_id.casefold():
-            log(f"[경고] accounts.json 의 blog_id({acc.blog_id})와 다릅니다. "
-                f"accounts.json 을 고치거나 다른 계정으로 로그인하세요.")
+            # ★다른 계정으로 들어왔다. 그냥 넘기면 그 사람 블로그에 글이 올라간다.
+            #   세션을 저장하지 않고 여기서 멈춘다.
+            log(f"[결과] ❌ 계정이 다릅니다 — {acc.title} 자리에 {blog_id} 로 "
+                f"로그인했습니다.")
+            log(f"       {acc.title} 은(는) {acc.blog_id} 입니다"
+                + (f" (로그인 ID {acc.login_id})." if acc.login_id else ".")
+                + " 다시 [실행 준비] 를 눌러 그 계정으로 들어가 주세요.")
             return 1
+
+        if not acc.blog_id and blog_id:
+            # ★처음 확인된 블로그 주소를 적어 둔다. 다음부터는 위 검사가 걸려
+            #   계정이 어긋나는 일을 막을 수 있다.
+            try:
+                accounts.set_blog_id(acc.id, blog_id)
+                log(f"[계정] {acc.title} 의 블로그 주소를 {blog_id} 로 적어 뒀습니다. "
+                    f"다음부터는 다른 계정으로 들어오면 막습니다.")
+            except Exception as exc:                           # noqa: BLE001
+                log(f"[계정] 블로그 주소를 적지 못했습니다: {exc}")
+
+        log(f"[결과] ✅ 로그인 확인 — {acc.title} ({blog_id})")
         session_store.write_meta(acc, blog_id=blog_id)
         return 0
     except Exception as exc:                                   # noqa: BLE001
