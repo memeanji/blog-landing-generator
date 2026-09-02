@@ -165,7 +165,7 @@ def preview_rows(brand_id: str, flow: str, media: str, deficiency: str, kind: st
 # ══════════════════════════════════════════════════════════════════
 # 화면 버전 — 배포할 때마다 바뀐다. "지금 보는 게 최신인가" 를 눈으로 확인하려고 둔다.
 #   (클라우드는 새로고침해도 옛 화면이 잠깐 남을 수 있어, 이 번호로 가른다)
-APP_VERSION = "09-02 10:02"
+APP_VERSION = "09-02 10:06"
 
 AGENT_DOWNLOAD_URL = ("https://github.com/memeanji/blog-landing-generator/"
                       "releases/latest/download/BlogLandingAgentSetup.exe")
@@ -1122,7 +1122,7 @@ with left:
             # ★로그인 다음은 **자동으로 이어지지 않는다**(실수 발행을 막으려고).
             #   그 사실을 적어 두지 않아 "멈춘 것 같다" 는 이야기가 나왔다.
             st.info("여기서 자동으로 글이 써지지는 않습니다."
-                    f"{chr(10)}{chr(10)}오른쪽 아래 **[Dry-run (발행 없음)]** 을 먼저 눌러 "
+                    f"{chr(10)}{chr(10)}**바로 아래**로 내려가서 **[Dry-run (발행 없음)]** 을 먼저 눌러 "
                     "어떤 행이 잡히는지 확인하고, 괜찮으면 **[실전 실행]** 을 눌러 주세요.")
         elif job_state in RUNNING_STATES:
             # 로그인이 끝나면 저절로 바뀌도록, 이 화면을 잠시 뒤 다시 그린다
@@ -1175,10 +1175,27 @@ with left:
         # ★Dry-run 은 시트만 읽고 브라우저를 켜지 않는다 → **네이버 로그인 전에도 가능**.
         #   실전 실행만 로그인 세션까지 요구한다.
         busy = running_job(store, device)
-        b1, b2 = st.columns(2)
+
+        # ★버튼이 회색이면 왜 그런지 그 자리에서 알려 준다.
+        #   예전에는 아무 말 없이 잠겨 있어 "눌러도 안 된다" 로만 보였다.
+        blockers = []
+        if problems:
+            blockers.append("시트에서 걸린 것이 있습니다 — " + " · ".join(problems))
+        if not agent_ready:
+            blockers.append("이 화면에 PC 가 연결돼 있지 않습니다(왼쪽 [내 PC] 확인)")
         if busy:
-            st.info(f"⏳ 지금 이 PC 에서 작업이 돌고 있습니다 — {busy}"
-                    f"{chr(10)}끝나거나 중단한 뒤에 다시 실행할 수 있습니다.")
+            blockers.append(f"이 PC 에서 다른 작업이 도는 중입니다 — {busy}")
+        if blockers:
+            st.error("**지금은 실행할 수 없습니다**" + chr(10) + chr(10)
+                     + chr(10).join(f"- {b}" for b in blockers))
+        elif not ready:
+            st.info("**[실전 실행]** 은 위쪽 **[실행 준비]**(네이버 로그인)를 끝내야 열립니다."
+                    f"{chr(10)}**[Dry-run]** 은 로그인 없이 지금 눌러 보실 수 있습니다.")
+        else:
+            st.caption("아래 두 버튼 중 하나를 누르면 글쓰기가 시작됩니다. "
+                       "**[Dry-run]** 은 글을 올리지 않습니다.")
+
+        b1, b2 = st.columns(2)
         if b1.button("Dry-run (발행 없음)", use_container_width=True,
                      disabled=bool(problems) or not agent_ready or bool(busy),
                      help="실제로 글을 올리지 않습니다. 시트에서 어떤 행이 잡히는지만 "
