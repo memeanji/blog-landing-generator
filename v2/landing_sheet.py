@@ -24,7 +24,9 @@ SHEET_NAME = "랜딩"          # (구) 테스트 시트 탭 — 실전 기록에
 #   `리퓨어리 UTM 빌더` — 매체별로 탭이 따로 있다. 컬럼 구성은 (구) `랜딩` 탭과 같고
 #   헤더가 1행에 있을 뿐이라, **행 매칭/열 찾기 규칙은 그대로** 두고 시트·탭만 바꾼다.
 PRODUCTION_SHEET_ID = brands.default_brand().utm_sheet_id
-MEDIA = ("GFA", "카카오모먼트", "메타", "틱톡")
+# ★구글애즈 추가(2026-09-02): UTM 빌더 시트에는 `구글애즈 블로그 랜딩 UTM 빌더` 탭이
+#   이미 있었는데 코드에만 매체 등록이 빠져 있어 `매체 '구글애즈'를 알 수 없습니다` 로 멈췄다.
+MEDIA = ("GFA", "카카오모먼트", "메타", "틱톡", "구글애즈")
 MEDIA_TABS = {m: brands.default_brand().utm_tab(m) for m in MEDIA}
 
 _ACTIVE_BRAND: "brands.Brand | None" = None
@@ -75,6 +77,7 @@ MEDIA_ALIASES = {
     "GFA": {"gfa", "지에프에이", "네이버gfa", "네이버"},
     "메타": {"메타", "meta", "페북", "페이스북", "facebook"},
     "틱톡": {"틱톡", "tiktok"},
+    "구글애즈": {"구글애즈", "구글", "google", "googleads", "google ads", "gads", "ga"},
 }
 
 
