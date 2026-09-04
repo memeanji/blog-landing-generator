@@ -170,7 +170,7 @@ def preview_rows(brand_id: str, flow: str, media: str, deficiency: str, kind: st
 # ══════════════════════════════════════════════════════════════════
 # 화면 버전 — 배포할 때마다 바뀐다. "지금 보는 게 최신인가" 를 눈으로 확인하려고 둔다.
 #   (클라우드는 새로고침해도 옛 화면이 잠깐 남을 수 있어, 이 번호로 가른다)
-APP_VERSION = "09-04 14:05"
+APP_VERSION = "09-04 17:10"
 
 
 def _job_has(field: str) -> bool:
@@ -1101,10 +1101,9 @@ with left:
                                key=f"no_sheet_{flow}",
                                help="`랜딩` 탭의 빈 행 확인과 발행 URL 기록을 모두 건너뜁니다. "
                                     "테스트 계정으로 작성·발행만 확인할 때 켜세요")
-        if no_sheet and not _job_has("no_sheet"):
-            st.warning("이 화면은 새 버전인데 실행부(`v2.job`)가 아직 옛 버전입니다 — "
-                       "**앱 재시작(Manage app → Reboot) 후** 다시 켜 주세요. "
-                       "지금 실행하면 이 옵션은 빠진 채로 돕니다.")
+        if no_sheet:
+            st.caption("· 시트 인자를 아예 보내지 않습니다 — **Agent 버전과 무관하게** "
+                       "`랜딩` 탭을 건드리지 않습니다.")
 
         # ── Job 조립 ─────────────────────────────────────────────
         #   ★고급 CLI 옵션(--ref-tab · --batch · --url · --product-url ·
@@ -1144,7 +1143,13 @@ with left:
                 job.on_error = "skip" if keep_going else "abort"
             else:
                 job.count = max(1, int(count))
-                if date.strip():
+                # ★'시트에 기록하지 않기' 면 **시트 인자를 아예 안 보낸다.**
+                #   `--no-sheet` 플래그에만 기대면 그 옵션을 아는 새 Agent 가 깔려 있어야 하는데,
+                #   설치가 안 된 PC 에서는 옛 Agent 가 플래그를 버리고 그대로 사전검사에 걸린다
+                #   (2026-09-04 실제로 겪음). 반면 **인자를 안 주는 것**은 예전부터 있던 동작이라
+                #   Agent 버전이 무엇이든 시트를 건드리지 않는다. 버전에 안 매이게 이쪽을 쓴다.
+                #   (`--no-sheet` 는 그대로 같이 보낸다 — 새 Agent 에서는 의도가 로그에 남는다.)
+                if date.strip() and not no_sheet:
                     job.sheet_media = catalog.sheet_media_for(media)
                     job.sheet_date = date.strip()
                     job.sheet_campaign = campaign.strip()
