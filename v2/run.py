@@ -74,6 +74,13 @@ def parse_args(argv=None):
                    help="기록 대상 C열 제품_결핍 (예: 레모니티_흑자). 생략하면 "
                         "--deficiency 앞 단어(흑자/목/기미…)로 자동 대조한다. "
                         "끄려면 --sheet-product \"\" ")
+    # ★시트 기록을 통째로 끄는 스위치(2026-09-04 사용자 요청).
+    #   테스트 계정으로 '글이 제대로 써지고 발행되는지'만 볼 때는 `랜딩` 탭에 기록할 행이 없다.
+    #   그때 `기록할 자리가 0개` 사전검사에 막히면 발행 자체를 못 해 본다.
+    #   → 이 플래그를 주면 사전검사도, 발행 후 기록도 하지 않는다(실전용 run_production 과 동일 이름).
+    p.add_argument("--no-sheet", action="store_true",
+                   help="`랜딩` 탭 확인·기록을 하지 않는다(발행 테스트용). "
+                        "--sheet-media/--sheet-date 를 줘도 무시한다")
     p.add_argument("--batch", type=int, default=0,
                    help="한 번에 열어 둘 탭 수. 예: 5 면 5개 작성→발행→다음 5개. "
                         "0(기본)이면 전부 열어 두고 마지막에 몰아서 발행")
@@ -282,7 +289,11 @@ def _sheet_product(args) -> str:
 
 async def main_async(args, settings, log) -> int:
     sheet_product = _sheet_product(args)
-    if args.sheet_media and args.sheet_date:
+    # ★시트를 쓸지 말지는 여기 한 곳에서만 정한다(아래 네 군데가 같은 값을 본다).
+    use_sheet = bool(args.sheet_media and args.sheet_date) and not args.no_sheet
+    if args.no_sheet:
+        log("[시트] --no-sheet — `랜딩` 탭 확인·기록을 모두 건너뜁니다(발행 테스트)")
+    if use_sheet:
         log(f"[시트] 기록 대상 필터 — 매체 {args.sheet_media} / 날짜 {args.sheet_date}"
             f" / 제품_결핍 ~{sheet_product or '(대조 안 함)'}"
             f" / 캠페인 {args.sheet_campaign or '(대조 안 함)'}")
@@ -311,11 +322,13 @@ async def main_async(args, settings, log) -> int:
         log(f"[dry-run] 참고 랜딩 = {ref_url}")
         log(f"[dry-run] 제품 링크 = {args.product_url or '(없음)'}")
         rows: list[int] = []
-        if args.sheet_media and args.sheet_date:
+        if use_sheet:
             rows = landing_sheet.find_target_rows(
                 settings.service_account_json, settings.spreadsheet_id,
                 args.sheet_media, args.sheet_date, log, need=max(1, args.count),
                 campaign=args.sheet_campaign or "", product=sheet_product)
+        elif args.no_sheet:
+            log("[dry-run] --no-sheet 라 기록 대상은 확인하지 않았습니다")
         else:
             log("[dry-run] --sheet-media / --sheet-date 가 없어 기록 대상은 확인하지 않았습니다")
         log(f"[dry-run] 생성 예정 {max(1, args.count)}건 · "
@@ -346,7 +359,7 @@ async def main_async(args, settings, log) -> int:
             log(f"[참고] 기준글 소유 계정({owner}) ≠ 로그인 계정({blog_id}) — "
                 f"발행 화면에서 읽으므로 그대로 진행합니다. 새 글은 {blog_id} 에 작성됩니다.")
         # ★기록 대상 행을 **발행 전에** 확인한다 — 발행해 놓고 쓸 자리가 없으면 곤란하다.
-        if args.publish and args.sheet_media and args.sheet_date:
+        if args.publish and use_sheet:
             landing_sheet.find_target_rows(
                 settings.service_account_json, settings.spreadsheet_id,
                 args.sheet_media, args.sheet_date, log, need=max(1, args.count),
@@ -418,13 +431,15 @@ async def main_async(args, settings, log) -> int:
             log(f"        {u}")
 
         # ★발행이 전부 끝난 뒤 한꺼번에 기록한다(중간에 쓰면 실패 시 어긋난다).
-        if published and args.sheet_media and args.sheet_date:
+        if published and use_sheet:
             rep = landing_sheet.write_blog_links(
                 settings.service_account_json, settings.spreadsheet_id,
                 args.sheet_media, args.sheet_date, published, log,
                 campaign=args.sheet_campaign or "", product=sheet_product)
             log(f"[시트] 기록 완료 — {rep['written']}건 (행 {rep['rows']})")
             log.event("sheet_written", written=rep["written"], rows=rep["rows"])
+        elif published and args.no_sheet:
+            log("[시트] --no-sheet — 발행 URL 을 기록하지 않았습니다")
         elif published:
             log("[시트] --sheet-media / --sheet-date 가 없어 기록하지 않았습니다")
         log.event("run_finished", ok=True, made=made, published=published)

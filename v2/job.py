@@ -82,6 +82,9 @@ class Job:
     sheet_campaign: str = ""
     sheet_product: str | None = None     # None = --deficiency 앞 단어 자동
     batch: int = 0
+    # ★시트 기록 끄기(검수용·실전용 공통). 테스트 계정으로 '발행이 잘 되나'만 볼 때 쓴다 —
+    #   `랜딩` 탭에 자리가 없어도 사전검사에 막히지 않는다.
+    no_sheet: bool = False
     # ── 실전용(v2.run_production) 전용 ─────────────────────────────
     date: str = ""
     campaign: str = ""                   # 실전용 --campaign (utm_campaign 접두사)
@@ -157,6 +160,8 @@ class Job:
                 add(["--start", str(int(self.start))])
             flag("--on-error", self.on_error)
 
+        if self.no_sheet:        # 검수용(v2.run)·실전용(v2.run_production) 둘 다 같은 이름
+            add(["--no-sheet"])
         if self.publish:
             add(["--publish"])
         if self.dry_run:

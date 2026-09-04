@@ -170,7 +170,7 @@ def preview_rows(brand_id: str, flow: str, media: str, deficiency: str, kind: st
 # ══════════════════════════════════════════════════════════════════
 # 화면 버전 — 배포할 때마다 바뀐다. "지금 보는 게 최신인가" 를 눈으로 확인하려고 둔다.
 #   (클라우드는 새로고침해도 옛 화면이 잠깐 남을 수 있어, 이 번호로 가른다)
-APP_VERSION = "09-02 11:27"
+APP_VERSION = "09-04 13:45"
 
 AGENT_DOWNLOAD_URL = ("https://github.com/memeanji/blog-landing-generator/"
                       "releases/latest/download/BlogLandingAgentSetup.exe")
@@ -1082,6 +1082,12 @@ with left:
                                  disabled=not is_prod,
                                  help="실패한 건은 발행하지 않고 시트에도 남기지 않습니다. "
                                       "끄면 예전처럼 그 배치를 통째로 멈춥니다")
+        # ★테스트 계정처럼 `랜딩` 탭에 기록할 자리가 없을 때 쓰는 스위치(2026-09-04 사용자 요청).
+        #   글이 제대로 써지고 발행되는지만 보고 싶은데 '기록할 자리가 0개' 로 막히면 확인 자체를 못 한다.
+        no_sheet = st.checkbox("시트에 기록하지 않기 (발행만 테스트)", value=False,
+                               key=f"no_sheet_{flow}",
+                               help="`랜딩` 탭의 빈 행 확인과 발행 URL 기록을 모두 건너뜁니다. "
+                                    "테스트 계정으로 작성·발행만 확인할 때 켜세요")
 
         # ── Job 조립 ─────────────────────────────────────────────
         #   ★고급 CLI 옵션(--ref-tab · --batch · --url · --product-url ·
@@ -1104,7 +1110,8 @@ with left:
                       ref_tab=ref_tab,          # ★고른 기준랜딩 탭을 그대로 넘긴다
                       media=media, deficiency=deficiency, kind=kind,
                       count=int(count), publish=not dry, dry_run=dry,
-                      headless=(False if show_window else None), events=True)
+                      headless=(False if show_window else None), events=True,
+                      no_sheet=bool(no_sheet))
             if is_prod:
                 job.date = date.strip()
                 job.campaign = campaign.strip()
