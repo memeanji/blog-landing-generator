@@ -170,7 +170,20 @@ def preview_rows(brand_id: str, flow: str, media: str, deficiency: str, kind: st
 # ══════════════════════════════════════════════════════════════════
 # 화면 버전 — 배포할 때마다 바뀐다. "지금 보는 게 최신인가" 를 눈으로 확인하려고 둔다.
 #   (클라우드는 새로고침해도 옛 화면이 잠깐 남을 수 있어, 이 번호로 가른다)
-APP_VERSION = "09-04 13:45"
+APP_VERSION = "09-04 14:05"
+
+
+def _job_has(field: str) -> bool:
+    """지금 import 된 `Job` 이 이 필드를 아는가.
+
+    ★클라우드가 화면(streamlit_app.py)만 새로 읽고 `v2.job` 은 옛 모듈을 그대로 쓸 때가 있다.
+      새 옵션을 생성자에 그냥 넘기면 그 순간 화면 전체가 TypeError 로 죽으므로,
+      **넘기기 전에 물어본다.** 옛 모듈이면 그 옵션만 빠지고 화면은 산다.
+    """
+    try:
+        return field in Job.__dataclass_fields__                # noqa: SLF001
+    except Exception:                                           # noqa: BLE001
+        return False
 
 AGENT_DOWNLOAD_URL = ("https://github.com/memeanji/blog-landing-generator/"
                       "releases/latest/download/BlogLandingAgentSetup.exe")
@@ -1088,6 +1101,10 @@ with left:
                                key=f"no_sheet_{flow}",
                                help="`랜딩` 탭의 빈 행 확인과 발행 URL 기록을 모두 건너뜁니다. "
                                     "테스트 계정으로 작성·발행만 확인할 때 켜세요")
+        if no_sheet and not _job_has("no_sheet"):
+            st.warning("이 화면은 새 버전인데 실행부(`v2.job`)가 아직 옛 버전입니다 — "
+                       "**앱 재시작(Manage app → Reboot) 후** 다시 켜 주세요. "
+                       "지금 실행하면 이 옵션은 빠진 채로 돕니다.")
 
         # ── Job 조립 ─────────────────────────────────────────────
         #   ★고급 CLI 옵션(--ref-tab · --batch · --url · --product-url ·
@@ -1110,8 +1127,15 @@ with left:
                       ref_tab=ref_tab,          # ★고른 기준랜딩 탭을 그대로 넘긴다
                       media=media, deficiency=deficiency, kind=kind,
                       count=int(count), publish=not dry, dry_run=dry,
-                      headless=(False if show_window else None), events=True,
-                      no_sheet=bool(no_sheet))
+                      headless=(False if show_window else None), events=True)
+            # ★새로 생긴 Job 필드는 **생성자 대신 나중에** 붙인다.
+            #   Streamlit Cloud 는 파일이 바뀌면 이 스크립트만 다시 돌리고, 이미 import 해 둔
+            #   `v2.*` 모듈은 옛것을 그대로 쓸 때가 있다. 그때 새 인자를 생성자에 넘기면
+            #   `TypeError: unexpected keyword argument` 로 **화면이 통째로 죽는다**(2026-09-04 실제 발생).
+            #   여기서 걸러 두면 옛 모듈일 때는 그 옵션만 조용히 빠진다
+            #   (`Job.from_dict` 가 모르는 키를 버리는 것과 같은 태도).
+            if _job_has("no_sheet"):
+                job.no_sheet = bool(no_sheet)
             if is_prod:
                 job.date = date.strip()
                 job.campaign = campaign.strip()
