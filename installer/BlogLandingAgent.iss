@@ -11,7 +11,7 @@
 ;    구글 시트 인증 파일은 사용자가 트레이 메뉴에서 직접 지정한다.
 ; ══════════════════════════════════════════════════════════════════
 #define AppName "블로그 랜딩 Agent"
-#define AppVer "1.0.0"
+#define AppVer "1.1.3"
 #define AppExe "BlogLandingAgent.exe"
 
 [Setup]

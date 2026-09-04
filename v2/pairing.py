@@ -18,7 +18,7 @@ import socket
 import sys
 from pathlib import Path
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.3"
 
 # 토큰 저장 위치 — 저장소나 프로젝트 폴더가 아니라 사용자 프로필 아래.
 DEVICE_DIR = Path(os.getenv("APPDATA") or Path.home()) / "BlogLandingAgent"
