@@ -167,15 +167,31 @@ def _product_col(header_cells: list[str]) -> int:
     return hdr.index(want) if want in hdr else -1
 
 
-def _product_ok(value: str, product: str) -> bool:
+def _product_ok(value: str, product: str, brand=None) -> bool:
     """C열 제품_결핍 대조. 결핍 키워드(흑자)와 시트 표기(레모니티_흑자)가 다르므로
-    **양방향 부분일치**로 본다 — '흑자' ⊂ '레모니티_흑자' 면 통과."""
+    **양방향 부분일치**로 본다 — '흑자' ⊂ '레모니티_흑자' 면 통과.
+
+    ★그것만으로는 부족한 경우가 있다. 그 칸에 결핍 이름이 아예 없고 **제품명만**
+      적힌 행이 있다(리퓨어리 `올레놀샷` = 팔자, 601행). 그때는 브랜드 설정의
+      `deficiency_products` 에 적어 둔 표기도 같은 것으로 본다.
+    """
     if not product:
         return True
     v, p = norm(value), norm(product)
     if not v:
         return False
-    return p in v or v in p
+    if p in v or v in p:
+        return True
+    try:
+        b = brand if brand is not None else brands.resolve(active_brand())
+        for mark in b.product_marks(product):
+            # ★부분일치로 두면 안 된다. `올레놀샷`(팔자)이 `올레놀샷_목주름`(목주름)까지
+            #   잡아 다른 결핍 행에 링크가 들어간다. **정확히 같을 때만** 인정한다.
+            if norm(mark) and norm(mark) == v:
+                return True
+    except Exception:                                          # noqa: BLE001
+        pass
+    return False
 
 
 def _campaign_ok(value: str, campaign: str) -> bool:

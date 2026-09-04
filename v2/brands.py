@@ -87,6 +87,9 @@ class Brand:
     reference_tab_mark: str = DEFAULT_REFERENCE_TAB_MARK
     # 기준랜딩 탭 → 계정 정보(선택). {"행복하서연 기준랜딩": {"name": …, "login_id": …}}
     accounts: dict = field(default_factory=dict)
+    # 결핍 → UTM 빌더 `제품_결핍` 칸 표기(선택). {"팔자": ["올레놀샷"]}
+    #   그 칸에 결핍 이름이 안 적히고 제품명만 있는 경우를 잇는다.
+    deficiency_products: dict = field(default_factory=dict)
     utm_sheet_id: str = ""
     utm_sheet_label: str = ""
     utm_tab_pattern: str = DEFAULT_UTM_TAB_PATTERN
@@ -160,6 +163,22 @@ class Brand:
                         "session_id": str(row.get("session_id") or "")}
         return {"name": self.account_name_of(want), "login_id": "",
                 "blog_id": "", "session_id": ""}
+
+    def product_marks(self, deficiency: str) -> list:
+        """이 결핍이 UTM 빌더 `제품_결핍` 칸에 어떻게 적히는가.
+
+        ★그 칸에 결핍 이름이 늘 들어 있는 건 아니다. `올레놀샷_목주름` 처럼
+          제품_결핍으로 적힌 것도 있고, `올레놀샷` 처럼 **제품명만** 적힌 것도 있다
+          (리퓨어리에서 팔자가 그렇다). 후자는 결핍 이름으로 못 찾아 대상이
+          0개가 됐다(2026-09-03). 여기 적어 두면 이어진다.
+        """
+        want = (deficiency or "").strip()
+        if not want:
+            return []
+        got = (self.deficiency_products or {}).get(want)
+        if isinstance(got, str):
+            return [got]
+        return [str(x) for x in (got or []) if str(x).strip()]
 
     def header(self, key: str, default: str) -> str:
         """UTM 빌더 컬럼명 오버라이드. 브랜드가 다른 헤더를 쓰면 `headers` 로 맞춘다."""
@@ -241,6 +260,8 @@ def _from_raw(raw: dict) -> Brand | None:
         # 기준랜딩 탭 → 계정 정보(선택). 화면과 PC 가 같은 값을 쓰게 하는 근거다.
         accounts=(dict(raw.get("accounts"))
                   if isinstance(raw.get("accounts"), dict) else {}),
+        deficiency_products=(dict(raw.get("deficiency_products"))
+                             if isinstance(raw.get("deficiency_products"), dict) else {}),
         headers=dict(heads) if isinstance(heads, dict) else {},
         enabled=bool(raw.get("enabled", True)),
         ready=bool(raw.get("ready", True)),
