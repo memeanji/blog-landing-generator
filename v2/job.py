@@ -19,9 +19,13 @@ from pathlib import Path
 
 from .appdir import SRC_ROOT as ROOT   # venv 탐색용(소스 폴더)
 
+# ★키(`review`/`production`)가 **내부 작업 타입**이다 — 분기·모듈 선택은 전부 이 키로 한다.
+#   `label` 은 **화면 표시용 문구일 뿐**이므로 바꿔도 동작이 달라지지 않는다
+#   (2026-09-17 사용자 요청으로 문구만 교체: 검수용 랜딩 생성 → 새 글 생성 /
+#    실전용 랜딩 전환 → 기존 글 수정. 키·module 값은 그대로 유지).
 FLOWS = {
-    "review": {"module": "v2.run", "label": "검수용 랜딩 생성 (새 글)"},
-    "production": {"module": "v2.run_production", "label": "실전용 랜딩 전환 (기존 글 수정)"},
+    "review": {"module": "v2.run", "label": "새 글 생성"},
+    "production": {"module": "v2.run_production", "label": "기존 글 수정"},
 }
 KINDS = ("검수용", "실전용")
 PROD_MODES = {"convert": "기존 검수용 글을 수정", "create": "새 글로 만들기"}
