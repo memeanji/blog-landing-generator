@@ -22,6 +22,8 @@ playwright-profile/
 # 계정 목록 — 운영 계정 식별자가 들어간다(기준랜딩 탭에서 자동 생성되므로 없어도 된다)
 accounts.json
 !accounts.example.json
+# Supabase 계정 목록의 로컬 캐시(장애 시 fallback) — 런타임 산출물이라 추적하지 않는다
+accounts_cache.json
 
 # 브랜드 설정 — 실제 구글 시트 ID 가 들어간다. 공개 저장소에 두지 않는다.
 #   배포할 때는 Secrets 의 BLOG_BRANDS_JSON 으로 넣는다(brands.example.json 참고).

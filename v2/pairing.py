@@ -1,7 +1,23 @@
 r"""PC ↔ 브라우저 연결(페어링) — Agent 쪽.
 
     화면(Streamlit)에서 6자리 코드 발급  →  이 PC 에서 코드 입력  →  device 등록
-      · 발급받은 `device_token` 은 **이 PC 에만** 저장한다(%APPDATA%\BlogLandingAgent).
+
+    ★`device_token` 이 실제로 어디에 있는가(2026-09-10 정리 — 오해가 없도록 못 박아 둔다)
+        · Supabase `devices` 테이블 : **SHA-256(token) 만** 저장 (원문 없음)
+        · 이 PC 의 `device.json`     : **원문 저장** ← Agent 가 bearer 로 쓰므로 정상이다
+        · job payload / 큐 레코드    : 저장 안 함
+        · 서버(Edge Function) 로그   : 저장 안 함 (해시 앞 12자만 찍는다)
+        · Agent 로그                 : 저장 안 함
+      즉 "원문은 어디에도 없다" 가 아니라 **"서버에는 없고, 페어링된 그 PC 에만 있다"** 이다.
+      유출 시 대응은 `devices.revoked_at` 이다(그 기기만 즉시 차단).
+
+    ★파일 보호에 대한 정확한 사실(2026-09-10)
+      `save_device()` 가 `os.chmod(0o600)` 을 부르지만, **윈도우에서 이것은 유닉스의
+      600 과 같은 보안 경계가 아니다** — 파이썬은 윈도우에서 읽기전용 속성만 건드리고
+      ACL 은 바꾸지 않는다. 실제 보호는 **`%APPDATA%` 가 사용자 프로필 ACL 로 보호되는
+      것**에 의존한다(그 사용자 + Administrators + SYSTEM 만 접근).
+      → 같은 PC 의 관리자 권한 사용자는 읽을 수 있다는 뜻이다. 그래서 토큰 유출을
+        '불가능' 으로 보지 않고, **revoke 로 되돌릴 수 있게** 설계해 두었다.
       · Agent 는 그 토큰으로 **자기 device 의 작업만** 가져간다(DB 함수가 검증).
       · service key 는 여기에 없다. Agent 가 아는 건 publishable key 와 자기 토큰뿐이다.
 
@@ -18,7 +34,7 @@ import socket
 import sys
 from pathlib import Path
 
-AGENT_VERSION = "1.1.3"
+AGENT_VERSION = "1.2.5"
 
 # 토큰 저장 위치 — 저장소나 프로젝트 폴더가 아니라 사용자 프로필 아래.
 DEVICE_DIR = Path(os.getenv("APPDATA") or Path.home()) / "BlogLandingAgent"
@@ -76,7 +92,10 @@ def save_device(data: dict) -> Path:
     DEVICE_DIR.mkdir(parents=True, exist_ok=True)
     DEVICE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1),
                            encoding="utf-8")
-    try:                                                       # 다른 사용자 못 읽게
+    # ⚠️윈도우에서는 이 호출이 **읽기전용 속성만** 바꾼다(ACL 은 안 건드린다).
+    #   즉 유닉스의 600 같은 보안 경계가 아니다 — 실제 보호는 `%APPDATA%` 의
+    #   사용자 프로필 ACL 이 담당한다. 리눅스/맥에서 돌 때만 의미가 있다.
+    try:
         os.chmod(DEVICE_FILE, 0o600)
     except Exception:                                          # noqa: BLE001
         pass

@@ -173,6 +173,15 @@ class SupabaseStore(JobStore):
         rows = self._rest("GET", f"jobs?order=created_at.desc&limit={int(limit)}")
         return [self._rec(r) for r in (rows or [])]
 
+    def accounts_list(self) -> list[dict]:
+        """블로그 계정 목록(중앙 관리) — **읽기 전용**.
+
+        ★device 토큰을 검증하는 DB 함수만 부른다(`schema_accounts.sql`).
+          Agent 에는 service_role key 를 넣지 않는다. 토큰이 틀리면 0행이 온다.
+          비활성 계정도 그대로 돌려준다 — 거르는 건 `accounts.load_accounts` 다.
+        """
+        return list(self._rpc("accounts_list", {}) or [])
+
     def request_cancel(self, job_id: str) -> None:
         self._rest("PATCH", f"jobs?job_id=eq.{job_id}",
                    json={"cancel_requested": True})
@@ -305,14 +314,20 @@ class SupabaseStore(JobStore):
 
     # ── UI 전용 부가기능(페어링) ─────────────────────────────────
     def create_pairing(self, minutes: int = 10) -> dict:
-        """6자리 1회용 코드를 만든다(service 모드)."""
-        import random
+        """6자리 1회용 코드를 만든다(service 모드).
+
+        ★난수는 `secrets`(CSPRNG)로 뽑는다 — 예전 `random.randint` 는 메르센 트위스터라
+          앞선 값 몇 개를 알면 다음 값을 예측할 수 있다. 이 코드는 그 자체가 인증값은
+          아니지만 **맞히면 device_token 을 받아 가는 관문**이라 추측 가능하면 안 된다.
+          (무차별 대입은 DB 쪽 `pair_device` 스로틀이 함께 막는다.)
+        """
+        import secrets
 
         if self.mode != "service":
             raise SupabaseError("페어링 코드 발급은 UI 에서만 합니다.")
         expires = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
         for _ in range(20):
-            code = f"{random.randint(0, 999999):06d}"
+            code = f"{secrets.randbelow(1000000):06d}"
             try:
                 self._rest("POST", "pairings",
                            json={"code": code, "expires_at": expires})
