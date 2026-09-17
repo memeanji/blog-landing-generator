@@ -967,16 +967,42 @@ with left:
                    "왼쪽 사이드바에서 리퓨어리를 선택하세요.")
     else:
         st.subheader("무엇을 만들까요")
-        flow = st.radio("작업 종류", list(FLOWS),
-                        format_func=lambda k: FLOWS[k]["label"], horizontal=True,
-                        key="flow")
-        is_prod = flow == "production"
-
-        # ★참고 랜딩 종류(=시트의 어느 열을 읽을지)는 플로우와 **별개 축**이다.
+        # ── 작업 종류 × 참고 랜딩 종류 → 내부 flow/mode 매핑 (2026-09-17) ──
+        #   ★화면은 두 축만 묻는다: '무엇을 할지(새 글/기존 글)' 와
+        #     '어느 참고글을 쓸지(검수용/실전용)'. 내부 flow(review/production)와
+        #     mode(create/convert)는 아래 표로 **자동 결정**한다.
+        #     예전에는 `실전용 방식` 을 따로 골라야 했는데, '기존 글 수정' 안에
+        #     '새 글로 만들기' 가 숨어 있어 찾을 수 없었다(사용자 지적).
+        #   ⚠️`v2.run`/`v2.run_production` 내부와 review/production 키는 건드리지 않는다 —
+        #     바뀐 것은 화면 선택값을 그 키로 옮기는 **매핑 규칙**뿐이다.
+        TASKS = {"new": "새 글 생성", "edit": "기존 글 수정"}
+        ROUTES = {
+            #  (작업 종류, 참고 랜딩) → (내부 flow, production mode)
+            ("new", "검수용"): ("review", "convert"),       # v2.run
+            ("new", "실전용"): ("production", "create"),    # v2.run_production
+            ("edit", "실전용"): ("production", "convert"),  # v2.run_production
+            #  ("edit", "검수용") 는 지원하지 않는다 — 아래에서 막는다.
+        }
+        task = st.radio("작업 종류", list(TASKS), format_func=lambda k: TASKS[k],
+                        horizontal=True, key="task_kind")
         kind = st.radio("참고 랜딩 종류 (기준시트 컬럼)", KINDS, horizontal=True,
-                        index=1 if is_prod else 0, key=f"kind_{flow}",
-                        help="검수용 블로그랜딩 / 실전용 블로그랜딩 중 어느 참고글을 읽을지. "
-                             "어떤 작업을 돌릴지와는 다른 선택입니다.")
+                        index=1 if task == "edit" else 0, key=f"kind_{task}",
+                        help="검수용 블로그랜딩 / 실전용 블로그랜딩 중 어느 참고글을 "
+                             "읽을지 고릅니다.")
+
+        route = ROUTES.get((task, kind))
+        if route is None:
+            # ★임의로 다른 경로로 보내지 않는다. 여기서 멈추고 무엇을 고르면 되는지 알려준다.
+            st.error(
+                f"**{TASKS[task]} + {kind}** 은 지원하지 않는 조합입니다."
+                f"{chr(10)}{chr(10)}"
+                f"· 검수용 참고글로 **새로** 쓰려면 → `새 글 생성 + 검수용`{chr(10)}"
+                f"· 이미 올린 글을 실전용으로 고치려면 → `기존 글 수정 + 실전용`")
+            st.stop()
+        flow, prod_mode = route
+        is_prod = flow == "production"
+        st.caption(f"→ 실행 경로: `{FLOWS[flow]['module']}`"
+                   + (f" · mode=`{prod_mode}`" if is_prod else ""))
 
         # ★`기준 계정` 선택지는 **브랜드 기준시트에서 자동으로** 읽는다.
         #   시트에 `<이름> 기준랜딩` 탭을 추가하면 코드 수정 없이 그대로 늘어난다.
@@ -1075,18 +1101,17 @@ with left:
             st.caption("· 시트 날짜가 비어 있어 `utm_campaign 접두사` 는 쓰이지 않습니다"
                        "(입력칸 숨김).")
 
+        # ★`실전용 방식`(prod_mode) 선택 UI 는 없앴다 — 위 '작업 종류 + 참고 랜딩'
+        #   조합이 이미 정하므로 중복이었다(같은 걸 두 번 묻고 서로 어긋날 수 있었다).
+        #   `제목/본문 출처`(content_from) 는 다른 축이라 그대로 둔다.
         if is_prod:
-            p1, p2 = st.columns(2)
-            prod_mode = p1.selectbox("실전용 방식", list(PROD_MODES),
-                                     format_func=lambda k: f"{k} — {PROD_MODES[k]}",
-                                     key="prod_mode")
-            content_from = p2.selectbox(
+            content_from = st.selectbox(
                 "제목/본문 출처", ("ref", "review"),
                 format_func=lambda k: ("ref — 실전용 참고글" if k == "ref"
                                        else "review — 기존 검수용 글"),
                 key="content_from")
         else:
-            prod_mode, content_from = "convert", "ref"
+            content_from = "ref"
 
         show_window = st.checkbox("브라우저 창 보기", value=False,
                                   help="끄면 창 없이(headless) 돕니다. "
@@ -1167,8 +1192,9 @@ with left:
             st.write({
                 "브랜드": brand.title,
                 "기준 계정": ref_tab,
-                "작업 종류": FLOWS[flow]["label"]
-                          + (f" · {prod_mode}" if is_prod else ""),
+                "작업 종류": f"{TASKS[task]} + {kind}"
+                          + f"  →  {FLOWS[flow]['module']}"
+                          + (f" · mode={prod_mode}" if is_prod else ""),
                 "참고 랜딩 종류": kind,
                 "매체": media,
                 "결핍": deficiency,
