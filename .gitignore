@@ -48,7 +48,8 @@ venv/
 build/
 dist/
 *.spec
-!installer/agent.spec        # 빌드 설정은 저장소에 둔다
+# 빌드 설정은 저장소에 둔다 (gitignore 는 줄 끝 주석을 지원하지 않는다)
+!installer/agent.spec
 .pytest_cache/
 .mypy_cache/
 .ipynb_checkpoints/
