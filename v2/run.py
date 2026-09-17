@@ -223,11 +223,19 @@ def _check_account(args, blog_id: str, log) -> None:
     `--account` 를 쓰지 않으면 아무 것도 하지 않는다(기존 동작 그대로).
     """
     acc = getattr(args, "account_obj", None)
-    if not acc or not acc.blog_id or not blog_id:
+    if not acc or not blog_id:
         return
+    if not acc.blog_id:
+        raise RuntimeError(
+            f"선택한 계정({acc.title} / id={acc.id})에 blog_id 가 등록돼 있지 않아 "
+            f"'고른 계정 = 로그인한 계정' 을 확인할 수 없습니다(실제 로그인={blog_id}). "
+            f"등록된 계정 정보에 blog_id 를 적어 주세요 — 검사 없이 진행하면 "
+            f"엉뚱한 블로그에 글이 올라갈 수 있어 중단합니다.")
+    log(f"[로그인 검증] 실제 로그인 blog_id = {blog_id} · 등록 blog_id = {acc.blog_id}")
     if blog_id.casefold() == acc.blog_id.casefold():
-        log(f"[계정] 확인 완료 — 선택({acc.title}) = 로그인({blog_id})")
+        log(f"[로그인 검증] ✅ 일치 — 선택({acc.title}) = 로그인({blog_id})")
         return
+    log("[로그인 검증] ❌ 불일치 — 글쓰기/복사 단계로 들어가지 않고 중단합니다.")
     raise RuntimeError(
         f"선택한 계정({acc.title} / {acc.blog_id})과 실제 로그인된 계정({blog_id})이 "
         f"다릅니다. 잘못된 블로그에 글이 올라가는 것을 막기 위해 중단합니다. "
@@ -258,7 +266,16 @@ def _apply_account(args, log) -> None:
     if acc:
         log(f"[계정] {acc.title} (id={acc.id}"
             + (f" · blog_id={acc.blog_id}" if acc.blog_id else "") + ")")
+        # ★계정 목록을 어디서 읽었는지 — Supabase / 캐시(마지막 동기화 시각) / 로컬파일.
+        #   장애로 캐시를 쓰고 있는 상태를 로그만 보고 알 수 있어야 한다.
+        log(f"[계정] 목록 출처 = {accounts.source_label() or '(알 수 없음)'}")
+        # ★무엇을 근거로 이 계정을 골랐는지 남긴다 — 이름(session_id)이 아니라
+        #   실제 식별정보(login_id/blog_id)로 골랐는지 로그만 보고 확인할 수 있게.
+        log(f"[계정] 선택 근거 = {accounts.last_basis() or '(없음)'}")
+        log(f"[계정] account.id = {acc.id} · login_id = {acc.login_id or '(없음)'}"
+            f" · 등록 blog_id = {acc.blog_id or '(없음)'}")
         info = session_store.describe(acc)
+        log(f"[계정] 세션 경로 = {session_store.session_dir(acc)}")
         log(f"[계정] 프로필 = {info['profile']}")
         log("[계정] 저장 세션 = " + (
             f"있음 (쿠키 {info['cookies']}개 · 저장 {info['saved_at']})"
@@ -315,6 +332,25 @@ async def main_async(args, settings, log) -> int:
             log(f"[시트] 제품 상세 URL — {ref.product_url}")
         elif not ref.product_url:
             log("[시트] 제품 상세 URL 컬럼이 비어 있습니다(있으면 자동으로 씁니다)")
+
+    # ── 기준글(복사 원본) 확인 로그 ────────────────────────────────────────
+    # ★URL 에서 뽑은 blog_id 는 **기록·경고용**이다. 기준글은 '복사 원본' 이라
+    #   남의 블로그 글이어도 정상이므로(발행 화면 복사) 여기서 막지 않는다.
+    #   실측(2026-09-17 기준시트 전수): `스마일 현미 기준랜딩` 의 기준글 소유계정이
+    #   myloveeee207 25건 · seoyoungene_ 20건 · hangbokhaseo7 7건 으로 섞여 있다.
+    #   차단은 _check_account(로그인된 실제 blog_id 대조)가 담당한다.
+    _acc = getattr(args, "account_obj", None)
+    _url_owner = re.search(r"blog\.naver\.com/([A-Za-z0-9_\-]+)/", ref_url or "")
+    _url_owner = _url_owner.group(1) if _url_owner else ""
+    log(f"[기준글] ref_tab = {getattr(args, 'ref_tab', '') or '(없음)'}")
+    log(f"[기준글] URL = {ref_url or '(없음)'}")
+    log(f"[기준글] URL 에서 추출한 blog_id = {_url_owner or '(없음)'}")
+    if _url_owner and _acc is not None and _acc.blog_id:
+        if _url_owner.casefold() == _acc.blog_id.casefold():
+            log(f"[기준글] 선택 계정 blog_id({_acc.blog_id})와 동일")
+        else:
+            log(f"[기준글] ⚠️ 선택 계정 blog_id({_acc.blog_id})와 다릅니다 — "
+                f"기준글은 복사 원본이라 남의 글일 수 있어 **경고만** 하고 계속합니다.")
 
     # ★브라우저를 켜기 전에 '무엇을 · 어디에' 쓸지만 확인하고 끝내는 모드.
     if args.dry_run:
