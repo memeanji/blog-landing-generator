@@ -136,10 +136,19 @@ def today_tag() -> str:
 
 
 def _check_account(args, blog_id: str, log) -> None:
-    """선택한 계정과 실제 로그인된 계정이 다르면 **작성 전에** 멈춘다."""
+    """선택한 계정과 실제 로그인된 계정이 다르면 **작성 전에** 멈춘다.
+
+    ★2026-09-17: 등록 blog_id 가 비어 있을 때 **건너뛰지 않고 오류**로 바꿨다
+      (빈 blog_id = 보호 장치가 없는 상태. run.py 의 같은 함수와 동일 규칙).
+    """
     acc = getattr(args, "account_obj", None)
-    if not acc or not acc.blog_id or not blog_id:
+    if not acc or not blog_id:
         return
+    if not acc.blog_id:
+        raise RuntimeError(
+            f"선택한 계정({acc.title} / id={acc.id})에 blog_id 가 등록돼 있지 않아 "
+            f"'고른 계정 = 로그인한 계정' 을 확인할 수 없습니다(실제 로그인={blog_id}). "
+            f"accounts.json 의 그 계정에 blog_id 를 적어 주세요.")
     if blog_id.casefold() == acc.blog_id.casefold():
         log(f"[계정] 확인 완료 — 선택({acc.title}) = 로그인({blog_id})")
         return

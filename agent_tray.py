@@ -44,8 +44,8 @@ NOTIFY_KEY = r"Control Panel\NotifyIconSettings"
 # ══════════════════════════════════════════════════════════════════
 RUNNABLE = {
     "v2.agent": "원격 큐를 보는 실행기",
-    "v2.run": "검수용 랜딩 생성",
-    "v2.run_production": "실전용 랜딩 전환",
+    "v2.run": "새 글 생성",                    # 내부 타입은 review (문구만 2026-09-17 변경)
+    "v2.run_production": "기존 글 수정",        # 내부 타입은 production
     "v2.session": "네이버 로그인 창 / 세션 확인",
     "v2.pairing": "이 PC 연결(6자리 코드)",
     "v2.delete_posts": "글 삭제 도구",
@@ -505,6 +505,76 @@ def ask_file(title: str) -> str:
     return GUI.call(ui) or ""
 
 
+def google_selftest(path) -> tuple[bool, str]:
+    """구글 인증 파일이 **진짜 쓸 수 있는지** 확인해서 (성공여부, 사람이 읽는 결과) 로.
+
+    ★사용자가 PowerShell 이나 설정 파일을 열지 않아도 되게 트레이 안에서 끝낸다(2026-09-14 요청).
+      ① 파일 존재 ② 서비스계정 JSON 형식 ③ 구글 토큰 발급 ④ 기준시트 읽기
+      ④ 는 시트 ID 를 알 때만 한다 — 설치본엔 brands.json 이 없어서 화면이 작업을 보낼 때
+      비로소 시트 ID 가 온다. 그 경우 ③까지만 확인하고 그렇게 알려 준다.
+    ⚠️읽기만 한다. 글을 쓰거나 발행하지 않는다.
+    """
+    import json as _json
+    from pathlib import Path as _P
+
+    nl = chr(10)
+    lines = []
+    f = _P(str(path))
+    if not f.is_file():
+        return False, "① 파일 없음" + nl + "   " + str(f)
+    lines.append("① 파일 확인 ✅  (" + format(f.stat().st_size, ",") + " 바이트)")
+
+    try:
+        data = _json.loads(f.read_text(encoding="utf-8"))
+    except Exception as exc:                                   # noqa: BLE001
+        return False, nl.join(lines + ["② JSON 형식 오류 ❌" + nl + "   " + str(exc)[:150]])
+    email = str(data.get("client_email") or "")
+    if data.get("type") != "service_account" or not email:
+        return False, nl.join(lines + [
+            "② 서비스계정 JSON 이 아닙니다 ❌",
+            "   구글 클라우드에서 받은 '서비스 계정 키' 파일을 골라 주세요."])
+    lines.append("② 서비스계정 ✅" + nl + "   " + email)
+
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2.service_account import Credentials
+        cred = Credentials.from_service_account_file(
+            str(f), scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+        cred.refresh(Request())
+        lines.append("③ 구글 인증 ✅  (토큰 발급 성공)")
+    except Exception as exc:                                   # noqa: BLE001
+        return False, nl.join(lines + [
+            "③ 구글 인증 실패 ❌" + nl + "   " + type(exc).__name__ + ": " + str(exc)[:150],
+            "   키가 만료·삭제됐거나 인터넷 연결을 확인해 주세요."])
+
+    try:
+        from v2 import brands
+        sheet_id = (getattr(brands.default_brand(), "reference_sheet_id", "") or "").strip()
+    except Exception:                                          # noqa: BLE001
+        sheet_id = ""
+    if not sheet_id:
+        lines.append("④ 기준시트 읽기 — 건너뜀" + nl
+                     + "   이 PC 엔 시트 ID 가 아직 없습니다(화면에서 작업을 보내면 함께 옵니다)." + nl
+                     + "   인증 파일 자체는 정상입니다.")
+        return True, nl.join(lines)
+
+    try:
+        import gspread
+        book = gspread.authorize(cred).open_by_key(sheet_id)
+        lines.append("④ 기준시트 읽기 ✅" + nl + "   " + book.title
+                     + " (탭 " + str(len(book.worksheets())) + "개)")
+        return True, nl.join(lines)
+    except Exception as exc:                                   # noqa: BLE001
+        text = type(exc).__name__ + ": " + str(exc)
+        up = text.upper()
+        tip = ("   이 시트를 위 서비스계정 주소에 **공유**해 주세요(보기 권한 이상)."
+               if ("403" in text or "PERMISSION" in up)
+               else "   시트 ID 가 맞는지 확인해 주세요."
+               if ("404" in text or "NOTFOUND" in up.replace(" ", ""))
+               else "   잠시 뒤 다시 시도해 주세요.")
+        return False, nl.join(lines + ["④ 기준시트 읽기 실패 ❌" + nl + "   " + text[:150], tip])
+
+
 def show(title: str, body: str) -> None:
     def ui():
         from tkinter import messagebox
@@ -617,12 +687,21 @@ class TrayAgent:
     def status_text(self) -> str:
         dev = pairing.load_device()
         cfg_ok = bool(pairing._config()["url"] and pairing._config()["key"])
-        sa = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or ""
+        # ★구글 인증은 이제 두 갈래다 — 로컬 JSON 파일, 또는 **페어링된 기기가
+        #   서버에서 받아오는 단기 토큰**. 어느 길로 되는지 그대로 보여 준다.
+        try:
+            from v2 import gauth
+            sa_state = gauth.source()
+            if sa_state == "없음":
+                sa_state = "없음(연결하거나 인증 파일을 지정하세요)"
+        except Exception:                                      # noqa: BLE001
+            sa = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or ""
+            sa_state = "있음" if sa and Path(sa).exists() else "없음"
         lines = [
             f"연결 상태 : {'연결됨' if dev else '연결 안 됨'}",
             f"PC 이름   : {dev.get('label') or host_name()}",
             f"접속 설정 : {'있음' if cfg_ok else '없음'}",
-            f"구글 인증 : {'있음' if sa and Path(sa).exists() else '없음(시트를 읽으려면 필요)'}",
+            f"구글 인증 : {sa_state}",
             f"크롬      : {'준비됨' if chromium_ready() else '미설치'}",
             f"데이터 폴더: {appdir.ROOT}",
         ]
@@ -689,28 +768,59 @@ class TrayAgent:
         show(APP_NAME, f"이름을 '{name}' 으로 바꿨습니다.\n\n{msg}")
         log(f"[이름] {name} — {msg}")
 
+    def _register_cred(self, src, origin: str) -> bool:
+        """고른 JSON 을 이 PC 에 등록하고 **바로 검사해서** 결과를 보여 준다.
+        수동 선택([구글 시트 인증 파일…])과 사내 가져오기가 같은 길을 쓴다."""
+        from v2 import shared_cred
+        try:
+            dest = shared_cred.copy_to_local(src)
+        except Exception as exc:                               # noqa: BLE001
+            show(APP_NAME, "등록하지 못했습니다." + chr(10) * 2 + str(exc))
+            log("[구글] 등록 실패 — " + str(exc)[:120])
+            return False
+        log("[구글] 인증 파일 등록(" + origin + ")")
+        ok, report = google_selftest(dest)
+        head = ("구글 인증 파일 등록 완료" if ok
+                else "인증 파일을 등록했지만 확인에서 문제가 있습니다.")
+        nl2 = chr(10) * 2
+        show(APP_NAME, head + nl2 + report + nl2
+             + "가져온 곳: " + str(src) + chr(10)
+             + "저장 위치: " + str(dest) + chr(10)
+             + "(이 파일은 이 컴퓨터 안에만 있습니다)")
+        log("[구글] 인증 확인 " + ("성공" if ok else "실패")
+            + " — " + report.replace(chr(10), " / "))
+        return ok
+
+    def on_google_shared(self, *_):
+        """사내 공유폴더에서 인증 JSON 을 가져온다. 못 찾으면 수동 선택으로 넘어간다."""
+        from v2 import shared_cred
+        src, looked = shared_cred.find()
+        if src:
+            self._register_cred(src, "사내 공유폴더")
+            return
+        nl = chr(10)
+        show(APP_NAME,
+             "사내 공유폴더에서 인증 파일을 찾지 못했습니다." + nl * 2
+             + "찾는 파일: " + shared_cred.CRED_NAME + nl
+             + "찾아본 곳:" + nl
+             + nl.join("  · " + x for x in looked) + nl * 2
+             + "이어서 파일을 직접 고르는 창을 엽니다."
+             + nl + "(고른 위치는 기억해 두어 다음부터 먼저 찾습니다)")
+        path = ask_file("구글 서비스계정 JSON 파일 선택")
+        if not path:
+            return
+        if self._register_cred(path, "직접 선택"):
+            try:
+                shared_cred.remember_dir(path)                 # 다음부터 그 폴더를 먼저 본다
+                log("[구글] 공유 경로 기억: " + str(path))
+            except Exception:                                  # noqa: BLE001
+                pass
+
     def on_google(self, *_):
         path = ask_file("구글 서비스계정 JSON 파일 선택")
         if not path:
             return
-        dest = appdir.ROOT / "google-service-account.json"
-        try:
-            shutil.copyfile(path, dest)
-            cfg = appdir.ROOT / "agent_config.json"
-            import json
-
-            data = {}
-            if cfg.exists():
-                data = json.loads(cfg.read_text(encoding="utf-8"))
-            data["google_service_account_path"] = str(dest)
-            cfg.write_text(json.dumps(data, ensure_ascii=False, indent=1),
-                           encoding="utf-8")
-            os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] = str(dest)
-            show(APP_NAME, f"구글 인증 파일을 등록했습니다.\n\n{dest}\n"
-                           f"(이 파일은 이 컴퓨터 안에만 있습니다)")
-            log("[구글] 인증 파일 등록")
-        except Exception as exc:                               # noqa: BLE001
-            show(APP_NAME, f"등록하지 못했습니다.\n\n{exc}")
+        self._register_cred(path, "직접 선택")
 
     def on_logs(self, *_):
         os.startfile(str(LOG_DIR))                             # noqa: S606
@@ -798,6 +908,8 @@ class TrayAgent:
                                  lambda *_: self._dialog(self.on_pair)),
                 pystray.MenuItem("PC 이름 바꾸기…",
                                  lambda *_: self._dialog(self.on_rename)),
+                pystray.MenuItem("사내 인증파일 가져오기",
+                                 lambda *_: self._dialog(self.on_google_shared)),
                 pystray.MenuItem("구글 시트 인증 파일…",
                                  lambda *_: self._dialog(self.on_google)),
                 pystray.Menu.SEPARATOR,

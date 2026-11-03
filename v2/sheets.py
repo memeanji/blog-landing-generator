@@ -114,11 +114,21 @@ class Reference:
 
 
 def service_account_email(cred: Path) -> str:
-    """오류 메시지에 '어느 계정을 공유해야 하는지' 를 같이 보여주기 위해 읽는다."""
+    """오류 메시지에 '어느 계정을 공유해야 하는지' 를 같이 보여주기 위해 읽는다.
+
+    ★서버 토큰 방식(새 노트북)에는 JSON 파일이 아예 없다 — 그때는 Edge Function 이
+      함께 내려준 `client_email`(공개값)을 쓴다. 안내 문구가 예전과 같게 유지된다."""
     try:
         import json as _json
-        return str(_json.loads(Path(cred).read_text(encoding="utf-8"))
-                   .get("client_email") or "")
+        got = str(_json.loads(Path(cred).read_text(encoding="utf-8"))
+                  .get("client_email") or "")
+        if got:
+            return got
+    except Exception:                                          # noqa: BLE001
+        pass
+    try:
+        from . import gauth
+        return gauth.client_email()
     except Exception:                                          # noqa: BLE001
         return ""
 
@@ -162,20 +172,37 @@ def access_error(brand, stage: str, title: str, sheet_id: str, cred, exc) -> Run
         brand=doctor_nuscent stage=utm_sheet_access status=failed reason=permission_denied
     """
     text = short(f"{type(exc).__name__}: {exc}")
-    denied = ("PermissionError" in type(exc).__name__
-              or "PERMISSION_DENIED" in text or "403" in text
-              or "insufficientPermissions" in text)
-    missing = ("SpreadsheetNotFound" in type(exc).__name__ or "404" in text)
-    reason = ("permission_denied" if denied else
+    # ★인증 단계 실패를 먼저 갈라낸다(2026-09-14).
+    #   예전엔 `"404" in text` 만 보고 sheet_not_found 로 분류해서, **인증 서버**(Edge Function
+    #   google-token)가 404 를 준 것까지 "brands.json 의 시트 ID 를 확인하세요" 로 오진했다.
+    #   그때 시트는 열어본 적조차 없었다 — 엉뚱한 곳을 뒤지게 만든다.
+    auth_failed = ("GoogleAuthError" in type(exc).__name__
+                   or "구글 인증 서버" in text
+                   or "연결(페어링)" in text)
+    denied = (not auth_failed) and (
+        "PermissionError" in type(exc).__name__
+        or "PERMISSION_DENIED" in text or "403" in text
+        or "insufficientPermissions" in text)
+    # 시트 없음은 **구글 시트 API 가 낸 404** 만 인정한다(인증 404 는 위에서 걸러졌다).
+    missing = (not auth_failed) and (
+        "SpreadsheetNotFound" in type(exc).__name__ or "404" in text)
+    reason = ("auth_error" if auth_failed else
+              "permission_denied" if denied else
               "sheet_not_found" if missing else
               "google_temporary_error" if is_transient(exc) else "open_failed")
-    who = service_account_email(cred) if cred else ""
+    # ★cred 가 None(서버 토큰 방식)이어도 gauth 가 client_email 을 알고 있으면 안내에 쓴다.
+    who = service_account_email(cred)
     nl = chr(10)
     tip = ""
     if denied:
         tip = (nl + "       → 시트를 서비스 계정에 공유해 주세요"
                + (f" ({who} · 편집자)" if who else "")
                + nl + "       → 권한을 준 뒤에는 코드 수정 없이 그대로 다시 실행하면 됩니다.")
+    elif auth_failed:
+        tip = (nl + "       → 구글 **인증** 단계에서 실패했습니다 — 시트 ID 문제가 아닙니다."
+               + nl + "       → 트레이 아이콘 우클릭 → [구글 시트 인증 파일…] 에서 "
+                      "서비스계정 JSON 을 지정하면 이 경로를 쓰지 않습니다."
+               + nl + "       → 서버 연결(페어링) 방식을 쓰려면 인증 서버가 배포돼 있어야 합니다.")
     elif missing:
         tip = nl + "       → brands.json 의 시트 ID 를 확인해 주세요."
     elif reason == "google_temporary_error":
@@ -190,11 +217,13 @@ def access_error(brand, stage: str, title: str, sheet_id: str, cred, exc) -> Run
 def open_book(cred: Path):
     """**선택한 브랜드의** 기준시트(스프레드시트)를 연다. 실패하면 원인이 드러나는 예외."""
     import gspread
-    from google.oauth2.service_account import Credentials
+
+    from . import gauth
 
     brand = active_brand()
-    creds = Credentials.from_service_account_file(
-        str(cred), scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    # ★자격증명은 gauth 한 곳에서 정한다 — 로컬 JSON(①②) 또는 **서버 발급 단기 토큰(③)**.
+    #   기준시트는 읽기만 하므로 readonly 로 요청한다(실제 scope 는 서버 allowlist 가 정함).
+    creds = gauth.credentials(gauth.OP_READONLY)
     # ★어떤 sheet_id 가 들어오든 기준시트는 **선택한 브랜드의 시트**만 본다(혼용 방지).
     target = active_sheet_id()
     try:

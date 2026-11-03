@@ -1073,3 +1073,114 @@ async def copy_whole_range(src, log, label: str = "참고글") -> dict:
         f"이미지 {got['imgs']}장 · {got['chars']}자")
     return {"chars": got["chars"], "imgs": got["imgs"], "comps": got["comps"],
             "from": "view-range"}
+
+
+# ── 붙여넣기에 딸려온 '대표'/빈 표 제거 ────────────────────────────────
+#   왜 있는가(2026-09-14 실측)
+#     프리즈젯 기준 랜딩에는 표가 0개인데, 복사→붙여넣기를 거친 글에는 이미지마다
+#     그 뒤에 빈 `se-table` 이 하나씩, 첫 이미지 뒤에는 '대표'(대표사진 배지) 표가
+#     하나 더 생겼다. 에디터의 이미지 배지·캡션 자리가 클립보드에서 표로 굳는 것이다.
+#   ⚠️DOM 으로 지우면 발행에 반영되지 않는다 — 반드시 **클릭 + 키보드**로 지운다.
+#   ⚠️글자나 사진이 든 표는 **진짜 표**다. 절대 대상으로 삼지 않는다.
+DECOR_TABLE_JS = r"""(idx) => {
+     const root = document.querySelector('.se-main-container')
+               || document.querySelector('.se-content');
+     if (!root) return {ok: false, why: 'root 없음'};
+     const norm = t => (t || '').replace(/[\u200b\s]+/g, ' ').trim();
+     const comps = Array.from(root.querySelectorAll('.se-component'))
+       .filter(c => !c.closest('.se-documentTitle'))
+       .filter(c => (c.parentElement ? !c.parentElement.closest('.se-component') : true));
+     const isTable = c => /se-table/.test((c.className || '').toString());
+     const DECOR = ['', '대표', '대표사진', '대표 사진'];
+     const decor = comps.filter(c => isTable(c)
+                                  && !c.querySelector('img')
+                                  && DECOR.indexOf(norm(c.innerText)) >= 0);
+     const info = {ok: true, comps: comps.length,
+                   tables: comps.filter(isTable).length,
+                   decor: decor.length,
+                   texts: decor.map(c => norm(c.innerText)).slice(0, 8)};
+     if (idx < 0 || idx >= decor.length) { info.found = false; return info; }
+     const c = decor[idx];
+     c.scrollIntoView({block: 'center'});
+     let r = c.getBoundingClientRect();
+     if (r.height < 4) {                       // 빈 표는 높이가 거의 없다 — 감싼 칸을 쓴다
+       const box = c.querySelector('table, .se-table-container, .se-section') || c;
+       r = box.getBoundingClientRect();
+     }
+     info.found = true;
+     info.cls = (c.className || '').toString().slice(0, 40);
+     info.text = norm(c.innerText).slice(0, 20);
+     info.w = Math.round(r.width);
+     info.h = Math.round(r.height);
+     info.edgeX = Math.round(r.left + 3);      // 표 바깥 여백 = 컴포넌트 선택
+     info.midX = Math.round(r.left + r.width / 2);
+     info.midY = Math.round(r.top + Math.max(r.height, 6) / 2);
+     return info;
+   }"""
+
+
+async def _decor_state(post, idx: int = -1) -> dict:
+    fr = await post._fr()
+    st = await fr.evaluate(DECOR_TABLE_JS, idx)
+    if not st.get("ok"):
+        raise RuntimeError(f"[정리] 본문을 읽지 못했습니다 — {st.get('why')}")
+    return st
+
+
+async def strip_decor_tables(post, log, tag: str = "", limit: int = 12) -> int:
+    """붙여넣기에 딸려온 장식 표(빈 표 · '대표' 배지)를 지운다. 지운 개수를 돌려준다.
+
+    한 개씩 [찾기 → 클릭 → 지우기 → 확인] 을 반복한다. 세 가지 방식을 차례로 시도하고
+    그래도 안 지워지면 **지우지 못했다고 알리고 멈춘다**(발행 차단은 verify_body 가 한다).
+    """
+    st = await _decor_state(post)
+    if not st.get("decor"):
+        if st.get("tables"):
+            log(f"{tag} 표 {st['tables']}개는 내용이 있는 표 — 그대로 둡니다")
+        return 0
+    log(f"{tag} 붙여넣기에 딸려온 장식 표 {st['decor']}개 발견 — "
+        f"{st.get('texts')} (전체 표 {st['tables']}개)")
+
+    before = await post.stats()
+    removed = 0
+    await post.page.bring_to_front()
+    for _ in range(min(limit, st["decor"] + 2)):
+        spot = await _decor_state(post, 0)
+        if not spot.get("found"):
+            break
+        n_before = spot["decor"]
+        ways = (("컴포넌트 여백 클릭 + Delete", spot["edgeX"], spot["midY"], None, "Delete"),
+                ("표 안 클릭 + Esc + Delete", spot["midX"], spot["midY"], "Escape", "Delete"),
+                ("표 안 클릭 + Esc + Backspace", spot["midX"], spot["midY"], "Escape", "Backspace"))
+        done = False
+        for why, x, y, pre, key in ways:
+            await post.page.mouse.click(x, y)
+            await post.page.wait_for_timeout(250)
+            if pre:
+                await post.page.keyboard.press(pre)
+                await post.page.wait_for_timeout(200)
+            await post.page.keyboard.press(key)
+            await post.page.wait_for_timeout(500)
+            now = await _decor_state(post)
+            if now["decor"] < n_before:
+                removed += 1
+                done = True
+                log(f"{tag} 장식 표 삭제 ✅ ({why}) — 남은 {now['decor']}개")
+                break
+        if not done:
+            log(f"{tag} 장식 표를 지우지 못했습니다 — 남은 {n_before}개 "
+                f"(cls={spot.get('cls')!r} 크기 {spot.get('w')}x{spot.get('h')})")
+            break
+
+    after = await post.stats()
+    if after["imgs"] < before["imgs"]:
+        raise RuntimeError(f"[정리] 표를 지우다 사진이 {before['imgs']}→{after['imgs']}장으로 "
+                           f"줄었습니다 — 발행하지 않습니다")
+    lost = before["chars"] - after["chars"]
+    if lost > 20:
+        raise RuntimeError(f"[정리] 표만 지웠는데 본문이 {lost}자 줄었습니다 "
+                           f"— 본문이 함께 지워졌을 수 있어 발행하지 않습니다")
+    if removed:
+        log(f"{tag} 장식 표 정리 완료 — {removed}개 삭제 · "
+            f"본문 {before['chars']}→{after['chars']}자 · 사진 {after['imgs']}장")
+    return removed

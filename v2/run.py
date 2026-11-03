@@ -21,7 +21,7 @@ import traceback
 
 from .config import load_settings, resolve_headless
 from .logger import Log
-from . import (accounts, brands, browser, landing_sheet, session_store,
+from . import (accounts, brands, browser, edit_post, landing_sheet, session_store,
                sheets, source_view, writer)
 
 
@@ -88,6 +88,13 @@ def parse_args(argv=None):
                    help=f"발행 간격 최소 초(기본 {DELAY_MIN})")
     p.add_argument("--delay-max", type=int, default=DELAY_MAX,
                    help=f"발행 간격 최대 초(기본 {DELAY_MAX})")
+    # ★기준글을 어느 화면에서 복사할지 (2026-09-07 사용자 지정: 기본 = 수정 화면)
+    #   edit : 기준 랜딩 글의 **[수정] 버튼**을 눌러 편집 화면으로 들어가 모바일 미리보기로
+    #          전환한 뒤 본문을 복사한다. 사용자가 손으로 하던 방식 그대로다.
+    #   view : 예전 방식 — 발행 화면(읽기 전용)에서 복사. 되돌릴 때만 쓴다.
+    #   ⚠️ edit 는 기준글을 **내 계정이 소유**해야 열린다(남의 글은 수정 화면이 안 열린다).
+    p.add_argument("--ref-copy-from", choices=("edit", "view"), default="edit",
+                   help="기준글 복사 원본 화면. edit=수정 화면(기본) / view=발행 화면(예전 방식)")
     p.add_argument("--inspect", action="store_true",
                    help="기준글 구조만 분석하고 끝낸다(새 글을 만들지 않음)")
     p.add_argument("--keep-open", action="store_true", help="끝나도 브라우저를 닫지 않는다")
@@ -154,7 +161,7 @@ async def _log_state(ctx, src, log, when: str) -> None:
 
 
 async def build_ready(ctx, src, blog_id, no, total, log, out_dir,
-                      product_url: str = ""):
+                      product_url: str = "", ref_url: str = ""):
     """새 글 1개를 READY 까지만 만든다(발행하지 않는다). 탭은 열어 둔 채 반환.
 
     ★탭은 글마다 새로 연다(writer.open_write). 같은 탭을 재사용하면 앞서 만든 글이
@@ -172,7 +179,17 @@ async def build_ready(ctx, src, blog_id, no, total, log, out_dir,
 
     # ★본문은 '한 번에' 복사/붙여넣기한다(2026-08-21 사용자 시연 방식).
     #   컴포넌트를 나눠 여러 번 복사하면 네이버가 [출처] 문구를 붙인다.
-    await src.copy_all()
+    # ★사람이 수동으로 하던 방식으로 전환(2026-09-14): 본문 **전체**를 Ctrl+A 로 복사한다.
+    #   부분 Range 복사는 기준글에 따라 빈 표를 끌고 와 레이아웃을 망가뜨렸다.
+    #   제품링크 카드도 함께 들어오지만, 붙여넣은 뒤 지우고 이 행의 링크로 다시 만든다.
+    #   ★2026-09-14 실측: 합성 복사(createRange+execCommand)가 표를 만들어냈다.
+    #     기준글에도, 사람이 붙여넣은 글에도 표는 없었다 → 진짜 키 입력으로 복사한다.
+    #     키 입력이 막히면(원격/포커스 문제) 예전 전체 복사로 한 번 더 시도한다.
+    try:
+        await src.copy_all_body_keys()
+    except Exception as exc:                                   # noqa: BLE001
+        log(f"[복사] 키 입력 복사 실패({type(exc).__name__}: {exc}) → 전체 선택 복사로 재시도")
+        await src.copy_all_body()
     await post.page.bring_to_front()
     await post.prepare_body_caret()
 
@@ -181,6 +198,19 @@ async def build_ready(ctx, src, blog_id, no, total, log, out_dir,
     src.extra_images = 0
     await post.paste_all(src)
     await post.log_targets(f"[{no}/{total}] 붙여넣기 후")
+
+    # 전체 복사라 기준글의 **기존 제품링크 카드**가 같이 들어와 있다 →
+    #   실전용에서 쓰던 `edit_post.remove_pasted_card` 로 **맨 끝 카드만** 지운다(중복 구현 안 함).
+    if getattr(src, "full_copy", False):
+        removed = await edit_post.remove_pasted_card(
+            post, log, tag=f"[{no}/{total}]", product_url=product_url)
+        if removed:
+            # ★카드를 지웠으면 글의 상태 = 기준글의 **복사 구간**(#first~#last)과 같다.
+            #   그래서 검증 기준도 전체(oglink 포함)가 아니라 구간 기준으로 되돌린다.
+            #   (이걸 안 하면 '이미지 4/5' 처럼 기준이 하나 어긋나 멀쩡한 글이 막힌다)
+            src.full_copy = False
+            src.extra_images = 0
+        log(f"[{no}/{total}] 기준글 제품카드 {'제거함' if removed else '없음'}")
 
     await post.verify_body(src)
     if product_url:
@@ -221,6 +251,10 @@ def _check_account(args, blog_id: str, log) -> None:
 
     계정이 여러 개가 되면 이게 없을 때 엉뚱한 블로그에 글이 올라간다(되돌리기 어렵다).
     `--account` 를 쓰지 않으면 아무 것도 하지 않는다(기존 동작 그대로).
+
+    ★2026-09-17: 예전에는 `acc.blog_id` 가 비어 있으면 **검사를 통째로 건너뛰었다**
+      → brands.json 의 blog_id 가 빈 경로(닥터누센트)에서 아무 보호가 없었다.
+      이제 등록 blog_id 가 없으면 **통과시키지 않고 오류**로 멈춘다.
     """
     acc = getattr(args, "account_obj", None)
     if not acc or not blog_id:
@@ -229,9 +263,10 @@ def _check_account(args, blog_id: str, log) -> None:
         raise RuntimeError(
             f"선택한 계정({acc.title} / id={acc.id})에 blog_id 가 등록돼 있지 않아 "
             f"'고른 계정 = 로그인한 계정' 을 확인할 수 없습니다(실제 로그인={blog_id}). "
-            f"등록된 계정 정보에 blog_id 를 적어 주세요 — 검사 없이 진행하면 "
-            f"엉뚱한 블로그에 글이 올라갈 수 있어 중단합니다.")
-    log(f"[로그인 검증] 실제 로그인 blog_id = {blog_id} · 등록 blog_id = {acc.blog_id}")
+            f"accounts.json 의 그 계정에 blog_id 를 적어 주세요 — 검사 없이 "
+            f"진행하면 엉뚱한 블로그에 글이 올라갈 수 있어 중단합니다.")
+    log(f"[로그인 검증] 실제 로그인 blog_id = {blog_id} · "
+        f"accounts.json 등록 blog_id = {acc.blog_id}")
     if blog_id.casefold() == acc.blog_id.casefold():
         log(f"[로그인 검증] ✅ 일치 — 선택({acc.title}) = 로그인({blog_id})")
         return
@@ -266,11 +301,11 @@ def _apply_account(args, log) -> None:
     if acc:
         log(f"[계정] {acc.title} (id={acc.id}"
             + (f" · blog_id={acc.blog_id}" if acc.blog_id else "") + ")")
+        # ★무엇을 근거로 이 계정을 골랐는지 남긴다 — 이름(session_id)이 아니라
+        #   실제 식별정보(login_id/blog_id)로 골랐는지 로그만 보고 확인할 수 있게.
         # ★계정 목록을 어디서 읽었는지 — Supabase / 캐시(마지막 동기화 시각) / 로컬파일.
         #   장애로 캐시를 쓰고 있는 상태를 로그만 보고 알 수 있어야 한다.
         log(f"[계정] 목록 출처 = {accounts.source_label() or '(알 수 없음)'}")
-        # ★무엇을 근거로 이 계정을 골랐는지 남긴다 — 이름(session_id)이 아니라
-        #   실제 식별정보(login_id/blog_id)로 골랐는지 로그만 보고 확인할 수 있게.
         log(f"[계정] 선택 근거 = {accounts.last_basis() or '(없음)'}")
         log(f"[계정] account.id = {acc.id} · login_id = {acc.login_id or '(없음)'}"
             f" · 등록 blog_id = {acc.blog_id or '(없음)'}")
@@ -302,6 +337,39 @@ def _sheet_product(args) -> str:
     if not args.deficiency:
         return ""
     return args.deficiency.split("/")[0].strip()
+
+
+async def copy_with_fallback(ctx, src, ref_url: str, log):
+    """본문을 복사하되, **기준글에 없던 표가 섞여 들어오면 발행 화면에서 다시 복사**한다.
+
+    ★2026-09-14 사고: 프리즈젯 기준글을 **수정 화면**에서 복사하니 결과 글에 1×1 빈 표가
+      4~5개 생겨 배치가 틀어졌다(리퓨어리는 같은 코드로 멀쩡했다 — 기준글마다 다르다).
+      **발행 화면 DOM 에는 그 표가 없다**(실측: 기준글 발행본 se-table 0개).
+      그래서 복사 직후 표가 잡히면 조용히 발행 화면으로 갈아타 다시 복사한다.
+      · 기준글이 원래 표를 쓰는 글이면(kind 에 table 이 있으면) 폴백하지 않는다.
+      · 폴백해도 표가 남으면 그대로 진행하고, 붙여넣기 뒤 **검증 게이트가 막는다**.
+    """
+    await src.copy_all()
+    want_table = "table" in (src.kind_counts() if hasattr(src, "kind_counts") else {})
+    dirty = (getattr(src, "tables_in_range", 0) or 0) + (getattr(src, "clipboard_tables", 0) or 0)
+    if want_table or not dirty:
+        return src
+    log(f"[복사] ⚠️ 기준글엔 표가 없는데 복사본에 <table> 이 섞였습니다 "
+        f"(범위 {src.tables_in_range}개 · 클립보드 {src.clipboard_tables}개)")
+    log("[복사] → 발행 화면에서 다시 복사합니다(표가 렌더링되지 않는 화면)")
+    try:
+        src2 = await source_view.open_source(ctx, ref_url, log)
+        await src2.scan()
+        await src2.copy_all()
+    except Exception as exc:                                   # noqa: BLE001
+        log(f"[복사] 발행 화면 재복사 실패({type(exc).__name__}) — 처음 복사본으로 진행합니다")
+        return src
+    left = (getattr(src2, "tables_in_range", 0) or 0) + (getattr(src2, "clipboard_tables", 0) or 0)
+    if left:
+        log(f"[복사] 발행 화면에서도 <table> 이 잡힙니다({left}개) — 검증 게이트가 판단합니다")
+    else:
+        log("[복사] 발행 화면 재복사 완료 — 표 없음 ✅")
+    return src2
 
 
 async def main_async(args, settings, log) -> int:
@@ -389,9 +457,21 @@ async def main_async(args, settings, log) -> int:
         #    ★수정 화면은 그 글의 소유 계정으로 로그인해야 열린다.
         owner = re.search(r"blog\.naver\.com/([A-Za-z0-9_\-]+)/", ref_url)
         owner = owner.group(1) if owner else ""
-        # ★기준글을 '발행 화면'에서 읽으므로 더 이상 소유 계정으로 로그인할 필요가 없다.
-        #   (수정 화면을 쓰던 시절의 제약이었다. 2026-08-21)
+        # (기준글 URL·소유 blog_id 는 위 '[기준글]' 블록에서 이미 기록했다.
+        #  여기서는 복사 방식(edit/view) 제약만 판단한다.)
+        # ★복사 원본 화면에 따라 소유 계정 제약이 달라진다(2026-09-07).
+        #     edit(기본) : [수정] 버튼으로 편집 화면을 여는 방식이라 **소유 계정 필수**.
+        #                  남의 글은 수정 화면이 열리지 않으므로 여기서 미리 막는다
+        #                  (열어 본 뒤 실패하면 새 탭·기준글 상태만 어지럽힌다).
+        #     view       : 발행 화면(읽기 전용)이라 소유 계정과 달라도 된다. 2026-08-21 방식.
+        use_edit_source = getattr(args, "ref_copy_from", "edit") == "edit"
         if owner and owner != blog_id:
+            if use_edit_source:
+                raise RuntimeError(
+                    f"기준글 소유 계정({owner}) ≠ 로그인 계정({blog_id}) 입니다. "
+                    f"[수정] 화면에서 복사하는 방식(--ref-copy-from edit)은 그 글을 "
+                    f"소유한 계정으로 로그인해야 합니다. {owner} 로 로그인하거나, "
+                    f"발행 화면에서 복사하려면 --ref-copy-from view 를 쓰세요.")
             log(f"[참고] 기준글 소유 계정({owner}) ≠ 로그인 계정({blog_id}) — "
                 f"발행 화면에서 읽으므로 그대로 진행합니다. 새 글은 {blog_id} 에 작성됩니다.")
         # ★기록 대상 행을 **발행 전에** 확인한다 — 발행해 놓고 쓸 자리가 없으면 곤란하다.
@@ -401,7 +481,20 @@ async def main_async(args, settings, log) -> int:
                 args.sheet_media, args.sheet_date, log, need=max(1, args.count),
                 campaign=args.sheet_campaign or "", product=sheet_product)
 
-        src = await source_view.open_source(ctx, ref_url, log)
+        # ★기준글 복사 원본 열기.
+        #   edit = 기준 랜딩 글의 [수정] 버튼 → 편집 화면 → 모바일 미리보기 → 복사.
+        #          실전용(run_production)에서 이미 쓰던 edit_post.open_source_edit 을 그대로
+        #          재사용한다. 그 안에서 모바일 전환과 **이미지 지연로딩 해제**까지 해 준다
+        #          (지연로딩을 안 풀면 이미지가 svg 자리표시자로 복사된다).
+        #   ⚠️ 편집 화면 탭은 열려 있는 동안 편집 가능한 상태다. 복사만 하고
+        #      키 입력·저장·발행은 하지 않는다(기준글 원본이 바뀌면 안 된다).
+        if use_edit_source:
+            log("[기준글] 복사 원본 = 수정 화면([수정] 버튼 → 모바일 미리보기)")
+            src, _src_post = await edit_post.open_source_edit(
+                ctx, ref_url, log, label="기준글")
+        else:
+            log("[기준글] 복사 원본 = 발행 화면(읽기 전용)")
+            src = await source_view.open_source(ctx, ref_url, log)
         await src.scan()
         if src.product_image and not args.product_url:
             raise RuntimeError(
@@ -439,7 +532,8 @@ async def main_async(args, settings, log) -> int:
                 try:
                     posts.append(await build_ready(ctx, src, blog_id, no, total,
                                                    log, settings.out_dir,
-                                                   args.product_url or ""))
+                                                   args.product_url or "",
+                                                   ref_url=ref_url))
                 except Exception as exc:                       # noqa: BLE001
                     log.event("post_failed", no=no, total=total,
                               error=f"{type(exc).__name__}: {exc}")

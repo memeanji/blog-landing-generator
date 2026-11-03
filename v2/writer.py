@@ -80,6 +80,53 @@ TITLE_COMP_IN_BODY_JS = r"""(title) => {
    }"""
 
 
+def _kind_of(cls: str) -> str:
+    """컴포넌트 class → 종류. source_view.SCAN_JS 와 **같은 규칙**이어야 대조가 된다."""
+    c = cls or ""
+    if "se-oglink" in c:
+        return "oglink"
+    if "se-image" in c:
+        return "image"
+    if "se-table" in c:
+        return "table"
+    if "se-text" in c:
+        return "text"
+    return "other"
+
+
+DECOR_TABLE_TEXTS = ("", "대표", "대표사진", "대표 사진")
+
+
+def _kind_of_item(it) -> str:
+    """컴포넌트 하나의 종류. **글자도 사진도 없는 표**는 따로 센다(2026-09-14).
+
+    복사→붙여넣기를 거치면 이미지마다 그 뒤에 빈 `se-table` 이, 첫 이미지 뒤에는
+    '대표'(대표사진 배지) 표가 딸려온다. 사람 눈에 거의 안 보이는 에디터 장식이라
+    **발행을 막지는 않고 경고만** 한다 — 내용이 있는 진짜 표가 생기면 그건 막는다.
+    """
+    k = _kind_of(it.get("cls", ""))
+    if k != "table":
+        return k
+    if it.get("imgs"):
+        return k
+    head = (it.get("head") or "").strip()
+    if (it.get("chars") or 0) <= 6 and head in DECOR_TABLE_TEXTS:
+        return "table(빈)"
+    return k
+
+
+def _kind_counts(items) -> dict:
+    out: dict = {}
+    for it in items or []:
+        k = _kind_of_item(it)
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def _kind_summary(counts: dict) -> str:
+    return " · ".join(f"{k} {v}개" for k, v in sorted(counts.items())) or "(없음)"
+
+
 STATS_JS = r"""() => {
      const root = document.querySelector('.se-main-container')
                || document.querySelector('.se-content');
@@ -706,6 +753,52 @@ class NewPost:
             problems.append(f"이미지 {st['imgs']}/{src.total_images}")
         else:
             self.log(f"[검증] 이미지 {st['imgs']}/{src.total_images}")
+
+        # ★컴포넌트 **종류별 개수**를 기준글과 대조한다(2026-09-14 추가).
+        #   사고: 기준글엔 표가 0개인데 생성글에 se-table 이 5개 생겼다(편집기 '대표'
+        #   배지가 붙여넣기에서 표로 바뀜). 이미지 수만 보던 옛 검증은 이미지가 그대로라
+        #   **조용히 통과**했고 잘못된 글이 그대로 발행됐다 → 기준에 없던 종류면 막는다.
+        got_counts = _kind_counts(st.get("items"))
+        want_counts = src.kind_counts() if hasattr(src, "kind_counts") else {}
+        self.log("[검증] 구성 기준 — " + _kind_summary(want_counts))
+        self.log("[검증] 구성 결과 — " + _kind_summary(got_counts))
+        if want_counts:
+            added = {k: got_counts.get(k, 0) - want_counts.get(k, 0)
+                     for k in set(got_counts) | set(want_counts)}
+            extra = {k: n for k, n in added.items() if n > 0}
+            if extra:
+                self.log("[검증] 늘어난 컴포넌트 — "
+                         + " · ".join(f"{k} +{n}" for k, n in sorted(extra.items())))
+                want_seq = [r["kind"] for r in getattr(src, "span", [])]
+                got_seq = [_kind_of(it.get("cls", "")) for it in (st.get("items") or [])]
+                for i in range(max(len(want_seq), len(got_seq))):
+                    a = want_seq[i] if i < len(want_seq) else "(없음)"
+                    b = got_seq[i] if i < len(got_seq) else "(없음)"
+                    if a != b:
+                        self.log(f"[검증] 처음 달라지는 위치 #{i} — 기준 {a} / 결과 {b}")
+                        break
+            # ★'table(빈)' 은 차단하지 않는다 — 발행을 막을 만한 변형이 아니고,
+            #   키보드로 지우려다 본문을 먹은 사고(2026-09-14 v1.2.2)가 있었다.
+            if extra.get("table(빈)"):
+                self.log(f"[검증] 빈 표 {extra['table(빈)']}개는 에디터 장식 — "
+                         f"발행은 막지 않습니다")
+            blocked = {k: n for k, n in extra.items() if k in ("table", "oglink", "other")}
+            # ★제품링크 카드의 +1 은 **설계된 정상 동작**이다(2026-09-14).
+            #   기준글 맨 끝 카드는 일부러 복사 구간에서 빼고(src.product_image),
+            #   그 자리에 '이 행의 링크'로 카드를 새로 만든다. 그래서 결과에는 항상
+            #   oglink 가 하나 더 있다 — 이걸 막아서 프리즈젯 실전용이 전건 실패했다.
+            #   조건: 기준에서 뺀 카드가 있었고 · 딱 1개 늘었고 · 그게 본문 맨 끝일 때만.
+            if blocked.get("oglink") == 1 and getattr(src, "product_image", False):
+                solid = [it for it in (st.get("items") or [])
+                         if it.get("chars") or it.get("imgs")]
+                if solid and _kind_of(solid[-1].get("cls", "")) == "oglink":
+                    blocked.pop("oglink")
+                    self.log("[검증] oglink +1 은 이 행의 제품링크 카드입니다 — 정상")
+            if blocked:
+                problems.append(
+                    "기준글에 없던 컴포넌트가 생겼습니다("
+                    + " · ".join(f"{k} +{n}" for k, n in sorted(blocked.items()))
+                    + "). 붙여넣기에서 편집기 장식이 섞였을 수 있습니다")
 
         body = _norm(st["text"])
         title = _norm(src.title)

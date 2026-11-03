@@ -115,12 +115,14 @@ def resolve_target(media: str, log=None) -> dict:
 
 def _open(cred: Path, sheet_id: str, readonly: bool, tab: str = ""):
     import gspread
-    from google.oauth2.service_account import Credentials
 
-    scope = ("https://www.googleapis.com/auth/spreadsheets.readonly" if readonly
-             else "https://www.googleapis.com/auth/spreadsheets")
+    from . import gauth
+
+    # ★작업 단위로 권한을 나눈다 — 조회는 readonly, J열 기록처럼 쓰는 순간만 write.
+    #   Agent 는 scope URL 을 고르지 않는다(서버 allowlist 가 정함).
+    operation = gauth.OP_READONLY if readonly else gauth.OP_WRITE
     brand = active_brand()
-    creds = Credentials.from_service_account_file(str(cred), scopes=[scope])
+    creds = gauth.credentials(operation)
     # ★어떤 sheet_id 가 들어오든 **선택한 브랜드의 UTM 빌더**만 연다(브랜드 혼용 방지).
     target = active_sheet_id()
     try:
