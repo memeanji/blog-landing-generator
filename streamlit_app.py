@@ -30,7 +30,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from v2 import (accounts, batch_plan, brands, catalog, landing_sheet,  # noqa: E402
-                queue_store, session_store, sheets)
+                queue_store, session_store, sheets, timeutil)
+from v2 import pairing                                                   # noqa: E402
+from v2.login_state import LABEL as GRADE_LABEL                          # noqa: E402
 from v2.job import FLOWS, KINDS, PROD_MODES, Job, python_exe              # noqa: E402
 
 st.set_page_config(page_title="시리즈빌더", page_icon="📝", layout="wide")
@@ -101,7 +103,15 @@ STAGE_LABELS = {
 # ══════════════════════════════════════════════════════════════════
 @st.cache_resource
 def get_store():
-    return queue_store.get_store()
+    """큐 연결 객체(프로세스에 한 번 만들어 재사용한다).
+
+    ★2026-11-03 — 원격 큐를 쓰는 설정이면 **strict**: 붙지 못하면 로컬 큐로
+      조용히 내려가지 않고 예외를 던진다. 예전에는 조용히 내려간 객체가 이
+      캐시에 박혀서, 작업을 넣어도 PC 가 못 보는 상태를 **관리자 재부팅** 말고는
+      풀 수 없었다. 예외는 캐시되지 않으므로 [연결 다시 맺기]·새로고침으로
+      곧바로 다시 시도된다.
+    """
+    return queue_store.get_store(strict=queue_store.wants_remote())
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -170,7 +180,7 @@ def preview_rows(brand_id: str, flow: str, media: str, deficiency: str, kind: st
 # ══════════════════════════════════════════════════════════════════
 # 화면 버전 — 배포할 때마다 바뀐다. "지금 보는 게 최신인가" 를 눈으로 확인하려고 둔다.
 #   (클라우드는 새로고침해도 옛 화면이 잠깐 남을 수 있어, 이 번호로 가른다)
-APP_VERSION = "09-04 17:10"
+APP_VERSION = "11-03 10:45"
 
 
 def _job_has(field: str) -> bool:
@@ -283,6 +293,9 @@ def unlink_device() -> None:
 
 def sync_address() -> None:
     """주소를 세션 상태에 맞춘다 — **화면을 그리기 전에 한 번만** 부른다."""
+    # ★확인 대기 중인 멱등성 키는 `_address` 와 **무관하게** 항상 맞춘다
+    #   (아래 early return 뒤에 두면 새로고침 복구가 안 된다).
+    sync_pending_key()
     want = st.session_state.pop("_address", None)
     if want is None:
         return
@@ -292,6 +305,41 @@ def sync_address() -> None:
                 st.query_params["device"] = want
         else:
             st.query_params.pop("device", None)
+    except Exception:                              # noqa: BLE001
+        pass
+
+
+def sync_pending_key() -> None:
+    """'등록 여부 확인 불가' 멱등성 키를 **주소에도** 남긴다.
+
+    ★`st.session_state` 는 브라우저를 새로 고치면 사라진다. 그러면 확인해야 할
+      작업의 키를 잃어버리고, 사용자는 같은 작업을 다시 넣게 된다(중복 발행).
+      주소(`?pending=…`)에 있으면 새로고침·재접속 후에도 그 작업을 조회할 수 있다.
+      ※키는 무작위 식별자일 뿐이라 주소에 남아도 비밀이 새지 않는다.
+    """
+    try:
+        pend = st.session_state.get("_pending_submit") or {}
+        key = pend.get("key") or ""
+        if not key:                                # 세션에 없으면 주소에서 되살린다
+            from_url = st.query_params.get("pending") or ""
+            if isinstance(from_url, (list, tuple)):
+                from_url = from_url[0] if from_url else ""
+            if from_url:
+                st.session_state["_pending_submit"] = {
+                    "key": str(from_url), "label": "작업", "at": "",
+                    "from_url": True}
+            return
+        if st.query_params.get("pending") != key:
+            st.query_params["pending"] = key
+    except Exception:                              # noqa: BLE001
+        pass
+
+
+def clear_pending_key() -> None:
+    """확인이 끝났으면 세션과 주소에서 모두 지운다."""
+    st.session_state.pop("_pending_submit", None)
+    try:
+        st.query_params.pop("pending", None)
     except Exception:                              # noqa: BLE001
         pass
 
@@ -391,92 +439,6 @@ def render_agent_panel(store) -> dict | None:
     return None
 
 
-def render_help() -> None:
-    """❓ 처음 사용하시나요? — 설치부터 실행까지."""
-    with st.expander("❓ 처음 사용하시나요? — 도움말 보기", expanded=False):
-        st.markdown(f"""
-### ① Windows Agent 설치
-이 화면은 **작업을 지시하기만** 하고, 실제 네이버 자동화는 **여러분 컴퓨터**에서 돕니다.
-그래서 컴퓨터마다 **한 번만** Agent 를 설치하면 됩니다.
-
-1. 왼쪽 **[⬇ Windows Agent 설치]** 를 누릅니다 → `BlogLandingAgentSetup.exe` 가 받아집니다
-2. 받은 파일을 실행해 설치합니다
-3. 설치가 끝나면 Agent 가 **자동으로 실행**되고, 다음부터는 **컴퓨터를 켤 때 자동 실행**됩니다
-
-> Python 이나 Playwright 를 따로 설치할 필요는 없습니다. 처음 실행할 때 크롬(Chromium)만
-> 자동으로 내려받습니다.
-
-### ② Agent 연결 확인
-설치 후 왼쪽 **[연결 코드 받기]** 로 나온 **6자리 숫자**를 트레이 아이콘 → **연결** 에 입력하면
-화면에 **🟢 연결됨** 이 표시됩니다.
-
-**🔴 Agent 연결 안 됨** 이면 —
-- Agent 가 설치돼 있는지
-- 작업표시줄 오른쪽 트레이에 **블로그 랜딩 Agent** 가 떠 있는지
-- 필요하면 Agent 를 다시 시작(트레이 아이콘 → 종료 후 시작 메뉴에서 재실행)
-
-### ③ 처음 계정을 사용하는 경우
-**[실행 준비]** 를 누릅니다.
-
-> ### ※ 로그인창은 이 화면 안에 뜨지 않습니다.
-> ### Agent 가 설치된 **그 컴퓨터의 바탕화면**에 Chromium 창이 열립니다.
-
-창이 안 보이면 — 작업표시줄 확인 / 다른 창 뒤에 가려졌는지 확인 / Agent 연결 상태 확인
-
-### ④ 네이버 로그인
-열린 Chromium 창에서 **원하는 네이버 계정으로 직접 로그인**합니다.
-
-- 로그인 후 세션은 **그 PC 안에만** 저장됩니다 (`sessions/<계정>/`)
-- 비밀번호는 이 화면에도, 서버에도, 데이터베이스에도 **저장하지 않습니다**
-- 쿠키·브라우저 프로필도 **외부로 올리지 않습니다**
-- 한 번 로그인하면 다음부터는 보통 다시 로그인하지 않아도 됩니다
-
-### ⑤ Dry-run
-**실제로 글을 올리지 않습니다.** 시트에서 어떤 행이 잡히는지, 어떤 제품 링크가 들어가는지,
-계정·기준시트 연결이 맞는지만 미리 확인하는 단계입니다.
-
-> **Dry-run = 발행 없음**
-
-### ⑥ 실전 실행
-**[실전 실행]** 을 누르면 그 PC 의 Agent 가 실제 Playwright 자동화를 실행합니다.
-화면에서는 이렇게 보입니다.
-
-`작업 요청됨` → `Agent 수신` → `실행 중` → `완료`
-
-건수를 넣으면 **{batch_plan.BATCH_SIZE}개씩 순서대로** 나눠 실행하고,
-배치가 바뀔 때마다 다시 로그인합니다(오래 도는 세션을 만들지 않기 위해서입니다).
-
-### ⑦ 컴퓨터를 바꿔서 사용하는 경우
-**그 컴퓨터에도 Agent 를 1회 설치**해야 합니다.
-
-- 회사 PC 에 설치 → 회사 PC 에서 실행
-- 집 PC 에 설치 → 집 PC 에서 실행
-
-Agent 가 설치되지 않은 컴퓨터에서는 **로그인창도 뜨지 않고 자동화도 실행되지 않습니다.**
-
-### ⑧ 자주 생기는 문제
-**Q. 실행 준비를 눌렀는데 로그인창이 안 떠요.**
-- 왼쪽 Agent 연결 상태(🟢) 확인
-- 작업표시줄/트레이에 Agent 가 있는지 확인
-- **Agent 가 설치된 PC 에서** 보고 계신지 확인
-- Chromium 창이 다른 창 뒤에 가려졌는지 확인
-
-**Q. 다른 사람 컴퓨터에 로그인창이 떠요.**
-- 연결된 PC 가 잘못된 경우입니다. 왼쪽 **PC 이름**을 확인하고,
-  다르면 **[연결 해제]** 후 내 PC 의 코드로 다시 연결하세요
-
-**Q. 한 번 로그인했는데 또 로그인하라고 나와요.**
-- 네이버 세션이 만료됐거나 프로필이 손상된 경우입니다. **[실행 준비]** 로 다시 로그인하면 됩니다
-
-**Q. 다른 컴퓨터에서도 쓸 수 있나요?**
-- 가능합니다. 그 컴퓨터에 Agent 를 **최초 1회** 설치하면 됩니다
-
-**Q. Streamlit 창을 닫아도 되나요?**
-- 실제 자동화는 Agent 가 하므로 창을 닫아도 실행은 계속됩니다
-- 다만 **진행 상황을 보려면 열어 두시는 것을 권장**합니다
-""")
-
-
 @st.cache_data(ttl=60, show_spinner=False)
 def brand_names() -> dict:
     """내부 브랜드 키 → 화면 표시명 (repurely → 리퓨어리 …)."""
@@ -537,27 +499,35 @@ def ensure_agent(store) -> bool:
 
 
 def submit_session_job(store, brand, account, action: str,
-                       device_id: str = "", ref_tab: str = "") -> str:
+                       device_id: str = "", ref_tab: str = "",
+                       extra_args: list | None = None):
     """세션 작업(`--login` / `--check`)을 **내 PC 의 Agent** 앞으로 넣는다.
 
     ★어느 기준랜딩 탭인지도 함께 보낸다. 계정(세션 폴더)이 그 PC 에 아직
       없으면 **그 PC 에서** 만들어 쓰기 위해서다(여기서 만들면 서버 안에만 생긴다).
+    ★2026-11-03 — 제출도 3상태로 확인한다(`SubmitResult`). 로그인 작업은
+      중복으로 들어가도 창만 두 번 뜨지만, '확인 불가' 를 실패로 보면 사용자가
+      계속 다시 누르게 되므로 같은 규칙을 쓴다.
     """
-    titles = {"--login": "로그인", "--check": "세션 확인"}
+    titles = {"--login": "로그인", "--check": "세션 확인",
+              "--logout": "로그아웃", "--confirm": "계정 확인 기록"}
     tab = ref_tab or getattr(account, "ref_tab", "") or ""
     extra = [action, account.id, "--events"]
     if tab:
         extra += ["--ref-tab", tab, "--brand", brand.id]
+    extra += [a for a in (extra_args or []) if a]
     who = account.label or account.id
     got_id = getattr(account, "login_id", "") or ""
-    return store.submit(
+    return submit_guarded(
+        store,
         Job(brand=brand.id, brand_config=brands.config_json(),
             account=account.id, ref_tab=tab,
             account_name=who, login_id=got_id, extra=extra),
         kind="session",
         title=f"{titles.get(action, action)} — {who}"
               + (f" ({got_id})" if got_id else ""),
-        target_agent=device_id)
+        target_agent=device_id,
+        label=f"{titles.get(action, action)} 작업")
 
 
 def resolve_account(brand, ref_tab: str):
@@ -748,13 +718,27 @@ def advance_plan(store, plan: dict) -> dict:
     """
     def submit_run(batch: dict) -> str:
         total = len(plan.get("batches") or [])
-        return store.submit(
-            Job.from_dict(batch_plan.job_for(plan, batch)),
+        res = submit_guarded(
+            store, Job.from_dict(batch_plan.job_for(plan, batch)),
             title=f"{plan.get('title')} — 배치 {batch['no']}/{total}",
-            target_agent=plan.get("device") or "")
+            target_agent=plan.get("device") or "",
+            label=f"배치 {batch['no']}/{total}")
+        if not res.ok:
+            # ★확인 불가도 여기서 멈춘다 — 계획을 진행시키면 다음 그리기에서
+            #   같은 배치를 또 넣게 된다(중복 발행). 사람이 확인한 뒤 잇는다.
+            raise RuntimeError(res.message or "등록 결과를 알 수 없습니다")
+        return res.job_id
 
-    plan, changed = batch_plan.advance(
-        plan, job_status=lambda jid: _job_status(store, jid), submit_run=submit_run)
+    try:
+        plan, changed = batch_plan.advance(
+            plan, job_status=lambda jid: _job_status(store, jid),
+            submit_run=submit_run)
+    except Exception as exc:                                   # noqa: BLE001
+        # ★등록에 실패했거나 확인되지 않았으면 계획 상태를 **바꾸지 않는다**
+        #   (save 하지 않는다) — "넣은 줄 알았는데 안 들어간" 상태와, 반대로
+        #   "안 넣은 줄 알고 또 넣는" 상태를 모두 막기 위해서다.
+        st.error(f"다음 배치를 큐에 넣지 못했습니다.{chr(10)}{chr(10)}{exc}")
+        return plan
     return batch_plan.save(plan) if changed else plan
 
 
@@ -763,8 +747,11 @@ def start_batch_login(store, plan: dict, brand, account,
     """다음 배치를 위한 **수동 로그인**을 띄운다(사용자가 버튼을 눌렀을 때만)."""
     if batch_plan.current(plan) is None:
         return
-    batch_plan.mark_logging_in(
-        plan, submit_session_job(store, brand, account, "--login", device_id))
+    res = submit_session_job(store, brand, account, "--login", device_id)
+    if not res.ok:
+        # 안내는 submit_guarded 가 이미 화면에 그렸다. 계획 상태는 바꾸지 않는다.
+        return
+    batch_plan.mark_logging_in(plan, res.job_id)
 
 
 def job_summary(rec: dict) -> dict:
@@ -841,7 +828,7 @@ if not require_password():          # ★팀 공용 비밀번호(Secrets)
 
 sync_address()                      # ★화면을 그리기 전에 주소를 한 번만 맞춘다
 
-def cloud_not_wired() -> list[str]:
+def cloud_not_wired(store_obj=None) -> list[str]:
     """서버에서 도는 화면인데 원격 큐에 안 붙어 있으면, 빠진 설정 이름을 돌려준다.
 
     ★이 상태를 알아채기가 아주 어려웠다 — [연결 코드 받기] 는 멀쩡히 6자리를
@@ -850,7 +837,7 @@ def cloud_not_wired() -> list[str]:
     """
     if sys.platform.startswith("win"):
         return []                          # 각자 PC 에서 띄운 화면이면 정상이다
-    if type(store).__name__ != "LocalStore":
+    if type(store_obj if store_obj is not None else store).__name__ != "LocalStore":
         return []                          # 이미 원격 큐에 붙어 있다
     need = ("BLOG_QUEUE_BACKEND", "SUPABASE_URL", "SUPABASE_SERVICE_KEY")
     missing = []
@@ -866,7 +853,447 @@ def cloud_not_wired() -> list[str]:
     return missing or list(need)
 
 
-store = get_store()
+# ══════════════════════════════════════════════════════════════════
+# 연결(큐) — 관리자 재부팅 없이 사용자가 다시 맺을 수 있게 (2026-11-03, 1단계)
+# ══════════════════════════════════════════════════════════════════
+#   ★[연결 다시 맺기] 가 하는 일 / 하지 않는 일을 여기서 못박는다.
+#       한다    : 큐 연결 객체 · 기준랜딩 탭 목록 · 결핍/제품 목록 · 시트 미리보기
+#                 · 브랜드 이름 · 계정 목록 메모리 캐시 — **읽기 캐시만** 버린다.
+#       안 한다 : 작업 제출 · 작업 취소 · 큐 파일/행 삭제 · 세션(쿠키) 변경.
+#                 추적 중인 작업 번호(job_id · plan_id)도 **그대로 둔다** —
+#                 지우면 같은 작업을 또 넣을 위험이 생긴다.
+RECONNECT_SCOPE = ("큐 연결", "기준랜딩 탭 목록", "결핍·제품 목록",
+                   "시트 미리보기", "브랜드 이름", "계정 목록 캐시")
+
+
+def reconnect() -> list[str]:
+    """화면이 들고 있던 읽기 캐시를 버린다(큐 데이터는 건드리지 않는다)."""
+    done: list[str] = []
+    for label, fn in (("큐 연결", get_store.clear),
+                      ("기준랜딩 탭 목록", load_tabs.clear),
+                      ("결핍·제품 목록", load_catalog.clear),
+                      ("시트 미리보기", preview_rows.clear),
+                      ("브랜드 이름", brand_names.clear)):
+        try:
+            fn()
+            done.append(label)
+        except Exception:                                      # noqa: BLE001
+            pass
+    try:
+        accounts.refresh()                 # 계정 목록 메모리 캐시만 버린다
+        done.append("계정 목록 캐시")
+    except Exception:                                          # noqa: BLE001
+        pass
+    return done
+
+
+def backend_label(store_obj=None) -> tuple[str, str]:
+    """(표시 문구, 심각도) — 심각도는 'ok' | 'warn' | 'error'."""
+    info = queue_store.backend_info()
+    kind = type(store_obj).__name__ if store_obj is not None else (info.get("kind") or "")
+    if kind == "SupabaseStore":
+        mode = getattr(store_obj, "mode", "") or info.get("mode") or ""
+        return f"Supabase 원격 큐{f' ({mode})' if mode else ''}", "ok"
+    if info.get("fallback"):
+        return "로컬 큐 — ⚠ 원격 큐 연결 실패로 내려온 상태", "error"
+    if queue_store.wants_remote():
+        return "로컬 큐 — ⚠ 설정은 원격인데 로컬로 돌고 있습니다", "error"
+    return "로컬 큐 (이 컴퓨터 안)", "ok" if sys.platform.startswith("win") else "warn"
+
+
+def render_connection_panel(store_obj, device: dict | None) -> None:
+    """지금 무엇에 붙어 있는지 · 마지막 통신 시각 · [연결 다시 맺기]."""
+    text, level = backend_label(store_obj)
+    st.header("연결 상태")
+    (st.success if level == "ok" else st.warning if level == "warn"
+     else st.error)(f"큐: {text}")
+    last = ""
+    try:
+        last = store_obj.last_contact()
+    except Exception:                                          # noqa: BLE001
+        last = ""
+    st.markdown(info_block(
+        ("큐 마지막 통신", (f"{timeutil.fmt(last)} ({timeutil.ago(last)})"
+                         if last else "아직 없음")),
+        ("내 PC Agent", (f"🟢 {device.get('label') or device.get('device_id')}"
+                        f"{chr(32)}· 신호 {timeutil.ago(device.get('last_seen'))}"
+                        if device and device.get("alive") else "🔴 연결 안 됨")),
+    ), unsafe_allow_html=True)
+    if st.button("연결 다시 맺기", use_container_width=True,
+                 help="관리자 재부팅 없이 이 화면이 들고 있던 읽기 캐시를 버리고 "
+                      "큐에 다시 붙습니다. 작업을 새로 넣거나 취소하지 않습니다."):
+        got = reconnect()
+        st.toast("연결을 다시 맺었습니다 — " + ", ".join(got))
+        st.rerun()
+    st.caption("다시 맺는 범위: " + " · ".join(RECONNECT_SCOPE)
+               + f"{chr(10)}작업 제출·취소·삭제는 하지 않으며, 진행 중인 작업 번호도 "
+                 "그대로 둡니다.")
+
+
+def connect_store():
+    """큐에 붙는다. 못 붙으면 **조용히 로컬로 가지 않고** 화면을 멈춘다."""
+    try:
+        got = get_store()
+    except Exception as exc:                                   # noqa: BLE001
+        st.error("🔌 **작업 큐(Supabase)에 연결하지 못했습니다.**"
+                 + chr(10) + chr(10) +
+                 "이 상태에서는 작업을 넣어도 **각자 PC 의 Agent 가 보지 못합니다.** "
+                 "그래서 실행 버튼을 열지 않고 여기서 멈춥니다."
+                 + chr(10) + chr(10) + f"원인: `{type(exc).__name__}: {exc}`")
+        st.info("아래 **[연결 다시 맺기]** 를 먼저 눌러 보세요. 그래도 같으면 "
+                "**Settings → Secrets** 의 `SUPABASE_URL` · `SUPABASE_SERVICE_KEY` · "
+                "`BLOG_QUEUE_BACKEND` 를 확인해 주세요. "
+                "(관리자 재부팅은 필요하지 않습니다)")
+        if st.button("연결 다시 맺기", type="primary"):
+            reconnect()
+            st.rerun()
+        st.caption("※ 이 화면은 작업을 넣기만 합니다. 연결이 끊긴 동안 **이미 넣은 "
+                   "작업은 그대로** 있고, 취소되지 않습니다.")
+        st.stop()
+    # ★서버(클라우드)에서 로컬 큐는 **쓸 수 없다.** 설정이 빠져 백엔드가 local 로
+    #   잡힌 경우가 여기 걸린다(이때는 예외가 아니라 조용히 LocalStore 가 된다).
+    #   그 상태로 두면 작업이 서버 컨테이너 안으로 들어가 PC 가 못 본다.
+    missing = cloud_not_wired(got)
+    if missing:
+        st.error("🔌 **이 화면이 각자 PC 와 이어져 있지 않습니다 — 작업 큐 설정이 "
+                 "빠졌습니다.**"
+                 + chr(10) + chr(10) +
+                 "이 상태에서는 작업이 **이 서버 안에만** 쌓여 PC 의 Agent 가 보지 "
+                 "못합니다. 그래서 실행 버튼을 열지 않고 멈춥니다."
+                 + chr(10) + chr(10) +
+                 "**Settings → Secrets** 에 다음을 넣고 저장해 주세요 → "
+                 + ", ".join(f"`{k}`" for k in missing))
+        if st.button("연결 다시 맺기", type="primary"):
+            reconnect()
+            st.rerun()
+        st.caption("※ 이미 넣은 작업은 그대로 있고, 취소되지 않습니다.")
+        st.stop()
+    return got
+
+
+# ══════════════════════════════════════════════════════════════════
+# 선택 계정 로그아웃 (Stage 2 · 2026-11-03)
+#   ★기존 발행 흐름은 건드리지 않는다. 전부 **보조 기능**이다.
+#   ★상태는 PC 의 파일이 아니라 **큐**에서 읽는다 — 클라우드 화면에는 sessions/ 가 없고,
+#     큐는 화면·PC 가 함께 보는 유일한 공용 저장소다.
+#   ★판단 기준은 **login_id** 뿐이다. blog_id 로 묶지 않는다.
+# ══════════════════════════════════════════════════════════════════
+def is_logout_job(rec: dict) -> bool:
+    job = (rec or {}).get("job") or {}
+    return "--logout" in list(job.get("extra") or [])
+
+
+def logout_state(store_obj, login_id: str, account_id: str = "") -> dict:
+    """그 계정의 로그아웃 진행 상태. 큐를 한 번만 읽는다.
+
+        {"login_id", "account_id", "held"(보류 작업),
+         "running"(끝나길 기다리는 배치),
+         "logout_job"(대기/실행 중인 로그아웃 작업), "pending"(대기 중인가)}
+
+    ★식별자는 **login_id 1순위, 없으면 account.id(세션 폴더) 정확일치**다.
+      `blog_id` 로는 고르지 않는다 — 같은 blog_id 에 로그인 계정이 둘 이상일 수 있다.
+    """
+    lid, aid = (login_id or "").strip(), (account_id or "").strip()
+    out = {"login_id": lid, "account_id": aid, "held": [], "running": [],
+           "logout_job": None, "pending": False}
+    if not lid and not aid:
+        return out
+    try:
+        rows = store_obj.list_jobs(limit=120)
+    except Exception:                                          # noqa: BLE001
+        return out                          # 큐를 못 읽으면 아무것도 단정하지 않는다
+    for rec in rows:
+        if not queue_store.matches(rec, lid, aid):
+            continue
+        status = rec.get("status") or ""
+        if status == queue_store.HELD:
+            out["held"].append(rec)
+        elif status == queue_store.RUNNING and (rec.get("kind") or "run") == "run":
+            out["running"].append(rec)
+        elif is_logout_job(rec) and status in RUNNING_STATES:
+            out["logout_job"] = out["logout_job"] or rec
+    out["pending"] = bool(out["held"] or out["logout_job"])
+    return out
+
+
+def logout_block(store_obj, login_id: str, account_id: str = "") -> str:
+    """로그아웃 대기 중이면 **새 작업을 만들지 못하게** 할 이유를 돌려준다."""
+    stt = logout_state(store_obj, login_id, account_id)
+    if not stt["pending"]:
+        return ""
+    bits = []
+    if stt["held"]:
+        bits.append(f"보류된 작업 {len(stt['held'])}건")
+    if stt["running"]:
+        bits.append(f"끝나기를 기다리는 배치 {len(stt['running'])}건")
+    if stt["logout_job"]:
+        bits.append("로그아웃 작업 대기")
+    who = login_id or f"계정 {account_id}"
+    return (f"**{who} 는 로그아웃 대기 상태입니다** — 새 작업을 만들지 "
+            f"않습니다({' · '.join(bits)})."
+            f"{chr(10)}{chr(10)}재로그인(**[실행 준비]**) 뒤 **[보류 작업 재개]** 를 "
+            f"누르면 이어서 진행됩니다. 다른 계정의 작업은 영향받지 않습니다.")
+
+
+def agent_can_logout(device: dict | None) -> bool:
+    """이 PC 의 Agent 가 선택 계정 로그아웃을 할 수 있는 버전인가.
+
+    ★`v2.session --logout` 은 1.3.0 에서 생긴 명령이다. 옛 설치본에 보내면
+      argparse 가 거부해 **작업이 실패**한다 → 그 PC 에서는 버튼을 잠근다.
+    """
+    return pairing.supports((device or {}).get("version") or "", "logout")
+
+
+def grade_line(ready_info: dict) -> str:
+    """PC 가 돌려준 검증 등급 한 줄. 등급이 없으면(옛 Agent) 빈 문자열."""
+    g = (ready_info or {}).get("grade") or ""
+    if not g:
+        return ""
+    label = (ready_info or {}).get("grade_label") or GRADE_LABEL.get(g, g)
+    tail = (" · 발행 대상 블로그 일치 확인됨"
+            if (ready_info or {}).get("blog_verified") else "")
+    extra = "" if g == "authenticated" else "  ※ 네이버 인증 ID 확인은 아닙니다"
+    return f"· 로그인 계정 확인: **{label}**{tail}{extra}"
+
+
+def render_account_tools(store_obj, brand, account, ready_info: dict,
+                         device: dict | None = None) -> None:
+    """계정 세션 관리(보조) — 상태확인 / 로그아웃 / 보류 재개.
+
+    ★기존 발행 흐름(기준랜딩 탭 선택 → 실행 준비 → Dry-run → 실전 실행)은
+      그대로다. 이 영역은 **필요할 때만** 펼쳐 쓰는 보조 기능이다.
+    """
+    device_id = (device or {}).get("device_id") or ""
+    can_logout = agent_can_logout(device)
+    lid = (getattr(account, "login_id", "") or "").strip()
+    #   ★login_id 가 없는 기존 계정(tab_… 등)도 로그아웃할 수 있어야 한다.
+    #     그 계정의 유일한 정확한 식별자는 **세션 폴더 이름(account.id)** 이다.
+    aid = "" if lid else (getattr(account, "id", "") or "").strip()
+    stt = logout_state(store_obj, lid, aid)
+    title = "계정 세션 관리 (보조)"
+    if stt["pending"]:
+        title += " — 로그아웃 대기 중"
+    with st.expander(title, expanded=bool(stt["pending"])):
+        st.caption(f"· 대상 계정: **{account.label or account.id}**"
+                   + (f" (login_id: {lid})" if lid
+                      else " (login_id 미등록 — 이 계정 전용 세션 기준)")
+                   + f"{chr(10)}· 여기서 하는 일은 **이 계정에만** 적용됩니다. "
+                     "다른 로그인 계정의 세션·쿠키는 건드리지 않습니다.")
+        line = grade_line(ready_info)
+        if line:
+            st.markdown(line)
+
+        if stt["pending"]:
+            bits = []
+            if stt["running"]:
+                bits.append(f"**실행 중인 배치 {len(stt['running'])}건은 끝까지 "
+                            f"발행합니다**(중간에 끊지 않습니다)")
+            if stt["held"]:
+                bits.append(f"대기 작업 {len(stt['held'])}건을 **보류**했습니다")
+            if stt["logout_job"]:
+                bits.append("배치가 끝나면 로그아웃이 실행됩니다")
+            st.warning("로그아웃 대기 — " + " · ".join(bits)
+                       + f"{chr(10)}{chr(10)}재로그인은 위 **[실행 준비]** 로 하고, 그 뒤 아래 "
+                         "**[보류 작업 재개]** 를 눌러 주세요.")
+
+        c1, c2 = st.columns(2)
+        if c1.button("로그인 상태 다시 확인", use_container_width=True,
+                     disabled=not device_id,
+                     help="창을 띄우지 않고 저장된 세션이 살아 있는지, 발행 대상 "
+                          "블로그가 맞는지 확인합니다"):
+            res = submit_session_job(store_obj, brand, account, "--check",
+                                     device_id,
+                                     ref_tab=getattr(account, "ref_tab", ""))
+            if res.ok:
+                st.session_state["job_id"] = res.job_id
+                st.toast("로그인 상태를 확인하고 있습니다.")
+                st.rerun()
+
+        if not stt["pending"]:
+            #   세션을 공유하는 계정이 있어 **불분명한 경우**에만 체크가 필요하다.
+            #   판정은 계정 목록이 있는 PC(Agent)가 하고, 여기서는 그 결과를 보여 준다.
+            shared_ok = st.checkbox(
+                "공유 세션 확인 — 같은 세션을 쓰는 다른 계정도 재로그인이 필요함을 "
+                "확인했습니다", key=f"_shared_{aid or lid}",
+                help="PC 에서 '이 세션을 함께 쓰는 계정' 이 발견되면 로그아웃이 "
+                     "중단됩니다. 영향 범위를 확인하셨다면 이걸 체크하고 다시 "
+                     "눌러 주세요")
+            if c2.button("선택 계정 로그아웃", use_container_width=True,
+                         disabled=not (device_id and (lid or aid) and can_logout),
+                         help="이 계정만 로그아웃합니다. 실행 중인 10건 배치는 "
+                              "끝까지 발행한 뒤 로그아웃합니다"):
+                do_logout(store_obj, brand, account, lid, device_id,
+                          account_id=aid, confirm_shared=bool(shared_ok))
+            if not (lid or aid):
+                st.caption("※ 계정을 특정할 수 없습니다(세션 폴더 이름도 비어 있음).")
+            elif not lid:
+                st.caption("※ login_id 가 등록되지 않은 계정이라 **이 계정 전용 "
+                           "세션**만 초기화합니다. blog_id 는 기준으로 쓰지 "
+                           "않습니다 — 같은 blog_id 에 다른 로그인 계정이 있을 수 "
+                           "있기 때문입니다.")
+            if device_id and not can_logout:
+                st.caption("※ 이 PC 의 Agent 가 "
+                           f"{(device or {}).get('version') or '옛 버전'} 입니다 — "
+                           "로그아웃 기능은 **"
+                           + ".".join(str(n) for n in pairing.NEEDS["logout"])
+                           + " 이상**에서 동작합니다. "
+                           "왼쪽에서 설치본을 다시 받아 설치하면 열립니다"
+                           "(설치해도 저장된 로그인 세션은 그대로입니다).")
+        elif c2.button("보류 작업 재개", type="primary", use_container_width=True,
+                       disabled=not (lid or aid),
+                       help="보류해 둔 작업을 다시 대기 상태로 돌립니다"):
+            do_resume(store_obj, lid, device_id, account_id=aid)
+
+
+def do_logout(store_obj, brand, account, login_id: str, device_id: str,
+              account_id: str = "", confirm_shared: bool = False) -> None:
+    """① 대기 작업 보류 → ② 로그아웃 작업 등록. 순서를 바꾸면 안 된다.
+
+    ★②를 먼저 하면 그 사이에 Agent 가 다음 배치를 집어 가 로그아웃 뒤에 발행이
+      이어질 수 있다. ①이 먼저여야 "보류된 것은 절대 집히지 않는다" 가 성립한다.
+    ★①은 **status 가 아직 pending 인 것만** 바꾸는 조건부 변경이다. 그 순간
+      Agent 가 집어간 작업(running)은 조건에 걸리지 않고 끝까지 간다.
+    """
+    try:
+        held = store_obj.hold_account(login_id, device=device_id or "",
+                                      account_id=account_id)
+    except NotImplementedError:
+        st.error("이 큐에서는 보류를 지원하지 않습니다 — 로그아웃을 하지 않았습니다.")
+        return
+    except Exception as exc:                                   # noqa: BLE001
+        st.error(f"대기 작업을 보류하지 못해 **로그아웃을 하지 않았습니다**."
+                 f"{chr(10)}{chr(10)}원인: `{type(exc).__name__}: {exc}`")
+        return
+
+    running = []
+    try:
+        running = store_obj.running_for_login(login_id, account_id)
+    except Exception:                                          # noqa: BLE001
+        pass
+
+    res = submit_session_job(store_obj, brand, account, "--logout", device_id,
+                             ref_tab=getattr(account, "ref_tab", ""),
+                             extra_args=["--confirm-shared"] if confirm_shared
+                             else None)
+    if not res.ok:
+        # ★로그아웃 작업이 안 들어갔다 → 보류를 **되돌린다**(작업이 멈춘 채
+        #   방치되지 않게). 안내는 submit_guarded 가 이미 그렸다.
+        try:
+            store_obj.resume_account(login_id, device=device_id or "",
+                                     account_id=account_id)
+            st.info("로그아웃 작업을 등록하지 못해 보류를 되돌렸습니다 "
+                    "(작업은 그대로 대기 상태입니다).")
+        except Exception:                                      # noqa: BLE001
+            st.warning("로그아웃 작업 등록에 실패했고 보류도 되돌리지 못했습니다 — "
+                       "[보류 작업 재개] 를 눌러 주세요.")
+        return
+    st.session_state["job_id"] = res.job_id
+    msg = [f"보류 {len(held)}건"]
+    if running:
+        msg.append(f"실행 중인 배치 {len(running)}건은 **끝까지 발행**합니다")
+    msg.append("그 뒤 로그아웃이 실행됩니다")
+    st.success("로그아웃을 예약했습니다 — " + " · ".join(msg))
+    st.rerun()
+
+
+def do_resume(store_obj, login_id: str, device_id: str,
+              account_id: str = "") -> None:
+    try:
+        back = store_obj.resume_account(login_id, device=device_id or "",
+                                        account_id=account_id)
+    except Exception as exc:                                   # noqa: BLE001
+        st.error(f"보류 작업을 재개하지 못했습니다 — `{type(exc).__name__}: {exc}`")
+        return
+    st.success(f"보류 작업 {len(back)}건을 다시 대기 상태로 돌렸습니다.")
+    st.rerun()
+
+
+def cancel_guarded(store_obj, job_id: str, label: str = "작업") -> bool:
+    """중단 요청. 실패를 성공처럼 보이지 않게 **결과를 화면에 알린다**."""
+    try:
+        store_obj.request_cancel(job_id)
+    except Exception as exc:                                   # noqa: BLE001
+        st.error(f"{label} 중단 요청을 보내지 못했습니다 — **작업은 계속 돌고 "
+                 f"있을 수 있습니다.**{chr(10)}{chr(10)}"
+                 f"원인: `{type(exc).__name__}: {exc}`")
+        return False
+    return True
+
+
+def submit_guarded(store_obj, job, *, kind: str = "run", title: str = "",
+                   target_agent: str = "", label: str = "작업"):
+    """`queue_store.submit_checked` + 결과를 **화면에 그려 준다** → `SubmitResult`.
+
+    판단은 큐 계층이 하고(테스트가 브라우저 없이 그걸 검증한다), 여기서는
+    상태별로 무엇을 누르면 되는지만 덧붙인다.
+      · 성공 확인   → 조용히 통과(호출한 쪽이 작업 번호를 추적한다)
+      · 실패 확정   → 빨간 안내. 다시 눌러도 **중복 발행 위험 없음**
+      · 확인 불가   → 노란 안내 + **자동 재제출 금지**. 멱등성 키를 남겨
+                      [등록 여부 다시 확인] 으로 되찾게 한다.
+    """
+    # ★로그아웃 대기 중인 계정의 **랜딩 작업(run)** 은 새로 만들지 않는다.
+    #   로그인·세션확인·로그아웃(session)은 복구 수단이므로 막지 않는다.
+    #   아직 아무것도 보내지 않았으므로 '실패 확정' 이 맞다(중복 위험 없음).
+    if kind == "run":
+        why = logout_block(store_obj, getattr(job, "login_id", "") or "",
+                           getattr(job, "account", "") or "")
+        if why:
+            st.error(why)
+            return queue_store.SubmitResult(queue_store.SUBMIT_FAILED, message=why)
+
+    res = queue_store.submit_checked(
+        store_obj, job, kind=kind, title=title, target_agent=target_agent,
+        label=label)
+    body = (res.message or "").replace(chr(10), chr(10) + chr(10))
+    if res.status == queue_store.SUBMIT_FAILED:
+        st.error(body + f"{chr(10)}{chr(10)}왼쪽 **연결 상태** 에서 "
+                 "[연결 다시 맺기] 를 누른 뒤 다시 시도해 주세요.")
+    elif res.unknown:
+        st.session_state["_pending_submit"] = {
+            "key": res.client_key, "label": label,
+            "at": timeutil.now_kst().isoformat(timespec="seconds")}
+        sync_pending_key()                 # 새로고침해도 키를 잃지 않게 주소에도
+        st.warning("⚠ " + body + f"{chr(10)}{chr(10)}**같은 작업을 다시 넣지 "
+                   "마세요.** 아래 **[등록 여부 다시 확인]** 으로 먼저 확인해 "
+                   "주세요(중복 발행을 막기 위해서입니다).")
+    elif res.message:                      # 성공이지만 알려 줄 것이 있는 경우
+        st.info(body)
+    return res
+
+
+def render_pending_submit(store_obj) -> None:
+    """'등록 여부 확인 불가' 가 남아 있으면 **조회로만** 되찾게 한다(재제출 안 함)."""
+    pend = st.session_state.get("_pending_submit") or {}
+    key = pend.get("key") or ""
+    if not key:
+        return
+    when = timeutil.fmt(pend.get("at"), "%H:%M:%S")
+    st.warning(f"⚠ **{pend.get('label') or '작업'}의 등록 여부가 확인되지 "
+               f"않았습니다**" + (f" ({when} 제출)" if when else "")
+               + ". 아래 버튼으로 확인하기 전에는 다시 넣지 마세요."
+               + (f"{chr(10)}{chr(10)}※ 새로고침 전에 제출한 작업입니다"
+                  "(주소에 남겨 둔 확인용 번호로 찾습니다)."
+                  if pend.get("from_url") else ""))
+    if st.button("등록 여부 다시 확인", use_container_width=True,
+                 help="작업을 새로 넣지 않고, 멱등성 키로 이미 등록된 작업만 찾습니다"):
+        rec, why = queue_store.find_job_by_client_key(store_obj, key, tries=2)
+        if rec:
+            st.session_state["job_id"] = rec.get("id") or ""
+            clear_pending_key()
+            st.toast("등록돼 있었습니다 — 그 작업을 이어서 보여 드립니다.")
+            st.rerun()
+        elif why:
+            st.error("아직 확인하지 못했습니다 — 다시 넣지 마세요."
+                     f"{chr(10)}{chr(10)}원인: `{why}`")
+        else:
+            clear_pending_key()
+            st.info("등록되지 않은 것으로 확인했습니다 — 이제 다시 실행하셔도 "
+                    "**중복 발행 위험이 없습니다.**"
+                    f"{chr(10)}{chr(10)}※ 그래도 아래 **최근 실행 기록**에 같은 "
+                    "작업이 보이면 그것을 이어서 쓰세요(늦게 처리된 경우).")
+
+
+store = connect_store()
 
 # ══════════════════════════════════════════════════════════════════
 # 사이드바 — 브랜드만 (계정/실행 준비는 본문에서 고른다)
@@ -901,6 +1328,9 @@ with st.sidebar:
     device = render_agent_panel(store)      # 🟢/🔴 · 설치 · 6자리 페어링
     agent_ready = bool(device and device.get("alive"))
 
+    st.divider()
+    render_connection_panel(store, device)  # 큐 백엔드 · 마지막 통신 · 다시 맺기
+
     st.caption("네이버 로그인 세션은 실행하는 PC 안에만 저장됩니다"
                "(큐로 나가지 않습니다).")
     st.caption(f"화면 버전 {APP_VERSION}")
@@ -921,8 +1351,6 @@ st.markdown(info_block(("브랜드", brand.title),
                        ("UTM 빌더", brand.utm_title)),
             unsafe_allow_html=True)
 
-render_help()                              # ❓ 처음 사용하시나요?
-
 _gap = cloud_not_wired()
 if _gap:
     st.error("🔌 **이 화면이 아직 각자 PC 와 이어져 있지 않습니다.**"
@@ -936,8 +1364,7 @@ elif not agent_ready:
     st.warning("⚠ **아직 어느 PC 에서 돌릴지 정해지지 않았습니다.**"
                f"{chr(10)}{chr(10)}왼쪽 **내 PC** 에서 본인 컴퓨터를 고르세요. "
                "목록에 없으면 그 컴퓨터에 Agent 를 **한 번만** 설치하면 됩니다 — "
-               "**[⬇ Windows Agent 설치]** → 설치 → **[연결 코드 받기]** 의 6자리 입력. "
-               "자세한 방법은 위 **도움말**을 펼쳐 보세요."
+               "**[⬇ Windows Agent 설치]** → 설치 → **[연결 코드 받기]** 의 6자리 입력."
                f"{chr(10)}{chr(10)}※ 다른 사람 PC 를 고르면 **그 사람 컴퓨터에서 "
                "그 사람 네이버 계정으로** 글이 올라갑니다. 꼭 본인 PC 를 고르세요.")
 
@@ -1278,12 +1705,14 @@ with left:
             # 탭 이름이 같으면 id 도 같으므로 미리 계산해 보내면 어긋나지 않는다.
             # 계정은 위에서 이미 정해 뒀다(없으면 탭 이름으로 만든 것).
             #   실제 등록은 **로그인하는 PC 에서** 한다.
-            jid = submit_session_job(store, brand, account, "--login",
+            res = submit_session_job(store, brand, account, "--login",
                                      device["device_id"] if device else "",
                                      ref_tab=ref_tab)
-            st.session_state["job_id"] = jid
-            st.toast("실행 준비를 시작했습니다 — 로그인 창을 확인해 주세요.")
-            st.rerun()
+            if res.ok:
+                st.session_state["job_id"] = res.job_id
+                st.toast("실행 준비를 시작했습니다 — 로그인 창을 확인해 주세요.")
+                st.rerun()
+            # 실패·확인 불가 안내는 submit_guarded 가 이미 그렸다(여기서 다시 넣지 않는다)
 
         # 지금 어디까지 왔는지 — 버튼 바로 아래에서 보인다
         watching = session_job(store, account, brand) if account else None
@@ -1294,6 +1723,12 @@ with left:
                     f"(쿠키 {info['cookies']}개 · {info['saved_at'][:16]})"
                     if logged_in else "· 로그인 세션: 없음")
                    + f"{chr(10)}· 네이버 로그인은 매번 직접 하셔야 합니다.")
+
+        # ── 계정 세션 관리(보조) ─────────────────────────────────
+        #   ★평소 발행에는 **아무것도 누를 필요가 없다.** 접어 둔다.
+        #   ★여기서 하는 일은 모두 **고른 계정 하나**에만 적용된다.
+        if account:
+            render_account_tools(store, brand, account, ready_info, device)
 
         if not agent_ready:
             st.info("이 컴퓨터의 **Agent 가 연결되면** 실행 버튼이 열립니다 "
@@ -1331,11 +1766,15 @@ with left:
                      help="실제로 글을 올리지 않습니다. 시트에서 어떤 행이 잡히는지만 "
                           "확인합니다(네이버 로그인 없이도 됩니다)"):
             job = build_job(dry=True)
-            st.session_state["job_id"] = store.submit(
-                job, title=f"[dry][{brand.title}] {FLOWS[flow]['label']} · "
-                           f"{media}/{deficiency}",
-                target_agent=device["device_id"] if device else "")
-            st.rerun()
+            res = submit_guarded(
+                store, job,
+                title=f"[dry][{brand.title}] {FLOWS[flow]['label']} · "
+                      f"{media}/{deficiency}",
+                target_agent=device["device_id"] if device else "",
+                label="Dry-run 작업")
+            if res.ok:
+                st.session_state["job_id"] = res.job_id
+                st.rerun()
 
         # ★확인 체크박스는 두지 않는다(2026-08-31 사용자 요청).
         #   오발행 방지는 **실행 준비 완료 상태에서만 버튼이 열리는 것**으로 갈음한다.
@@ -1354,12 +1793,19 @@ with left:
                     device=device["device_id"] if device else "")
                 st.session_state["plan_id"] = plan["id"]
                 st.session_state.pop("job_id", None)
+                st.rerun()
             else:
                 # 건수 0(=전부)은 총 건수를 알 수 없어 나누지 않는다(기존 동작).
-                st.session_state["job_id"] = store.submit(
-                    job, title=title,
-                    target_agent=device["device_id"] if device else "")
-            st.rerun()
+                res = submit_guarded(
+                    store, job, title=title,
+                    target_agent=device["device_id"] if device else "",
+                    label="실전 실행 작업")
+                if res.ok:
+                    st.session_state["job_id"] = res.job_id
+                    st.rerun()
+        # 등록 여부를 확인하지 못한 제출이 있으면 **조회로만** 되찾는다
+        render_pending_submit(store)
+
         # 지금 어디까지 왔는지 — 실행 버튼 바로 아래에서 보인다
         running_id = st.session_state.get("job_id") or ""
         watch_run = store.get(running_id) if running_id else None
@@ -1503,7 +1949,7 @@ with left:
                                                       use_container_width=True):
                 for key in ("run_job", "login_job"):
                     if cur and cur.get(key):
-                        store.request_cancel(cur[key])
+                        cancel_guarded(store, cur[key], "배치")
                 batch_plan.cancel(plan)
                 st.session_state.pop("plan_id", None)
                 st.rerun()
@@ -1545,10 +1991,10 @@ else:
     head[3].metric("발행", len(published))
     if status in RUNNING_STATES:
         if head[4].button("중단", type="secondary", use_container_width=True):
-            store.request_cancel(rec["id"])
-            st.toast("중단을 요청했습니다.")
-            time.sleep(1.0)
-            st.rerun()
+            if cancel_guarded(store, rec["id"]):
+                st.toast("중단을 요청했습니다.")
+                time.sleep(1.0)
+                st.rerun()
     else:
         head[4].caption(f"코드 {rec.get('exit_code')}")
 

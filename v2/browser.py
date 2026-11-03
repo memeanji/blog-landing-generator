@@ -127,8 +127,20 @@ async def open_session(settings, log, relogin: bool = False):
             if account:
                 from . import session_store
 
-                path = session_store.save_state(account, cookies, blog_id=logged or "")
-                log(f"[세션] `{account}` 세션 저장 완료 → {path}")
+                # ★계정이 어긋나면 **저장하지 않는다.** 뒤에서 호출한 쪽이
+                #   어긋남을 보고 멈춘다. 이 경로에서는 쿠키를 headless 로
+                #   넘기지도 않는다(넘기면 그 세션으로 작업이 이어진다).
+                verdict, why = save_verdict(account, logged or "")
+                if verdict == "mismatch":
+                    log(f"[세션] ❌ 저장하지 않았습니다 — {why}")
+                    cookies = []              # headless 로 넘기지도 않는다
+                    await _wipe_context_cookies(ctx, log)
+                elif verdict == "unreadable":
+                    log(f"[세션] ❌ 저장하지 않았습니다 — {why}")
+                else:
+                    path = session_store.save_state(account, cookies,
+                                                    blog_id=logged or "")
+                    log(f"[세션] `{account}` 세션 저장 완료 → {path}")
         except Exception as exc:                               # noqa: BLE001
             log(f"[로그인] 쿠키를 읽지 못했습니다({type(exc).__name__})")
     finally:
@@ -174,11 +186,126 @@ async def _prime_session(ctx, account: str, log) -> int:
     return n
 
 
+def registered_blog_id(account: str) -> str:
+    """이 세션 폴더(계정 id)에 **등록된** blog_id. 모르면 빈 문자열.
+
+    ★`id` **정확일치**로만 찾는다. login_id·blog_id 로 느슨하게 찾으면, 한 계정의
+      폴더 이름이 다른 계정의 blog_id 와 같을 때 엉뚱한 계정을 집어온다(2026-09-16).
+    """
+    try:
+        from . import accounts
+
+        for acc in accounts.load_accounts(include_disabled=True):
+            if acc.id == account:
+                return (acc.blog_id or "").strip()
+    except Exception:                                          # noqa: BLE001
+        return ""                             # 목록을 못 읽으면 '모른다'(예전 동작)
+    return ""
+
+
+def saved_blog_id(account: str) -> str:
+    """그 세션 폴더에 **지금까지 저장돼 있던** blog_id. 없으면 빈 문자열.
+
+    ★등록(accounts) 쪽에 blog_id 가 비어 있는 계정을 지키는 두 번째 기준이다.
+      이미 그 폴더로 A 블로그에 로그인해 쓰고 있었는데 B 블로그로 들어왔다면,
+      등록값이 없어도 **그 세션을 덮어써서는 안 된다**.
+    """
+    try:
+        from . import session_store
+
+        return (session_store.describe(account).get("blog_id") or "").strip()
+    except Exception:                                          # noqa: BLE001
+        return ""
+
+
+def reference_blog_id(account: str) -> tuple[str, str]:
+    """대조 기준 blog_id 와 그 출처. ① 등록값 ② 그 세션에 저장돼 있던 값 순."""
+    want = registered_blog_id(account)
+    if want:
+        return want, "등록 blog_id"
+    return saved_blog_id(account), "이 세션에 저장돼 있던 blog_id"
+
+
+def save_verdict(account: str, blog_id: str) -> tuple[str, str]:
+    """`(판정, 사유)` — `verified` / `mismatch` / `unreadable` / `unknown`.
+
+        verified    기준값과 일치한다 → 저장한다
+        mismatch    기준값과 **다르다** → 저장하지 않고, 프로필 쿠키까지 지운다
+        unreadable  기준값은 있는데 **지금 블로그를 못 읽었다**
+                    → 저장하지 않는다(기존 정상 세션을 보존한다). 쿠키는 **지우지 않는다**.
+        unknown     기준값이 아예 없다(첫 로그인) → 예전처럼 저장하되
+                    '검증됨' 으로 기록하지 않는다
+
+    ★`login_id` 가 같은지는 여기서 알 수 없다 — 그래서 `verified` 도 '블로그가
+      맞다' 는 뜻일 뿐이고, 로그인 계정 확인 등급은 `login_state` 가 따로 매긴다.
+    """
+    got = (blog_id or "").strip()
+    want, where = reference_blog_id(account)
+    if not got:
+        # ★기준값이 있는데 지금 블로그를 못 읽었다 = 대조 불가.
+        #   여기서 저장하면 **기준값이 지워져** 다음부터 영구히 대조 불가가 된다.
+        if want:
+            return "unreadable", (
+                f"로그인된 블로그를 읽지 못했습니다 — {where}({want}) 로 쓰던 "
+                f"`{account}` 세션을 대조 없이 덮어쓰지 않습니다")
+        return "unknown", "로그인된 블로그를 읽지 못했습니다(기준값도 없음)"
+    if not want:
+        return "unknown", "대조할 기준 blog_id 가 없습니다(첫 로그인)"
+    if want.casefold() == got.casefold():
+        return "verified", f"{where}({want}) 와 일치"
+    return "mismatch", (f"로그인된 블로그({got})가 {where}({want}) 와 다릅니다 — "
+                        f"남의 인증정보를 `{account}` 세션으로 저장하지 않습니다")
+
+
+BLOCK_SAVE = ("mismatch", "unreadable")
+
+
+def save_blocked(account: str, blog_id: str) -> str:
+    """저장하면 안 되는 이유. 저장해도 되면 빈 문자열(`unknown` 은 허용).
+
+    ★`unknown`(기준값 없음)은 **예전과 똑같이** 저장한다 — 첫 로그인과 기존 계정의
+      동작을 바꾸지 않기 위해서다. 다만 검증됐다고 기록하지는 않는다.
+    """
+    verdict, why = save_verdict(account, blog_id)
+    return why if verdict in BLOCK_SAVE else ""
+
+
+async def _wipe_context_cookies(ctx, log) -> bool:
+    """어긋난 로그인의 흔적을 **영구 프로필에서도** 지운다.
+
+    ★`launch_persistent_context` 는 세션이 아닌 쿠키(NID_AUT 등)를 프로필 파일에
+      남긴다. state.json 을 저장하지 않아도, 다음 실행에서 그 프로필만으로 **엉뚱한
+      계정으로 자동 로그인**될 수 있다. 저장을 막은 경로에서는 여기서 끊는다.
+      (프로필 폴더 자체는 지우지 않는다 — 기기 등록 흔적은 남긴다.)
+    """
+    try:
+        await ctx.clear_cookies()
+    except Exception as exc:                                   # noqa: BLE001
+        log(f"[세션] ⚠ 어긋난 로그인 쿠키를 지우지 못했습니다"
+            f"({type(exc).__name__}) — 다음 실행에서 자동 로그인될 수 있습니다. "
+            f"필요하면 `--relogin` 으로 다시 로그인해 주세요.")
+        return False
+    log("[세션] 어긋난 로그인 쿠키를 프로필에서도 지웠습니다(프로필 폴더는 보존)")
+    return True
+
+
 async def _persist_session(ctx, account: str, blog_id: str, log) -> int:
     """지금 컨텍스트의 쿠키를 계정 폴더에 저장한다(창을 닫기 **전에** 불러야 한다)."""
     if not account:
         return 0
     from . import session_store
+
+    verdict, why = save_verdict(account, blog_id)
+    if verdict == "mismatch":
+        log(f"[세션] ❌ 저장하지 않았습니다 — {why}")
+        await _wipe_context_cookies(ctx, log)       # 어긋난 로그인 흔적을 끊는다
+        return 0
+    if verdict == "unreadable":
+        # ★쿠키를 지우지 않는다 — 기존 정상 세션을 끊으면 재로그인을 유발한다.
+        log(f"[세션] ❌ 저장하지 않았습니다 — {why}")
+        return 0
+    if verdict == "unknown":
+        log(f"[세션] (참고) {why} — 저장은 하지만 '검증됨' 으로 기록하지 않습니다")
 
     try:
         cookies = await ctx.cookies()

@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import re
 
-from . import browser
+from . import browser, fastwait
 
 POPUP_MARKS = ("작성 중인 글이 있습니다", "이어서 작성하시겠습니까")
 
@@ -562,6 +562,9 @@ class NewPost:
         for c in picked[:5]:
             try:
                 await fr.locator(f'[data-v2-dev="{c["i"]}"]').first.click(timeout=2500)
+                # ★2026-11-03: 조건부 대기로 바꿨다가 **원복**했다. 측정상 이득이
+                #   0.4~0.7초뿐이고, 사용자 요청(1건당 1~3초)은 아래 '글 화면 진입'
+                #   개선만으로 충분하다. 안정성 우선 — 고정 대기를 그대로 둔다.
                 await self.page.wait_for_timeout(900)
                 after = await fr.evaluate(DEVICE_STATE_JS)
                 if after["width"] != before["width"] or after["marks"] != before["marks"]:
@@ -610,6 +613,7 @@ class NewPost:
         await fr.locator('[data-v2-title]').first.click(timeout=8000)
         await self.page.wait_for_timeout(400)
         await self.page.keyboard.type(title, delay=12)
+        # ★2026-11-03: 조건부 대기로 바꿨다가 **원복**(위 모바일 전환과 같은 이유).
         await self.page.wait_for_timeout(600)
 
         got = _norm((await self.stats())["title"])
@@ -1421,12 +1425,41 @@ async def dismiss_draft_popup(page, log, timeout_ms: int = 10_000) -> None:
     log("[새글] 작성 중인 글 팝업 없음")
 
 
+# ★에디터가 **실제로 보이는가**. iframe 이 있다는 것만으로는 안 된다 —
+#   그러면 아직 로딩 중인 화면을 '준비됐다' 로 보게 된다(조건이 무의미해진다).
+OPEN_READY_JS = r"""() => !!document.querySelector(
+     '.se-component, [class*="se-placeholder"], .se-documentTitle')"""
+
+
+async def _page_ready(page) -> bool:
+    """이 뒤에 쓸 것들(로그인 여부 · 팝업 · 에디터) 중 하나라도 **판정 가능**한가.
+
+    ★`open_write` / `open_for_edit` 의 고정 2.5초 대기를 대신한다. 어느 쪽이든
+      바로 다음 줄이 확인하는 것이고, 조건이 안 되면 2.5초를 그대로 기다린다.
+    """
+    if "nidlogin" in (page.url or ""):
+        return True
+    if await _popup_visible(page):            # 같은 모듈의 팝업 판정을 그대로 쓴다
+        return True
+    for fr in [page.main_frame] + list(page.frames):
+        try:
+            if fr.is_detached():
+                continue
+            if await fr.evaluate(OPEN_READY_JS):
+                return True
+        except Exception:                                      # noqa: BLE001
+            continue
+    return False
+
+
 async def open_write(ctx, blog_id: str, log) -> NewPost:
     """새 글쓰기 화면을 **항상 새 탭**으로 연다.
     ★같은 탭에서 이동시키면 앞서 완성해 둔 글이 통째로 날아간다(2026-08-20 사고)."""
     page = await ctx.new_page()
     await page.goto(f"https://blog.naver.com/{blog_id}/postwrite", wait_until="domcontentloaded")
-    await page.wait_for_timeout(2500)
+    # ★예전: 고정 2.5초. 이제는 '로그인 화면 / 작성중 팝업 / 에디터' 중 하나가
+    #   보이면 바로 넘어간다(최대 2.5초 — 안 되면 옛 동작과 같다).
+    await fastwait.settle(page, 2500, lambda: _page_ready(page))
     if "nidlogin" in (page.url or ""):
         raise RuntimeError("새 글쓰기가 로그인 페이지로 튕겼습니다. 로그인 상태를 확인하세요.")
     await dismiss_draft_popup(page, log)

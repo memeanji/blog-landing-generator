@@ -130,6 +130,97 @@ def clear_state(acc, profile: bool = False) -> list[str]:
     return gone
 
 
+# ══════════════════════════════════════════════════════════════════
+#  사용자가 고른 계정만 로그아웃 (2026-11-03)
+#    기본(soft)  : 이 계정의 저장 쿠키(state.json)만 지우고 **프로필은 보존**한다.
+#                  → 기기 등록 흔적이 남아 다음 로그인에서 2차 인증을 다시 겪지 않는다.
+#    hard        : 프로필 안의 로그인 파일까지 지운다. **별도 승인 기능**이고,
+#                  브라우저가 완전히 종료된 경우에만 실행할 수 있다(아래 참조).
+#  ★절대 하지 않는 것 — 다른 계정 폴더 접근 · 쿠키 백업 파일 생성 · 프로필 기본 삭제
+# ══════════════════════════════════════════════════════════════════
+#  hard logout 때 지우는 것만 나열한다(프로필 폴더 자체는 남긴다).
+HARD_TARGETS = ("Cookies", "Cookies-journal", "Login Data", "Login Data-journal",
+                "Local Storage", "Session Storage", "Sessions")
+
+
+def browser_closed(acc) -> tuple[bool, str]:
+    """브라우저가 **완전히 종료**됐는지 확인한다.
+
+    확인 방법 — 프로필 폴더를 잠깐 다른 이름으로 바꿔 본다. 크로미움이 그 폴더를
+    쓰고 있으면 윈도우가 이름 변경을 거부한다(WinError 32/5). 성공하면 즉시
+    원래 이름으로 되돌린다. ★폴더 내용은 건드리지 않는다.
+    """
+    import os
+
+    d = profile_dir(acc)
+    if not d.exists():
+        return True, "프로필 폴더가 없습니다(열려 있을 수 없음)"
+    if (d / "SingletonLock").exists():
+        return False, "프로필이 사용 중입니다(SingletonLock) — 브라우저를 닫아 주세요"
+    probe = d.with_name(d.name + ".closedcheck")
+    try:
+        os.rename(d, probe)
+    except OSError as exc:
+        return False, (f"프로필이 사용 중입니다({type(exc).__name__}) — "
+                       f"브라우저를 완전히 닫은 뒤 다시 시도해 주세요")
+    try:
+        os.rename(probe, d)
+    except OSError as exc:                                     # 되돌리기 실패 = 즉시 보고
+        raise RuntimeError(
+            f"프로필 폴더 이름을 되돌리지 못했습니다({type(exc).__name__}). "
+            f"{probe} 를 {d} 로 직접 바꿔 주세요.") from exc
+    return True, "브라우저가 종료돼 있습니다"
+
+
+def logout(acc, hard: bool = False) -> dict:
+    """이 계정의 로컬 인증정보를 초기화한다. **다른 계정은 건드리지 않는다.**
+
+    돌려주는 것
+        {"local_cleared": [...], "profile_kept": bool, "hard": bool,
+         "skipped": [...], "reason": str}
+    ★쿠키 백업 파일을 만들지 않는다. 지운 파일 이름만 남긴다(내용은 기록하지 않는다).
+    """
+    import shutil
+
+    ident = account_id(acc)
+    if not ident:
+        raise RuntimeError("계정 id 가 비어 있어 로그아웃할 수 없습니다.")
+
+    cleared: list[str] = []
+    sp = state_path(acc)
+    if sp.exists():
+        try:
+            sp.unlink()
+            cleared.append(sp.name)
+        except Exception as exc:                               # noqa: BLE001
+            return {"local_cleared": cleared, "profile_kept": True, "hard": False,
+                    "skipped": [sp.name],
+                    "reason": f"{sp.name} 을 지우지 못했습니다({type(exc).__name__})"}
+
+    if not hard:
+        return {"local_cleared": cleared, "profile_kept": True, "hard": False,
+                "skipped": [], "reason": "프로필 보존(기본)"}
+
+    ok, why = browser_closed(acc)
+    if not ok:
+        return {"local_cleared": cleared, "profile_kept": True, "hard": False,
+                "skipped": list(HARD_TARGETS), "reason": why}
+
+    d = profile_dir(acc)
+    skipped: list[str] = []
+    for name in HARD_TARGETS:
+        for p in (d / name, d / "Default" / name):
+            if not p.exists():
+                continue
+            try:
+                shutil.rmtree(p) if p.is_dir() else p.unlink()
+                cleared.append(str(p.relative_to(d)))
+            except Exception as exc:                           # noqa: BLE001
+                skipped.append(f"{p.name}({type(exc).__name__})")
+    return {"local_cleared": cleared, "profile_kept": True, "hard": True,
+            "skipped": skipped, "reason": why}
+
+
 def describe(acc) -> dict:
     """GUI·CLI 에 보여줄 세션 현황(브라우저를 켜지 않는다)."""
     state, meta = load_state(acc), {}

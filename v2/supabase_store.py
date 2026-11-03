@@ -28,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .job import Job
-from .queue_store import (CANCELED, DONE, FAILED, JobStore, PENDING, RUNNING,
+from .queue_store import (CANCELED, DONE, FAILED, HELD, JobStore, PENDING, RUNNING,
                           host_name, now_iso)
 
 TIMEOUT = 20
@@ -37,7 +37,19 @@ LOG_FLUSH_SEC = 1.5
 
 
 class SupabaseError(RuntimeError):
-    pass
+    """Supabase 호출 실패.
+
+    ★`definite_failure=True` 는 **서버에 아무것도 쓰이지 않았음이 확실**하다는 뜻이다
+      (요청을 보내기도 전에 막힌 경우, 또는 서버가 4xx 로 거부한 경우).
+      타임아웃·연결 끊김·5xx 는 **도착해서 처리됐을 수도 있으므로** 확실하지 않다
+      — 그때 '등록 실패' 로 단정하면 사용자가 다시 넣어 **중복 발행**이 된다.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None,
+                 definite_failure: bool = False) -> None:
+        super().__init__(message)
+        self.status = status
+        self.definite_failure = definite_failure
 
 
 def _env(name: str, default: str = "") -> str:
@@ -82,6 +94,10 @@ class SupabaseStore(JobStore):
         self._buf: dict[str, list[str]] = {}
         self._buf_at: dict[str, float] = {}
         self._lock = threading.Lock()
+        # ★마지막으로 **성공적으로** 주고받은 시각(화면의 '연결 상태' 표시용).
+        #   객체를 만든 것만으로는 채우지 않는다 — 설정만 맞고 키가 틀린 상태를
+        #   '연결됨' 으로 보이게 하면 안 된다.
+        self._last_ok = ""
 
     # ── 저수준 ───────────────────────────────────────────────────
     def _headers(self, extra: dict | None = None) -> dict:
@@ -95,7 +111,13 @@ class SupabaseStore(JobStore):
                                    headers=self._headers(kw.pop("headers", None)),
                                    timeout=TIMEOUT, **kw)
         if not r.ok:
-            raise SupabaseError(f"{method} {path} 실패({r.status_code}): {r.text[:200]}")
+            # ★4xx = 서버가 **받아서 거부**했다 → 행이 생기지 않았음이 확실하다.
+            #   5xx·네트워크 예외는 처리됐을 수도 있어 확실하지 않다(아래 except 로 빠짐).
+            raise SupabaseError(
+                f"{method} {path} 실패({r.status_code}): {r.text[:200]}",
+                status=r.status_code,
+                definite_failure=400 <= r.status_code < 500)
+        self._last_ok = now_iso()
         if not r.content:
             return None
         try:
@@ -110,10 +132,23 @@ class SupabaseStore(JobStore):
                                 headers=self._headers(), json=body, timeout=TIMEOUT)
         if not r.ok:
             raise SupabaseError(f"rpc {fn} 실패({r.status_code}): {r.text[:200]}")
+        self._last_ok = now_iso()
         try:
             return r.json()
         except Exception:                                      # noqa: BLE001
             return None
+
+    # ── 연결 확인 (읽기 1회 · 작업을 집거나 바꾸지 않는다) ────────
+    def probe(self) -> bool:
+        """service 모드에서 테이블을 1행만 읽어 **정말 붙었는지** 확인한다.
+
+        ★device 모드(Agent)는 `strict` 로 부르지 않으므로 건너뛴다 — 토큰 검증
+          RPC 는 작업을 집는 것(claim)뿐이라 확인용으로 부를 수 없다.
+        """
+        if self.mode != "service":
+            return True
+        self._rest("GET", "jobs?select=job_id&limit=1")
+        return True
 
     # ── 레코드 모양 맞추기(LocalStore 호환) ──────────────────────
     @staticmethod
@@ -144,24 +179,87 @@ class SupabaseStore(JobStore):
 
     # ══ UI 쪽 (service 모드) ═════════════════════════════════════
     def submit(self, job: Job, *, kind: str = "run", title: str = "",
-               created_by: str = "", target_agent: str = "") -> str:
+               created_by: str = "", target_agent: str = "",
+               client_key: str = "") -> str:
+        # ★아래 두 검사는 **요청을 보내기 전**에 막는다 → 등록 실패가 확실하다.
         if self.mode != "service":
-            raise SupabaseError("작업 등록은 UI(service 모드)에서만 할 수 있습니다.")
+            raise SupabaseError("작업 등록은 UI(service 모드)에서만 할 수 있습니다.",
+                                definite_failure=True)
         if not target_agent:
             raise SupabaseError("실행할 PC(device_id)가 지정되지 않았습니다. "
-                                "먼저 Agent 를 연결해 주세요.")
+                                "먼저 Agent 를 연결해 주세요.",
+                                definite_failure=True)
         brand = (getattr(job, "brand", "") or "").strip()
+        payload = job.to_dict()
+        if client_key:
+            # ★멱등성 키를 payload 에 넣는다(컬럼 추가 없이 조회 가능).
+            #   `job_id` 는 서버가 만들기 때문에, 응답이 유실되면 이 키 말고는
+            #   방금 넣은 작업을 되찾을 방법이 없다. 옛 Agent 는 `Job.from_dict` 가
+            #   모르는 키를 버리므로 영향이 없다.
+            payload = {**payload, "client_key": client_key}
         row = {
             "device_id": target_agent,
             "kind": kind if kind in ("run", "session") else "run",
             "brand": brand,
             "title": title or (f"[{brand}] " if brand else "")
                      + f"{job.flow} · {job.media} / {job.deficiency}",
-            "payload": job.to_dict(),
+            "payload": payload,
         }
         got = self._rest("POST", "jobs", json=row,
                          headers={"Prefer": "return=representation"})
         return (got or [{}])[0].get("job_id", "")
+
+    def find_by_client_key(self, client_key: str) -> dict | None:
+        """멱등성 키로 이미 등록된 작업을 찾는다(재제출 대신 조회)."""
+        key = (client_key or "").strip()
+        if not key:
+            return None
+        if self.mode != "service":
+            raise NotImplementedError("device 모드에서는 작업을 조회하지 않는다")
+        from urllib.parse import quote
+
+        rows = self._rest(
+            "GET", f"jobs?payload->>client_key=eq.{quote(key, safe='')}"
+                   f"&order=created_at.desc&limit=1") or []
+        return self._rec(rows[0]) if rows else None
+
+    # ── 계정별 보류 (Stage 2) ────────────────────────────────────
+    #   ★한 번의 **조건부 UPDATE** 로 끝낸다 — "status 가 아직 pending 인 행만"
+    #     바꾸므로, 그 순간 Agent 가 집어간 작업(running)은 조건에 걸리지 않고
+    #     그대로 끝까지 간다. 경합이 생기지 않는다(원자성은 DB 가 보장한다).
+    #   ★`payload->>login_id` 로만 고른다 — blog_id 로 묶지 않는다.
+    def _switch_status(self, login_id: str, frm: str, to: str,
+                       device: str = "", account_id: str = "") -> list[str]:
+        from urllib.parse import quote
+
+        lid, aid = (login_id or "").strip(), (account_id or "").strip()
+        if not lid and not aid:
+            return []                         # 식별자가 없으면 아무것도 건드리지 않는다
+        if self.mode != "service":
+            raise SupabaseError("작업 보류/재개는 UI(service 모드)에서만 합니다.",
+                                definite_failure=True)
+        # ★kind=run 만 — 로그인/세션확인/로그아웃 작업은 보류하지 않는다
+        #   (보류하면 사용자가 재로그인으로 복구할 길이 막힌다).
+        # ★식별자: login_id 1순위, 없으면 payload->>account(세션 폴더) 정확일치.
+        #   blog_id 로는 절대 고르지 않는다.
+        key = ("login_id", lid) if lid else ("account", aid)
+        q = (f"jobs?status=eq.{frm}&kind=eq.run"
+             f"&payload->>{key[0]}=eq.{quote(key[1], safe='')}")
+        if device:
+            q += f"&device_id=eq.{quote(device, safe='')}"
+        rows = self._rest("PATCH", q, json={"status": to},
+                          headers={"Prefer": "return=representation"}) or []
+        return [str(r.get("job_id")) for r in rows if r.get("job_id")]
+
+    def hold_account(self, login_id: str = "", *, device: str = "",
+                     account_id: str = "") -> list[str]:
+        return self._switch_status(login_id, PENDING, HELD, device,
+                                   account_id=account_id)
+
+    def resume_account(self, login_id: str = "", *, device: str = "",
+                       account_id: str = "") -> list[str]:
+        return self._switch_status(login_id, HELD, PENDING, device,
+                                   account_id=account_id)
 
     def get(self, job_id: str) -> dict | None:
         if not job_id:

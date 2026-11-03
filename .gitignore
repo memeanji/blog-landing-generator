@@ -76,3 +76,14 @@ installer/build/
 installer/out/
 installer/payload/
 *.exe
+
+# 롤백용 설치본 바이너리(65MB) — 저장소에 올리지 않는다
+installer/rollback_125/
+installer/out/
+installer/dist/
+installer/build/
+
+# ★운영 계정 데이터가 든 SQL — PUBLIC 저장소에 올리지 않는다
+#   (계정 id·login_id·기준랜딩 탭 이름이 들어간다)
+supabase/add_account_*.sql
+supabase/verify_readonly_*.sql

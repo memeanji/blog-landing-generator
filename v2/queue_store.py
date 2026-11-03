@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import time
 import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
@@ -31,8 +32,44 @@ QUEUE_ROOT = ROOT / "queue"
 
 PENDING, RUNNING, DONE, FAILED, CANCELED = ("pending", "running", "done",
                                             "failed", "canceled")
+# ★HELD — 사용자가 그 계정을 로그아웃하려 해서 **대기 작업만** 멈춰 둔 상태.
+#   · 종료 상태가 아니다. 사용자가 재로그인하고 직접 재개하면 pending 으로 돌아간다.
+#   · Agent 는 pending 만 집으므로(claim) 보류 작업은 집히지 않는다 — 옛 Agent 도 같다.
+#   · **실행 중(running)인 배치는 보류하지 않는다.** 10건 배치는 끝까지 간다.
+HELD = "held"
 OPEN_STATES = (PENDING, RUNNING)
 KINDS = ("run", "session")          # run = 랜딩 생성/전환, session = 로그인/세션 확인
+
+
+# ══════════════════════════════════════════════════════════════════
+#  큐 백엔드 상태 (2026-11-03, 1단계)
+#   ★예전에는 Supabase 연결이 실패하면 **stderr 한 줄만 남기고** 로컬 큐로
+#     조용히 내려갔다. 화면(Streamlit Cloud)에서 그렇게 되면 작업이 그 서버
+#     컨테이너 안 `queue/` 로 들어가 **PC 에이전트가 영원히 못 본다.**
+#     `@st.cache_resource` 가 그 객체를 프로세스 내내 들고 있어서 새로고침으로도
+#     안 풀리고 관리자 재부팅만이 해결책이었다.
+#   → ① 폴백 사실을 **여기에 기록**해 화면이 읽을 수 있게 하고
+#     ② `strict=True` 로 부르면 **폴백하지 않고 예외**를 던진다.
+#     ③ 기본값(strict=False)은 예전과 똑같이 동작한다 — Agent·CLI 영향 없음.
+# ══════════════════════════════════════════════════════════════════
+class QueueBackendError(RuntimeError):
+    """원격 큐(Supabase)에 붙지 못했다 — 로컬 큐로 숨기지 않고 알린다."""
+
+
+_BACKEND: dict = {"requested": "", "kind": "", "mode": "", "fallback": False,
+                  "reason": "", "at": ""}
+
+
+def backend_info() -> dict:
+    """마지막 `get_store()` 가 무엇에 붙었는지(화면 표시용). 사본을 돌려준다."""
+    return dict(_BACKEND)
+
+
+def _note_backend(requested: str, kind: str, mode: str = "",
+                  fallback: bool = False, reason: str = "") -> None:
+    _BACKEND.update({"requested": requested, "kind": kind, "mode": mode,
+                     "fallback": bool(fallback), "reason": reason,
+                     "at": now_iso()})
 
 
 def now_iso() -> str:
@@ -53,10 +90,16 @@ def host_name() -> str:
 class JobStore(ABC):
     """UI ↔ 에이전트 사이의 계약. Supabase 판을 만들 때 이 메서드만 채우면 된다."""
 
+    # ★네트워크 없이 이 PC 안에서만 움직이는 저장소인가.
+    #   True 면 "제출이 실패했으면 작업도 없다" 가 보장된다(중간에 떠 있는 요청이 없다).
+    #   원격 저장소는 False — 타임아웃이 나도 서버에서는 처리됐을 수 있다.
+    is_local = False
+
     # ── UI 쪽 ────────────────────────────────────────────────────
     @abstractmethod
     def submit(self, job: Job, *, kind: str = "run", title: str = "",
-               created_by: str = "", target_agent: str = "") -> str: ...
+               created_by: str = "", target_agent: str = "",
+               client_key: str = "") -> str: ...
 
     @abstractmethod
     def get(self, job_id: str) -> dict | None: ...
@@ -98,6 +141,109 @@ class JobStore(ABC):
     @abstractmethod
     def agents(self, max_age_sec: int = 30) -> list[dict]: ...
 
+    def find_by_client_key(self, client_key: str) -> dict | None:
+        """멱등성 키로 **이미 등록된** 작업을 찾는다(재제출 금지용).
+
+        ★응답만 유실되고 서버에는 작업이 생긴 경우를 가려내기 위한 것이다.
+          구현하지 않은 저장소는 `NotImplementedError` 를 던지고, 호출한 쪽은
+          그것을 '확인 불가' 로 다뤄야 한다(없는 것으로 단정하면 중복 제출이 된다).
+        """
+        raise NotImplementedError
+
+    # ── 계정별 보류 (2026-11-03, Stage 2) ────────────────────────
+    #   로그아웃 대기 중인 **그 login_id 의 대기 작업만** 멈춘다.
+    #   ★실행 중인 작업은 건드리지 않는다(10건 배치를 중간에 끊지 않는다).
+    #   ★login_id 가 비어 있는 작업은 **보류하지 않는다** — 누구 것인지 모르는 작업을
+    #     추측으로 묶으면 다른 계정의 발행이 멈춘다.
+    #   식별자는 **login_id 1순위 · 없으면 account.id(세션 폴더) 정확일치**다.
+    #   blog_id 는 쓰지 않는다(같은 blog_id 에 로그인 계정이 둘 이상일 수 있다).
+    def hold_account(self, login_id: str = "", *, device: str = "",
+                     account_id: str = "") -> list[str]:
+        """그 계정의 pending 작업을 held 로. 보류된 job_id 목록."""
+        raise NotImplementedError
+
+    def resume_account(self, login_id: str = "", *, device: str = "",
+                       account_id: str = "") -> list[str]:
+        """held → pending. 재개된 job_id 목록."""
+        raise NotImplementedError
+
+    def held_jobs(self, login_id: str = "", account_id: str = "") -> list[dict]:
+        """보류 중인 작업 목록(식별자를 주면 그 계정만)."""
+        both = not (login_id or "").strip() and not (account_id or "").strip()
+        return [r for r in self.list_jobs(limit=200)
+                if (r.get("status") or "") == HELD
+                and (both or matches(r, login_id, account_id))]
+
+    def running_for_login(self, login_id: str = "",
+                          account_id: str = "") -> list[dict]:
+        """그 계정의 **실행 중** 작업(= 아직 끝나지 않은 배치). 로그아웃 시점 판단용."""
+        return [r for r in self.list_jobs(limit=200)
+                if (r.get("status") or "") == RUNNING
+                and matches(r, login_id, account_id)]
+
+    # ── 상태 표시용(추상 아님 — 기존 구현체를 고치지 않아도 된다) ──
+    def last_contact(self) -> str:
+        """이 저장소와 **마지막으로 성공적으로 주고받은 시각**(없으면 빈 문자열)."""
+        return getattr(self, "_last_ok", "") or ""
+
+    def describe_backend(self) -> dict:
+        """화면에 보여 줄 한 줄 요약."""
+        return {"kind": type(self).__name__,
+                "mode": getattr(self, "mode", "") or "",
+                "last_contact": self.last_contact()}
+
+    def probe(self) -> bool:
+        """정말 주고받을 수 있는지 **가볍게** 확인한다(기본: 할 일 없음).
+
+        ★설정값만 맞고 키가 틀린 경우는 객체를 만들 때 드러나지 않는다.
+          화면은 `strict` 로 부를 때 이걸 한 번 거쳐 '붙은 줄 알았는데 아닌' 상태를
+          만들지 않는다. 읽기 1회뿐이고 작업을 집거나 바꾸지 않는다.
+        """
+        return True
+
+
+def login_of(rec: dict | None) -> str:
+    """작업 레코드에 적힌 로그인 ID. 없으면 빈 문자열.
+
+    ★`blog_id` 로 대신 찾지 않는다 — blog_id 가 같아도 로그인 계정이 다를 수 있다.
+    """
+    job = (rec or {}).get("job") or {}
+    return str(job.get("login_id") or "").strip()
+
+
+def account_of(rec: dict | None) -> str:
+    """작업 레코드의 계정(세션 폴더) 이름. `login_id` 가 없는 계정의 유일한 식별자다.
+
+    ★`blog_id` 는 쓰지 않는다 — 같은 blog_id 에 로그인 계정이 둘 이상 있을 수 있다.
+    """
+    job = (rec or {}).get("job") or {}
+    return str(job.get("account") or "").strip()
+
+
+def _same_login(a: str, b: str) -> bool:
+    a, b = (a or "").strip(), (b or "").strip()
+    return bool(a) and bool(b) and a.casefold() == b.casefold()
+
+
+def _same_account(a: str, b: str) -> bool:
+    """세션 폴더 이름은 **대소문자까지 그대로** 같아야 한다(폴더 이름이므로)."""
+    a, b = (a or "").strip(), (b or "").strip()
+    return bool(a) and bool(b) and a == b
+
+
+def matches(rec: dict | None, login_id: str = "", account_id: str = "") -> bool:
+    """이 작업이 그 계정의 것인가.
+
+    · `login_id` 를 주면 **그것만** 본다(계정 식별 1순위).
+    · `login_id` 가 없을 때만 `account_id`(세션 폴더 이름) **정확일치**로 본다.
+    · 둘 다 없으면 **아무것도 고르지 않는다**(추측 금지).
+    """
+    if (login_id or "").strip():
+        return _same_login(login_of(rec), login_id)
+    if (account_id or "").strip():
+        return _same_account(account_of(rec), account_id)
+    return False
+
 
 def _atomic_write(path: Path, text: str) -> None:
     """반쯤 쓰인 JSON 을 상대가 읽는 일이 없게 임시 파일에 쓰고 바꿔치기한다."""
@@ -129,17 +275,21 @@ class LocalStore(JobStore):
       옮기면 한쪽만 성공한다(윈도우에서도 원자적).
     """
 
+    is_local = True                        # 네트워크가 없다 → 실패 판정이 정확하다
+
     def __init__(self, root: Path | str | None = None) -> None:
         self.root = Path(root) if root else QUEUE_ROOT
-        for sub in ("pending", "running", "finished", "logs", "cancel", "agents"):
+        for sub in ("pending", "running", "held", "finished", "logs", "cancel",
+                    "agents"):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
+        self._last_ok = now_iso()          # 폴더를 만들 수 있었다 = 교신 성공
 
     # ── 경로 ─────────────────────────────────────────────────────
     def _dir(self, state: str) -> Path:
         return self.root / state
 
     def _find(self, job_id: str) -> tuple[str, Path] | tuple[None, None]:
-        for state in ("running", "pending", "finished"):
+        for state in ("running", "pending", "held", "finished"):
             p = self._dir(state) / f"{job_id}.json"
             if p.exists():
                 return state, p
@@ -153,12 +303,15 @@ class LocalStore(JobStore):
 
     # ── UI 쪽 ────────────────────────────────────────────────────
     def submit(self, job: Job, *, kind: str = "run", title: str = "",
-               created_by: str = "", target_agent: str = "") -> str:
+               created_by: str = "", target_agent: str = "",
+               client_key: str = "") -> str:
         job_id = new_job_id()
         # ★브랜드는 레코드 맨 위에도 따로 둔다 — 큐 파일만 열어 봐도 어느 브랜드인지 안다.
         brand = (getattr(job, "brand", "") or "").strip()
         record = {
             "id": job_id,
+            # ★멱등성 키 — 응답이 유실돼도 이 값으로 **이미 넣은 작업**을 찾는다.
+            "client_key": client_key,
             "kind": kind if kind in KINDS else "run",
             "brand": brand,
             "title": title or (f"[{brand}] " if brand else "")
@@ -181,9 +334,23 @@ class LocalStore(JobStore):
         _state, path = self._find(job_id)
         return _read_json(path) if path else None
 
+    def find_by_client_key(self, client_key: str) -> dict | None:
+        key = (client_key or "").strip()
+        if not key:
+            return None
+        for state in ("pending", "running", "held", "finished"):
+            for p in self._dir(state).glob("*.json"):
+                rec = _read_json(p)
+                if rec and (rec.get("client_key") or "") == key:
+                    self._last_ok = now_iso()
+                    return rec
+        self._last_ok = now_iso()
+        return None
+
     def list_jobs(self, limit: int = 30) -> list[dict]:
         rows: list[dict] = []
-        for state in ("running", "pending", "finished"):
+        self._last_ok = now_iso()
+        for state in ("running", "pending", "held", "finished"):
             for p in self._dir(state).glob("*.json"):
                 rec = _read_json(p)
                 if rec:
@@ -213,6 +380,52 @@ class LocalStore(JobStore):
             except Exception:                                  # noqa: BLE001
                 continue
         return out, len(lines)
+
+    # ── 계정별 보류 ──────────────────────────────────────────────
+    def _move_account(self, src_state: str, dst_state: str, login_id: str,
+                      device: str, status: str, account_id: str = "") -> list[str]:
+        """`src_state` → `dst_state` 로 **그 계정 작업만** 옮긴다(os.replace = 원자적).
+
+        ★`pending` 폴더에서만 꺼내므로 **실행 중 작업은 절대 영향받지 않는다.**
+          옮기기가 실패하면(= 그 순간 Agent 가 집어갔다) 조용히 건너뛴다 — 그 작업은
+          running 이 되었고, 배치는 끝까지 가는 것이 정책이다.
+        ★식별자: login_id 1순위, 없으면 account.id 정확일치. 둘 다 없으면 0건.
+        """
+        lid, aid = (login_id or "").strip(), (account_id or "").strip()
+        if not lid and not aid:
+            return []
+        moved: list[str] = []
+        for src in sorted(self._dir(src_state).glob("*.json")):
+            rec = _read_json(src)
+            if rec is None or not matches(rec, lid, aid):
+                continue
+            # ★랜딩 작업(run)만 보류한다. 로그인·세션확인·로그아웃(session)은
+            #   사용자가 방금 누른 **복구 수단**이라 보류하면 재로그인을 못 한다.
+            if (rec.get("kind") or "run") != "run":
+                continue
+            want = (rec.get("target_agent") or "").strip()
+            if device and want and want != device:
+                continue
+            dst = self._dir(dst_state) / src.name
+            try:
+                os.replace(src, dst)
+            except OSError:
+                continue                   # 방금 Agent 가 집어갔다 → 그대로 둔다
+            rec["status"] = status
+            rec["held_at"] = now_iso() if status == HELD else ""
+            _atomic_write(dst, json.dumps(rec, ensure_ascii=False, indent=1))
+            moved.append(str(rec.get("id") or src.stem))
+        return moved
+
+    def hold_account(self, login_id: str = "", *, device: str = "",
+                     account_id: str = "") -> list[str]:
+        return self._move_account(PENDING, HELD, login_id, device, HELD,
+                                  account_id=account_id)
+
+    def resume_account(self, login_id: str = "", *, device: str = "",
+                       account_id: str = "") -> list[str]:
+        return self._move_account(HELD, PENDING, login_id, device, PENDING,
+                                  account_id=account_id)
 
     # ── 에이전트 쪽 ──────────────────────────────────────────────
     def claim(self, agent_id: str) -> dict | None:
@@ -354,24 +567,233 @@ class LocalStore(JobStore):
         return sorted(out, key=lambda r: r.get("at") or "", reverse=True)
 
 
-def get_store(backend: str = "") -> JobStore:
-    """`BLOG_QUEUE_BACKEND` (local | supabase). 지금은 local 만 있다.
+# ── 제출 결과 3상태 (2026-11-03 보완) ─────────────────────────────
+#   ★'확인 불가' 를 '실패' 로 단정하면 안 된다. 서버에는 작업이 생겼는데 응답만
+#     유실된 경우가 있고, 그때 다시 넣으면 **같은 발행이 두 번** 돌아간다.
+#     그래서 ①성공 확인 ②실패 확정 ③확인 불가 를 나누고, ③에서는 자동 재제출을
+#     하지 않고 **멱등성 키로 조회**해 되찾는다.
+SUBMIT_OK, SUBMIT_FAILED, SUBMIT_UNKNOWN = "ok", "failed", "unknown"
+
+
+class SubmitResult:
+    """제출 결과. `ok` 가 아니면 `message` 를 사용자에게 그대로 보여 준다."""
+
+    __slots__ = ("status", "job_id", "client_key", "message", "cause")
+
+    def __init__(self, status: str, job_id: str = "", client_key: str = "",
+                 message: str = "", cause: str = "") -> None:
+        self.status, self.job_id = status, job_id
+        self.client_key, self.message, self.cause = client_key, message, cause
+
+    @property
+    def ok(self) -> bool:
+        return self.status == SUBMIT_OK
+
+    @property
+    def unknown(self) -> bool:
+        return self.status == SUBMIT_UNKNOWN
+
+    def __repr__(self) -> str:                                 # 테스트 가독성
+        return (f"SubmitResult({self.status}, job_id={self.job_id!r}, "
+                f"key={self.client_key!r})")
+
+
+def new_client_key() -> str:
+    """제출 1회를 가리키는 멱등성 키."""
+    return uuid.uuid4().hex
+
+
+def find_job_by_client_key(store: JobStore, client_key: str,
+                           tries: int = 1, wait_sec: float = 1.5
+                           ) -> tuple[dict | None, str]:
+    """(찾은 레코드 | None, 조회 실패 사유).
+
+    ★돌려주는 값이 `(None, "")` 이면 **조회는 됐고 없었다**는 뜻이고,
+      `(None, 사유)` 면 **확인하지 못했다**는 뜻이다. 둘을 섞으면 안 된다.
+    ★`tries>1` — 늦게 도착한 요청이 서버에서 처리되는 중일 수 있어 잠깐 기다려
+      다시 본다(네트워크 지연으로 방금 넣은 작업이 아직 안 보이는 경우).
+    """
+    if not client_key:
+        return None, "멱등성 키가 없습니다"
+    why = ""
+    for i in range(max(1, tries)):
+        if i:
+            time.sleep(wait_sec)
+        try:
+            rec = store.find_by_client_key(client_key)
+        except NotImplementedError:
+            return None, "이 저장소는 작업 조회를 지원하지 않습니다"
+        except Exception as exc:                               # noqa: BLE001
+            why = f"{type(exc).__name__}: {exc}"
+            continue
+        if rec:
+            return rec, ""
+        why = ""
+    return None, why
+
+
+def _definite_failure(store: JobStore, exc: BaseException) -> bool:
+    """이 예외가 '서버에 아무것도 안 들어갔음' 을 보장하는가.
+
+    ★보수적으로 판단한다 — 확실하지 않으면 **False**(= 확인 불가로 다룬다).
+      타임아웃·연결 끊김·5xx 는 요청이 도착해 처리됐을 수 있다.
+    """
+    if getattr(exc, "definite_failure", False):
+        return True
+    if isinstance(exc, (TypeError, ValueError, KeyError)):
+        return True                        # 우리 쪽 인자 오류 = 보내기 전에 막혔다
+    # 로컬 파일 큐는 네트워크가 없다 → 실패했으면 파일도 없다(조회가 정확하다)
+    return bool(getattr(store, "is_local", False))
+
+
+def submit_checked(store: JobStore, job: Job, *, kind: str = "run",
+                   title: str = "", target_agent: str = "",
+                   label: str = "작업",
+                   client_key: str = "") -> SubmitResult:
+    """큐에 넣고 **정말 들어갔는지 확인**한다 → `SubmitResult`(3상태).
+
+    ★조용히 실패하는 길을 막기 위한 것이다. 예전에는 `submit` 이 예외를 던지면
+      화면이 깨졌고, 로컬 큐로 내려간 상태에서는 성공처럼 보였다(2026-10-30).
+    ★제출이 실패로 보여도 **먼저 멱등성 키로 조회**한다. 조회로 '없음' 을 확인하면
+      실패 확정, 조회 자체를 못 하면 '확인 불가' 다. 어느 경우에도 **자동으로
+      다시 넣지 않는다** — 재시도는 사람이 결정한다.
+    """
+    retry = bool(client_key)               # 같은 키로 다시 부른 것 = 재시도
+    key = client_key or new_client_key()
+
+    def confirm(cause: str, had_id: str = "",
+                definite: bool = False) -> SubmitResult:
+        """조회로 실제 등록 여부를 가린다.
+
+        ★`definite=False`(기본)면 조회에서 안 보여도 **실패로 단정하지 않는다.**
+          늦게 도착한 요청이 나중에 처리될 수 있어, 그때 다시 넣으면 중복 발행이 된다.
+        """
+        rec, why = find_job_by_client_key(store, key, tries=1 if definite else 2)
+        if rec:
+            return SubmitResult(SUBMIT_OK, rec.get("id") or had_id, key,
+                                f"{label}은 등록되어 있습니다(응답만 유실됐습니다).",
+                                cause)
+        if why:
+            return SubmitResult(
+                SUBMIT_UNKNOWN, had_id, key,
+                f"{label}의 등록 여부를 확인하지 못했습니다 — 등록됐을 수도 "
+                f"있으니 다시 넣지 마세요.\n원인: {cause}\n조회 실패: {why}",
+                cause)
+        if not definite:
+            return SubmitResult(
+                SUBMIT_UNKNOWN, had_id, key,
+                f"{label}이 아직 큐에 보이지 않습니다 — 요청이 늦게 처리될 수도 "
+                f"있어 **등록 실패로 단정하지 않습니다.** 다시 넣지 마세요.\n"
+                f"원인: {cause}", cause)
+        return SubmitResult(SUBMIT_FAILED, "", key,
+                            f"{label}을 큐에 등록하지 못했습니다 — "
+                            f"실행되지 않았습니다.\n원인: {cause}", cause)
+
+    # ★같은 키로 다시 불렸으면 **먼저 조회**한다 — 이미 들어가 있으면 또 넣지 않는다.
+    if retry:
+        rec, why = find_job_by_client_key(store, key)
+        if rec:
+            return SubmitResult(SUBMIT_OK, rec.get("id") or "", key,
+                                f"{label}은 이미 등록되어 있습니다(다시 넣지 "
+                                f"않았습니다).")
+        if why:
+            return SubmitResult(SUBMIT_UNKNOWN, "", key,
+                                f"{label}의 등록 여부를 확인하지 못해 다시 넣지 "
+                                f"않았습니다.\n조회 실패: {why}")
+
+    try:
+        jid = store.submit(job, kind=kind, title=title, target_agent=target_agent,
+                           client_key=key)
+    except TypeError as exc:
+        # 옛 저장소(멱등성 키를 모르는 구현)와의 호환 — 키 없이 한 번만 시도한다.
+        if "client_key" not in str(exc):
+            return confirm(f"{type(exc).__name__}: {exc}",
+                           definite=_definite_failure(store, exc))
+        try:
+            jid = store.submit(job, kind=kind, title=title,
+                               target_agent=target_agent)
+        except Exception as exc2:                              # noqa: BLE001
+            return SubmitResult(SUBMIT_UNKNOWN, "", "",
+                                f"{label}의 등록 여부를 확인하지 못했습니다 — "
+                                f"다시 넣지 말고 작업 목록에서 확인해 주세요.\n"
+                                f"원인: {type(exc2).__name__}: {exc2}")
+        key = ""                                               # 조회 수단이 없다
+    except Exception as exc:                                   # noqa: BLE001
+        return confirm(f"{type(exc).__name__}: {exc}",
+                       definite=_definite_failure(store, exc))
+
+    if not jid:
+        # 번호를 못 받았을 뿐 서버에는 들어갔을 수 있다 → 단정하지 않는다.
+        return confirm("작업 번호를 받지 못했습니다")
+
+    try:
+        rec = store.get(jid)
+    except Exception as exc:                                   # noqa: BLE001
+        return SubmitResult(SUBMIT_UNKNOWN, jid, key,
+                            f"{label}을 넣었지만 상태를 확인하지 못했습니다 — "
+                            f"다시 넣지 마세요(작업 번호 {jid}).\n"
+                            f"원인: {type(exc).__name__}: {exc}",
+                            f"{type(exc).__name__}: {exc}")
+    if not rec:
+        # ★로컬 큐는 방금 쓴 파일이 반드시 보인다 → 안 보이면 실패가 확실하다.
+        #   원격은 복제 지연 등이 있을 수 있어 단정하지 않는다.
+        return confirm(f"작업 번호 {jid} 를 큐에서 다시 찾지 못했습니다", had_id=jid,
+                       definite=bool(getattr(store, "is_local", False)))
+    return SubmitResult(SUBMIT_OK, jid, key)
+
+
+def configured_backend(backend: str = "") -> str:
+    """이번 실행이 **쓰려고 하는** 백엔드 이름(local | supabase)."""
+    name = (backend or os.getenv("BLOG_QUEUE_BACKEND") or "local").strip().lower()
+    if name in ("", "file"):
+        return "local"
+    return name
+
+
+def wants_remote(backend: str = "") -> bool:
+    """원격 큐를 쓰려는 설정인가(= 폴백을 숨기면 안 되는 상황인가)."""
+    return configured_backend(backend) in ("supabase", "remote")
+
+
+def get_store(backend: str = "", strict: bool = False) -> JobStore:
+    """`BLOG_QUEUE_BACKEND` (local | supabase).
 
     Supabase 를 붙일 때 여기 분기 하나와 `SupabaseStore` 만 추가하면
     UI(`streamlit_app.py`)와 에이전트(`v2.agent`)는 고치지 않는다.
+
+    ★`strict=True` (화면이 쓴다) — 원격 큐를 쓰려는 설정인데 붙지 못하면
+      **로컬 큐로 내려가지 않고 `QueueBackendError`** 를 던진다. 조용한 폴백은
+      "작업을 넣었는데 PC 가 못 본다" 는 상태를 만들고, 그 상태가 화면 프로세스에
+      캐시되면 재부팅 말고는 풀 방법이 없었다(2026-10-30).
+    ★`strict=False` (기본 · Agent·CLI) — 예전과 똑같이 로컬 큐로 되돌아간다.
+      어느 쪽이든 결과는 `backend_info()` 에 남아 화면에서 확인할 수 있다.
     """
-    name = (backend or os.getenv("BLOG_QUEUE_BACKEND") or "local").strip().lower()
-    if name in ("", "local", "file"):
-        return LocalStore()
+    name = configured_backend(backend)
+    if name == "local":
+        store = LocalStore()
+        _note_backend(name, type(store).__name__)
+        return store
     if name in ("supabase", "remote"):
         # ★원격 큐 — Streamlit Cloud 와 각 PC 의 Agent 가 같은 큐를 본다.
-        #   설정이 없거나 연결이 안 되면 **로컬 큐로 조용히 되돌아간다**(기존 동작 보존).
         try:
             from .supabase_store import SupabaseStore
-            return SupabaseStore()
+            store = SupabaseStore()
+            if strict:
+                store.probe()              # 키가 틀린 경우까지 여기서 걸러낸다
         except Exception as exc:  # noqa: BLE001
+            reason = f"{type(exc).__name__}: {exc}"
+            _note_backend(name, "LocalStore" if not strict else "",
+                          fallback=True, reason=reason)
+            if strict:
+                raise QueueBackendError(
+                    "원격 큐(Supabase)에 연결하지 못했습니다 — "
+                    "작업을 넣어도 각자 PC 의 Agent 가 보지 못합니다.\n"
+                    f"원인: {reason}") from exc
             import sys
             print(f"[큐] Supabase 연결 실패 — 로컬 큐로 진행합니다: {exc}",
                   file=sys.stderr)
             return LocalStore()
+        _note_backend(name, type(store).__name__,
+                      mode=getattr(store, "mode", "") or "")
+        return store
     raise RuntimeError(f"아직 없는 큐 백엔드입니다: {name!r} (local | supabase)")

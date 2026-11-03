@@ -34,7 +34,31 @@ import socket
 import sys
 from pathlib import Path
 
-AGENT_VERSION = "1.2.5"
+# ★1.3.0 — `v2.session --logout / --confirm`(선택 계정 로그아웃)이 들어갔다.
+#   화면은 이 번호를 보고 로그아웃 버튼을 열어 준다(옛 설치본에서는 잠긴다).
+AGENT_VERSION = "1.3.0"
+
+# ★기능별 **최소 Agent 버전**. 화면은 이 표를 보고 버튼을 열거나 잠근다.
+#   옛 설치본에 없는 명령을 보내면 argparse 가 거부해 작업이 실패하기 때문이다.
+NEEDS = {"logout": (1, 3, 0)}
+
+
+def ver_tuple(text: str) -> tuple:
+    """'1.3.0' -> (1, 3, 0). 숫자가 아닌 부분은 0 으로 본다(빈 값은 (0,))."""
+    out = []
+    for part in str(text or "").split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out[:3]) or (0,)
+
+
+def supports(version: str, feature: str) -> bool:
+    """그 Agent 버전이 이 기능을 쓸 수 있는가(버전을 모르면 False = 잠근다)."""
+    need = NEEDS.get(feature)
+    if need is None:
+        return True
+    got = ver_tuple(version)
+    return bool(str(version or "").strip()) and got >= need
 
 # 토큰 저장 위치 — 저장소나 프로젝트 폴더가 아니라 사용자 프로필 아래.
 DEVICE_DIR = Path(os.getenv("APPDATA") or Path.home()) / "BlogLandingAgent"

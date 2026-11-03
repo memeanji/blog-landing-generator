@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 
-from . import browser, source_view, writer
+from . import browser, fastwait, source_view, writer
 
 
 def update_url(blog_id: str, log_no: str) -> str:
@@ -78,6 +78,7 @@ async def _wait_entered(page, blog_id: str, log_no: str, log,
         ok, urls, marks = _entered(page, blog_id, log_no)
         if ok:
             return marks
+        # ★2026-11-03: 0.25초로 줄였다가 **원복**했다(범위 축소 — 진입 대기만 개선).
         await page.wait_for_timeout(1000)
     return marks
 
@@ -118,7 +119,16 @@ async def open_for_edit(ctx, blog_url: str, log) -> tuple["writer.NewPost", str,
     target = update_url(blog_id, log_no)
     log(f"[수정] 진입: {target[:100]}")
     await page.goto(target, wait_until="domcontentloaded")
-    await page.wait_for_timeout(2500)
+
+    # ★예전: 고정 2.5초. 이제는 **바로 아래에서 보는 그 조건**(수정화면 진입 /
+    #   로그인 화면)이 서면 즉시 넘어간다(최대 2.5초 — 안 되면 옛 동작과 같다).
+    async def _ready() -> bool:
+        if "nidlogin" in (page.url or ""):
+            return True
+        ok, _urls, _marks = _entered(page, blog_id, log_no)
+        return ok
+
+    await fastwait.settle(page, 2500, _ready)
 
     if "nidlogin" in (page.url or ""):
         raise RuntimeError("수정 화면이 로그인 페이지로 튕겼습니다.")
@@ -811,6 +821,8 @@ async def copy_whole_body(src, log, label: str = "참고글") -> dict:
 
     # ★Ctrl+C 가 주 경로
     await src.page.keyboard.press("Control+C")
+    # ★2026-11-03: 조건부 대기로 바꿨다가 **원복**했다(범위 축소 — 복사·붙여넣기
+    #   경로는 기존 대기 방식을 그대로 유지한다).
     await src.page.wait_for_timeout(900)
     after = await src._clipboard()
 
