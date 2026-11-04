@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from .job import Job
+from .loginid import same_login
 
 from .appdir import ROOT      # 개발 PC=프로젝트 폴더 / 설치본=%APPDATA%\BlogLandingAgent
 QUEUE_ROOT = ROOT / "queue"
@@ -52,6 +53,39 @@ KINDS = ("run", "session")          # run = 랜딩 생성/전환, session = 로�
 #     ② `strict=True` 로 부르면 **폴백하지 않고 예외**를 던진다.
 #     ③ 기본값(strict=False)은 예전과 똑같이 동작한다 — Agent·CLI 영향 없음.
 # ══════════════════════════════════════════════════════════════════
+class PartialHoldError(RuntimeError):
+    """보류/재개를 **일부만** 반영한 채 실패했다 (2026-11-04).
+
+    왜 따로 만들었나
+        보류는 50건씩 나눠 보낸다. 두 번째 묶음이 실패하면 **첫 묶음은 이미
+        서버에 반영된 상태**다. 그런데 평범한 예외로 올려 보내면 반환값(바뀐
+        job_id 목록)이 사라져, 화면은 "하나도 보류하지 못했다" 고 안내한다.
+        실제로는 N 건이 보류돼 있으므로 사용자가 [보류 작업 재개] 를 눌러야 한다.
+
+    들고 있는 것
+        done     : 성공을 **확인한** job_id 목록(서버가 돌려준 것)
+        verified : 실패 직후 **다시 조회한** 실제 그 상태의 job_id 목록.
+                   재조회까지 실패하면 `None` — 그때는 '0건' 이 아니라
+                   **'결과 확인 불가'** 로 안내해야 한다.
+        remaining: 보내지 못한(또는 결과를 모르는) job_id 목록
+    """
+
+    def __init__(self, message: str, *, done=None, verified=None,
+                 remaining=None, cause: BaseException | None = None) -> None:
+        super().__init__(message)
+        self.done = list(done or [])
+        self.verified = None if verified is None else list(verified)
+        self.remaining = list(remaining or [])
+        self.cause = cause
+
+    @property
+    def confirmed(self) -> int:
+        """실제로 바뀐 것으로 **확인된** 건수. 확인 불가면 -1."""
+        if self.verified is not None:
+            return len(self.verified)
+        return len(self.done) if self.done else -1
+
+
 class QueueBackendError(RuntimeError):
     """원격 큐(Supabase)에 붙지 못했다 — 로컬 큐로 숨기지 않고 알린다."""
 
@@ -167,19 +201,50 @@ class JobStore(ABC):
         """held → pending. 재개된 job_id 목록."""
         raise NotImplementedError
 
+    # ── 상태로 좁혀 보는 조회 (2026-11-04) ───────────────────────
+    #   ★왜 따로 만들었나 — 예전에는 `list_jobs(limit=200)`(화면은 120)을 훑어
+    #     그 안에서 held 를 골랐다. 작업이 많아 **보류 작업이 조회 창 밖으로
+    #     밀려나면 "보류 없음" 으로 보이고**, 그러면 로그아웃 대기 중인 계정에
+    #     새 발행 작업이 다시 만들어진다(= 신규 발행 차단 누락).
+    #     상태로 먼저 좁히면 held·running 은 몇 건뿐이라 창에 밀려나지 않는다.
+    #   ★식별 비교는 `matches`(login_id 정규화 포함)로 **클라이언트 쪽에서** 한다.
+    #     서버 필터는 문자열 정확일치라 `@naver.com` 표기 차이를 흡수하지 못한다.
+    SCAN_LIMIT = 500
+
+    def list_by_status(self, status: str, login_id: str = "",
+                       account_id: str = "", kind: str = "",
+                       limit: int = 0) -> list[dict]:
+        """그 상태의 작업만 돌려준다(식별자를 주면 그 계정만).
+
+        기본 구현은 `list_jobs` 를 훑는다. 상태별 조회를 서버에서 할 수 있는
+        저장소는 이 메서드를 덮어써서 **조회 창 문제를 아예 없앤다.**
+        """
+        want = (status or "").strip()
+        both = not (login_id or "").strip() and not (account_id or "").strip()
+        out: list[dict] = []
+        for rec in self.list_jobs(limit=int(limit or self.SCAN_LIMIT)):
+            if (rec.get("status") or "") != want:
+                continue
+            if kind and (rec.get("kind") or "run") != kind:
+                continue
+            if not both and not matches(rec, login_id, account_id):
+                continue
+            out.append(rec)
+        return out
+
     def held_jobs(self, login_id: str = "", account_id: str = "") -> list[dict]:
         """보류 중인 작업 목록(식별자를 주면 그 계정만)."""
-        both = not (login_id or "").strip() and not (account_id or "").strip()
-        return [r for r in self.list_jobs(limit=200)
-                if (r.get("status") or "") == HELD
-                and (both or matches(r, login_id, account_id))]
+        return self.list_by_status(HELD, login_id, account_id)
 
     def running_for_login(self, login_id: str = "",
                           account_id: str = "") -> list[dict]:
-        """그 계정의 **실행 중** 작업(= 아직 끝나지 않은 배치). 로그아웃 시점 판단용."""
-        return [r for r in self.list_jobs(limit=200)
-                if (r.get("status") or "") == RUNNING
-                and matches(r, login_id, account_id)]
+        """그 계정의 **실행 중** 작업(= 아직 끝나지 않은 배치). 로그아웃 시점 판단용.
+
+        ★식별자가 없으면 **아무것도 돌려주지 않는다**(남의 배치를 내 것으로 세지 않게).
+        """
+        if not (login_id or "").strip() and not (account_id or "").strip():
+            return []
+        return self.list_by_status(RUNNING, login_id, account_id)
 
     # ── 상태 표시용(추상 아님 — 기존 구현체를 고치지 않아도 된다) ──
     def last_contact(self) -> str:
@@ -221,8 +286,13 @@ def account_of(rec: dict | None) -> str:
 
 
 def _same_login(a: str, b: str) -> bool:
-    a, b = (a or "").strip(), (b or "").strip()
-    return bool(a) and bool(b) and a.casefold() == b.casefold()
+    """로그인 ID 비교 — `shin894894` 와 `shin894894@naver.com` 을 같게 본다.
+
+    ★운영 등록표에 두 형태가 섞여 있다. 문자열 그대로 비교하면 작업 payload 에
+      적힌 형태와 등록 형태가 다를 때 **보류·재개가 그 계정을 못 찾는다.**
+      정규화는 `v2/loginid.py` 한 곳에만 있다(login_state 와 같은 규칙).
+    """
+    return same_login(a, b)
 
 
 def _same_account(a: str, b: str) -> bool:
@@ -357,6 +427,27 @@ class LocalStore(JobStore):
                     rows.append(rec)
         rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
         return rows[:limit]
+
+    def list_by_status(self, status: str, login_id: str = "",
+                       account_id: str = "", kind: str = "",
+                       limit: int = 0) -> list[dict]:
+        """상태 폴더 **하나만** 읽는다 → 조회 창에 밀려 놓치는 일이 없다."""
+        want = (status or "").strip()
+        state = want if want in ("pending", "running", "held") else "finished"
+        both = not (login_id or "").strip() and not (account_id or "").strip()
+        rows: list[dict] = []
+        for p in self._dir(state).glob("*.json"):
+            rec = _read_json(p)
+            if not rec or (rec.get("status") or "") != want:
+                continue
+            if kind and (rec.get("kind") or "run") != kind:
+                continue
+            if not both and not matches(rec, login_id, account_id):
+                continue
+            rows.append(rec)
+        self._last_ok = now_iso()
+        rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+        return rows[: int(limit)] if limit else rows
 
     def request_cancel(self, job_id: str) -> None:
         (self.root / "cancel" / job_id).write_text(now_iso(), encoding="utf-8")
