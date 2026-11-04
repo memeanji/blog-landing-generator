@@ -983,6 +983,11 @@ def is_logout_job(rec: dict) -> bool:
     return "--logout" in list(job.get("extra") or [])
 
 
+#  큐 조회가 일시적으로 실패할 때 다시 시도하는 횟수·간격(2026-11-04).
+#    ★`list_by_status` 자체도 안에서 한 번 더 확인하므로 여기선 짧게만 붙인다.
+QUEUE_READ_TRIES, QUEUE_READ_WAIT = 2, 0.6
+
+
 def logout_state(store_obj, login_id: str, account_id: str = "") -> dict:
     """그 계정의 로그아웃 진행 상태. 큐를 한 번만 읽는다.
 
@@ -995,30 +1000,99 @@ def logout_state(store_obj, login_id: str, account_id: str = "") -> dict:
     """
     lid, aid = (login_id or "").strip(), (account_id or "").strip()
     out = {"login_id": lid, "account_id": aid, "held": [], "running": [],
-           "logout_job": None, "pending": False}
+           "waiting": [], "logout_job": None, "pending": False,
+           "read_error": ""}
     if not lid and not aid:
         return out
+
+    # ★상태별로 좁혀 조회한다(2026-11-04). 예전에는 `list_jobs(limit=120)` 를 훑어
+    #   그 안에서 held 를 골랐다 — 작업이 많으면 **보류 작업이 조회 창 밖으로
+    #   밀려나 '보류 없음' 으로 보이고**, 로그아웃 대기 중인 계정에 새 발행 작업이
+    #   다시 만들어졌다. held·running 은 몇 건뿐이라 상태로 좁히면 밀리지 않는다.
+    # ★일시적인 오류는 **제한적으로만** 다시 시도한다(2026-11-04).
+    #   화면을 그릴 때마다 불리는 함수라 길게 매달리면 화면이 멈춘다.
+    def by_status(status: str, kind: str = "") -> list:
+        last = None
+        for i in range(QUEUE_READ_TRIES):
+            if i:
+                time.sleep(QUEUE_READ_WAIT)
+            try:
+                return store_obj.list_by_status(status, lid, aid, kind=kind)
+            except AttributeError:
+                raise                      # 옛 저장소 → 아래 폴백으로 넘긴다
+            except Exception as exc:                           # noqa: BLE001
+                last = exc
+        raise last if last else RuntimeError("큐를 읽지 못했습니다")
+
     try:
-        rows = store_obj.list_jobs(limit=120)
-    except Exception:                                          # noqa: BLE001
-        return out                          # 큐를 못 읽으면 아무것도 단정하지 않는다
-    for rec in rows:
-        if not queue_store.matches(rec, lid, aid):
-            continue
-        status = rec.get("status") or ""
-        if status == queue_store.HELD:
-            out["held"].append(rec)
-        elif status == queue_store.RUNNING and (rec.get("kind") or "run") == "run":
-            out["running"].append(rec)
-        elif is_logout_job(rec) and status in RUNNING_STATES:
-            out["logout_job"] = out["logout_job"] or rec
+        # ★조회는 **세 번만** 한다(held · running · pending). running 을 두 번
+        #   읽지 않고 한 번 읽어 나눠 쓴다 — 화면을 그릴 때마다 불리는 함수라
+        #   요청 수를 늘리면 그대로 느려진다.
+        out["held"] = by_status(queue_store.HELD)
+        running_all = by_status(queue_store.RUNNING)
+        out["running"] = [r for r in running_all
+                          if (r.get("kind") or "run") == "run"]
+        pending_all = by_status(queue_store.PENDING)
+        #  ★표시용 — 로그아웃 전에 "지금 대기 중인 발행 작업이 몇 건인지" 보여 준다.
+        #    이미 받아 온 목록을 나눠 쓰는 것뿐이고, 조회를 더 하지 않는다.
+        out["waiting"] = [r for r in pending_all
+                          if (r.get("kind") or "run") == "run"]
+        for rec in pending_all + running_all:
+            if is_logout_job(rec):
+                out["logout_job"] = rec
+                break
+    except AttributeError:
+        # 옛 저장소(상태별 조회가 없는 구현) — 예전 방식으로 훑는다.
+        try:
+            rows = store_obj.list_jobs(limit=200)
+        except Exception as exc:                               # noqa: BLE001
+            out["read_error"] = f"{type(exc).__name__}: {exc}"
+            return out
+        for rec in rows:
+            if not queue_store.matches(rec, lid, aid):
+                continue
+            status = rec.get("status") or ""
+            kind = (rec.get("kind") or "run")
+            if status == queue_store.HELD:
+                out["held"].append(rec)
+            elif status == queue_store.RUNNING and kind == "run":
+                out["running"].append(rec)
+            elif status == queue_store.PENDING and kind == "run":
+                out["waiting"].append(rec)
+            elif is_logout_job(rec) and status in RUNNING_STATES:
+                out["logout_job"] = out["logout_job"] or rec
+    except Exception as exc:                                   # noqa: BLE001
+        # 큐를 못 읽으면 아무것도 단정하지 않는다 — 다만 **못 읽었다는 사실을 남긴다.**
+        out["read_error"] = f"{type(exc).__name__}: {exc}"
+        return out
+
     out["pending"] = bool(out["held"] or out["logout_job"])
     return out
 
 
 def logout_block(store_obj, login_id: str, account_id: str = "") -> str:
-    """로그아웃 대기 중이면 **새 작업을 만들지 못하게** 할 이유를 돌려준다."""
+    """새 작업을 만들지 못하게 할 이유를 돌려준다(없으면 빈 문자열).
+
+    막는 경우
+      ① 그 계정이 로그아웃 대기 중이다(보류 작업·로그아웃 작업이 있다)
+      ② **큐를 읽지 못했다** — 보류가 있는지 없는지 모른다(2026-11-04, fail-safe)
+
+    ★②가 왜 차단인가 — 예전에는 조회 실패를 '보류 없음' 과 같이 다뤄 새 발행이
+      그대로 만들어졌다. 로그아웃을 눌러 둔 계정에 다음 배치가 올라가면
+      사용자 의도와 정반대가 된다. 모르면 막는 쪽이 안전하다.
+    ★이 판단은 **그 계정 하나의 조회 결과**로만 한다. 다른 계정은 각자 자기
+      조회로 판단하므로, 한 계정이 막혀도 나머지는 그대로 발행할 수 있다.
+    """
     stt = logout_state(store_obj, login_id, account_id)
+    who = login_id or f"계정 {account_id}"
+    if stt.get("read_error"):
+        return (f"**{who} 의 보류 작업을 확인하지 못해 새 작업을 만들지 "
+                f"않았습니다**(안전을 위해 막았습니다)."
+                f"{chr(10)}{chr(10)}큐를 읽지 못하면 그 계정이 로그아웃 대기 중인지 "
+                f"알 수 없습니다. 왼쪽 **연결 상태** 에서 [연결 다시 맺기] 를 "
+                f"누른 뒤 다시 시도해 주세요."
+                f"{chr(10)}{chr(10)}원인: `{stt['read_error']}`"
+                f"{chr(10)}{chr(10)}※ 다른 계정의 발행은 영향받지 않습니다.")
     if not stt["pending"]:
         return ""
     bits = []
@@ -1057,11 +1131,17 @@ def grade_line(ready_info: dict) -> str:
 
 
 def render_account_tools(store_obj, brand, account, ready_info: dict,
-                         device: dict | None = None) -> None:
-    """계정 세션 관리(보조) — 상태확인 / 로그아웃 / 보류 재개.
+                         device: dict | None = None, *,
+                         logged_in: bool | None = None,
+                         job_state: str = "") -> None:
+    """**네이버 계정 관리** — 상태확인 / 로그아웃 / 보류 재개.
 
-    ★기존 발행 흐름(기준랜딩 탭 선택 → 실행 준비 → Dry-run → 실전 실행)은
-      그대로다. 이 영역은 **필요할 때만** 펼쳐 쓰는 보조 기능이다.
+    ★2026-11-04 — 자리만 옮겼다(실행 준비 영역 안의 접힌 패널 → 메인 화면
+      상단 오른쪽). **기능은 하나도 바꾸지 않았다**: 식별자 결정(login_id 1순위,
+      없으면 account.id), `logout_state` 조회, `do_logout`/`do_resume`,
+      버전 게이트, 공유 세션 확인 체크박스가 모두 그대로다.
+    ★`logged_in`·`job_state` 는 **표시용**이다(없으면 그 줄을 생략한다).
+      판단 로직은 호출하는 쪽(기존 실행 준비 영역)이 그대로 갖고 있다.
     """
     device_id = (device or {}).get("device_id") or ""
     can_logout = agent_can_logout(device)
@@ -1070,34 +1150,62 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
     #     그 계정의 유일한 정확한 식별자는 **세션 폴더 이름(account.id)** 이다.
     aid = "" if lid else (getattr(account, "id", "") or "").strip()
     stt = logout_state(store_obj, lid, aid)
-    title = "계정 세션 관리 (보조)"
+
+    st.markdown("##### 🔐 네이버 계정 관리")
+    st.markdown(f"**{account.label or account.id}**")
+    #  ★세션 폴더 이름(account.id)은 화면에 노출하지 않는다(2026-09-17 결정).
+    #    login_id 가 없으면 '이 계정 전용 세션 기준' 이라고만 적는다.
+    st.caption(("아이디 `" + lid + "`") if lid
+               else "login_id 미등록 — 이 계정 전용 세션 기준")
+
+    # ── 로그인 상태(표시용) ──────────────────────────────────────
+    if logged_in is None:
+        pass                               # 호출한 쪽이 알려주지 않았다 → 생략
+    elif logged_in:
+        st.success("● 로그인됨", icon="✅")
+    elif job_state in RUNNING_STATES:
+        st.info("▶ 로그인 진행 중 — PC 에서 네이버 로그인을 마쳐 주세요")
+    else:
+        st.warning("○ 로그인 안 됨 — 아래 **[실행 준비]** 로 로그인해 주세요")
+    line = grade_line(ready_info)
+    if line:
+        st.caption(line.lstrip("· "))
+
+    # ── 이 계정의 작업 현황 ──────────────────────────────────────
+    #   ★로그아웃을 누르기 **전에** 무엇이 멈추고 무엇이 끝까지 가는지 보이게 한다.
+    if stt.get("read_error"):
+        # 큐를 못 읽었으면 '0건' 이 아니라 **모른다**는 뜻이다. 숫자를 지어내지 않는다.
+        st.warning("작업 큐를 읽지 못해 **보류 상태를 확인하지 못했습니다** — "
+                   "로그아웃 대기 중일 수 있습니다. 왼쪽 **연결 상태** 에서 "
+                   "[연결 다시 맺기] 뒤 다시 확인해 주세요."
+                   f"{chr(10)}{chr(10)}이 계정의 새 발행은 **안전을 위해 막혀 "
+                   f"있습니다**(다른 계정은 영향 없음)."
+                   f"{chr(10)}원인: `{stt['read_error']}`")
+    else:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("대기", len(stt.get("waiting") or []),
+                  help="아직 시작하지 않은 발행 작업 — 로그아웃하면 **보류**됩니다")
+        m2.metric("실행 중", len(stt["running"]),
+                  help="지금 돌고 있는 배치 — 로그아웃해도 **끝까지 발행**합니다")
+        m3.metric("보류", len(stt["held"]),
+                  help="로그아웃 때문에 멈춰 둔 작업 — [보류 작업 재개] 로 되돌립니다")
+
     if stt["pending"]:
-        title += " — 로그아웃 대기 중"
-    with st.expander(title, expanded=bool(stt["pending"])):
-        st.caption(f"· 대상 계정: **{account.label or account.id}**"
-                   + (f" (login_id: {lid})" if lid
-                      else " (login_id 미등록 — 이 계정 전용 세션 기준)")
-                   + f"{chr(10)}· 여기서 하는 일은 **이 계정에만** 적용됩니다. "
-                     "다른 로그인 계정의 세션·쿠키는 건드리지 않습니다.")
-        line = grade_line(ready_info)
-        if line:
-            st.markdown(line)
+        bits = []
+        if stt["running"]:
+            bits.append(f"**실행 중인 배치 {len(stt['running'])}건은 끝까지 "
+                        f"발행합니다**(중간에 끊지 않습니다)")
+        if stt["held"]:
+            bits.append(f"대기 작업 {len(stt['held'])}건을 **보류**했습니다")
+        if stt["logout_job"]:
+            bits.append("배치가 끝나면 로그아웃이 실행됩니다")
+        st.warning("로그아웃 대기 — " + " · ".join(bits)
+                   + f"{chr(10)}{chr(10)}재로그인은 아래 **[실행 준비]** 로 하고, 그 뒤 "
+                     "**[보류 작업 재개]** 를 눌러 주세요.")
 
-        if stt["pending"]:
-            bits = []
-            if stt["running"]:
-                bits.append(f"**실행 중인 배치 {len(stt['running'])}건은 끝까지 "
-                            f"발행합니다**(중간에 끊지 않습니다)")
-            if stt["held"]:
-                bits.append(f"대기 작업 {len(stt['held'])}건을 **보류**했습니다")
-            if stt["logout_job"]:
-                bits.append("배치가 끝나면 로그아웃이 실행됩니다")
-            st.warning("로그아웃 대기 — " + " · ".join(bits)
-                       + f"{chr(10)}{chr(10)}재로그인은 위 **[실행 준비]** 로 하고, 그 뒤 아래 "
-                         "**[보류 작업 재개]** 를 눌러 주세요.")
-
-        c1, c2 = st.columns(2)
-        if c1.button("로그인 상태 다시 확인", use_container_width=True,
+    c1, c2 = st.container(), st.container()
+    with c1:
+        if st.button("로그인 상태 다시 확인", use_container_width=True,
                      disabled=not device_id,
                      help="창을 띄우지 않고 저장된 세션이 살아 있는지, 발행 대상 "
                           "블로그가 맞는지 확인합니다"):
@@ -1109,6 +1217,7 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                 st.toast("로그인 상태를 확인하고 있습니다.")
                 st.rerun()
 
+    with c2:
         if not stt["pending"]:
             #   세션을 공유하는 계정이 있어 **불분명한 경우**에만 체크가 필요하다.
             #   판정은 계정 목록이 있는 PC(Agent)가 하고, 여기서는 그 결과를 보여 준다.
@@ -1118,14 +1227,15 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                 help="PC 에서 '이 세션을 함께 쓰는 계정' 이 발견되면 로그아웃이 "
                      "중단됩니다. 영향 범위를 확인하셨다면 이걸 체크하고 다시 "
                      "눌러 주세요")
-            if c2.button("선택 계정 로그아웃", use_container_width=True,
+            if st.button("선택 계정 로그아웃", use_container_width=True,
                          disabled=not (device_id and (lid or aid) and can_logout),
                          help="이 계정만 로그아웃합니다. 실행 중인 10건 배치는 "
                               "끝까지 발행한 뒤 로그아웃합니다"):
                 do_logout(store_obj, brand, account, lid, device_id,
                           account_id=aid, confirm_shared=bool(shared_ok))
             if not (lid or aid):
-                st.caption("※ 계정을 특정할 수 없습니다(세션 폴더 이름도 비어 있음).")
+                st.caption("※ 계정을 특정할 수 없습니다(세션 폴더 이름도 비어 "
+                           "있음) — 로그아웃 대상을 고르지 않습니다.")
             elif not lid:
                 st.caption("※ login_id 가 등록되지 않은 계정이라 **이 계정 전용 "
                            "세션**만 초기화합니다. blog_id 는 기준으로 쓰지 "
@@ -1139,10 +1249,23 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                            + " 이상**에서 동작합니다. "
                            "왼쪽에서 설치본을 다시 받아 설치하면 열립니다"
                            "(설치해도 저장된 로그인 세션은 그대로입니다).")
-        elif c2.button("보류 작업 재개", type="primary", use_container_width=True,
+        elif st.button("보류 작업 재개", type="primary", use_container_width=True,
                        disabled=not (lid or aid),
                        help="보류해 둔 작업을 다시 대기 상태로 돌립니다"):
             do_resume(store_obj, lid, device_id, account_id=aid)
+    st.caption("※ 여기서 하는 일은 **이 계정에만** 적용됩니다. 다른 로그인 계정·"
+               "다른 PC 의 세션과 작업은 건드리지 않습니다.")
+
+    # ── 카드 맨 아래 — 참고용 랜딩 기준 시트 바로가기 (2026-11-04 이동) ──
+    #   ★가운데 발행 설정 영역에 있던 버튼을 여기로 옮긴 것이다.
+    #     URL 은 하드코딩하지 않고 **선택한 브랜드 설정**에서 만든다(동작 동일).
+    ref_url = brand.sheet_url(brand.reference_sheet_id) if brand else ""
+    if ref_url:
+        st.divider()
+        st.link_button("📄 랜딩 기준 시트 열기", ref_url,
+                       use_container_width=True,
+                       help=f"{brand.title} 참고용 랜딩 기준 시트가 새 탭에서 "
+                            f"열립니다")
 
 
 def do_logout(store_obj, brand, account, login_id: str, device_id: str,
@@ -1161,8 +1284,36 @@ def do_logout(store_obj, brand, account, login_id: str, device_id: str,
         st.error("이 큐에서는 보류를 지원하지 않습니다 — 로그아웃을 하지 않았습니다.")
         return
     except Exception as exc:                                   # noqa: BLE001
-        st.error(f"대기 작업을 보류하지 못해 **로그아웃을 하지 않았습니다**."
-                 f"{chr(10)}{chr(10)}원인: `{type(exc).__name__}: {exc}`")
+        # ★보류가 **일부만** 반영됐을 수 있다(50건씩 나눠 보낸다).
+        #   그때 "하나도 못 했다" 고 안내하면 사용자가 보류된 작업을 방치한다.
+        #   성공 확인 건수 / 실패 건수를 나눠 보여 주고, 확인조차 못 했으면
+        #   **0건이라고 하지 않고 '확인 불가'** 로 안내한다(2026-11-04).
+        hint = ("{nl}{nl}[보류 작업 재개] 를 눌러 **대기 상태로 되돌린 뒤** 다시 "
+                "시도해 주세요.").format(nl=chr(10))
+        n = getattr(exc, "confirmed", None)
+        if n is None:                              # 부분 실패 정보가 없는 예외
+            held_now = None
+            try:
+                held_now = len(store_obj.held_jobs(login_id, account_id))
+            except Exception:                                  # noqa: BLE001
+                held_now = None
+            n = -1 if held_now is None else held_now
+        if n < 0:
+            st.error(f"대기 작업 보류 결과를 **확인하지 못했습니다** — "
+                     f"보류된 작업이 있을 수 있습니다(0건이 아닙니다). "
+                     f"**로그아웃은 하지 않았습니다.**"
+                     f"{chr(10)}{chr(10)}원인: `{type(exc).__name__}: {exc}`" + hint)
+        elif n:
+            failed = len(getattr(exc, "remaining", []) or [])
+            st.error(f"대기 작업을 **일부만 보류했습니다** — 보류 확인 "
+                     f"**{n}건**"
+                     + (f" · 실패/미확인 **{failed}건**" if failed else "")
+                     + f". **로그아웃은 하지 않았습니다.**"
+                     f"{chr(10)}{chr(10)}원인: `{type(exc).__name__}: {exc}`" + hint)
+        else:
+            st.error(f"대기 작업을 보류하지 못해 **로그아웃을 하지 않았습니다**"
+                     f"(보류된 작업 0건 — 확인했습니다)."
+                     f"{chr(10)}{chr(10)}원인: `{type(exc).__name__}: {exc}`")
         return
 
     running = []
@@ -1188,7 +1339,20 @@ def do_logout(store_obj, brand, account, login_id: str, device_id: str,
                        "[보류 작업 재개] 를 눌러 주세요.")
         return
     st.session_state["job_id"] = res.job_id
-    msg = [f"보류 {len(held)}건"]
+
+    # ★2차 스윕 — 로그아웃 작업을 등록하는 **사이**에 들어온 대기 작업을 한 번 더
+    #   보류한다(2026-11-04). ①보류 → ②등록 순서라, 그 틈에 제출된 작업은
+    #   ①을 지나쳐 pending 으로 남는다. 여기서 한 번 더 긁어 가면 창이 훨씬 좁아진다.
+    #   ※ 창이 **완전히** 닫히지는 않는다(아래 보고서 참고) — DB 수준 처리가 필요하다.
+    swept: list = []
+    try:
+        swept = store_obj.hold_account(login_id, device=device_id or "",
+                                       account_id=account_id)
+    except Exception:                                          # noqa: BLE001
+        swept = []                     # 2차 스윕 실패는 로그아웃을 되돌리지 않는다
+
+    msg = [f"보류 {len(held) + len(swept)}건"
+           + (f"(2차 스윕 {len(swept)}건 포함)" if swept else "")]
     if running:
         msg.append(f"실행 중인 배치 {len(running)}건은 **끝까지 발행**합니다")
     msg.append("그 뒤 로그아웃이 실행됩니다")
@@ -1202,7 +1366,24 @@ def do_resume(store_obj, login_id: str, device_id: str,
         back = store_obj.resume_account(login_id, device=device_id or "",
                                         account_id=account_id)
     except Exception as exc:                                   # noqa: BLE001
-        st.error(f"보류 작업을 재개하지 못했습니다 — `{type(exc).__name__}: {exc}`")
+        # ★재개도 50건씩 나눠 보낸다 → 일부만 되돌아갔을 수 있다.
+        n = getattr(exc, "confirmed", None)
+        if n is None or n < 0:
+            st.error(f"보류 작업 재개 결과를 **확인하지 못했습니다** — 일부가 "
+                     f"되돌아갔을 수 있습니다(0건이 아닙니다). 잠시 뒤 "
+                     f"[보류 작업 재개] 를 다시 눌러 주세요."
+                     f"{chr(10)}{chr(10)}원인: `{type(exc).__name__}: {exc}`")
+        else:
+            st.error(f"보류 작업을 **일부만 재개했습니다** — 재개 확인 **{n}건**. "
+                     f"[보류 작업 재개] 를 다시 누르면 남은 것만 이어서 "
+                     f"되돌립니다(이미 돌아간 것은 다시 건드리지 않습니다)."
+                     f"{chr(10)}{chr(10)}원인: `{type(exc).__name__}: {exc}`")
+        return
+    if not back:
+        # ★중복 재개 방지 — 이미 재개됐으면 아무것도 바꾸지 않고 그렇게 알린다.
+        #   (조건부 UPDATE 라 held 가 아닌 작업은 애초에 대상이 아니다)
+        st.info("되돌릴 보류 작업이 없습니다 — 이미 재개된 상태입니다.")
+        st.rerun()
         return
     st.success(f"보류 작업 {len(back)}건을 다시 대기 상태로 돌렸습니다.")
     st.rerun()
@@ -1345,30 +1526,59 @@ alive = live_agents(store)          # 실행 에이전트 현황(아래 여러 �
 # ══════════════════════════════════════════════════════════════════
 # 본문
 # ══════════════════════════════════════════════════════════════════
-st.title("네이버 블로그 랜딩 생성기")
-st.markdown(info_block(("브랜드", brand.title),
-                       ("기준시트", brand.reference_title),
-                       ("UTM 빌더", brand.utm_title)),
-            unsafe_allow_html=True)
+# ══════════════════════════════════════════════════════════════════
+# 레이아웃 — 왼쪽(약 69%) 작업 영역 / 오른쪽(약 31%) 네이버 계정 관리
+#            + 아래쪽은 **전체 너비**(최근 실행 기록 · 진행 상황)
+#   (2026-11-04 2차: 상단을 두 줄로 나눠 놓았더니 오른쪽 계정 패널 높이만큼
+#    '무엇을 만들까요' 영역이 아래로 밀려 **왼쪽에 큰 공백**이 생겼다.
+#    → 칸을 한 쌍으로 합치고, 작업 영역을 그 왼쪽 칸 **안쪽**에 넣는다.)
+#
+#   ★기존 `with left:` 블록(작업 설정 전체)은 한 줄도 바꾸지 않는다.
+#     `left` 가 가리키는 **그릇만** 바꿔 끼운다 — 위젯 key·session_state·
+#     callback·계정 식별 값이 그대로 유지된다.
+#   ★`ACCOUNT_BOX` 는 `st.empty()` 로 자리만 잡아 두고, 계정·로그인 상태가
+#     정해진 뒤 그 안을 채운다(순서를 바꾸지 않기 위해서다).
+#     `st.empty()` 자체는 높이를 만들지 않는다 — 안을 채우기 전에는 0 이다.
+# ══════════════════════════════════════════════════════════════════
+MAIN_COL, SIDE_COL = st.columns([2.2, 1], gap="large")
 
-_gap = cloud_not_wired()
-if _gap:
-    st.error("🔌 **이 화면이 아직 각자 PC 와 이어져 있지 않습니다.**"
-             + chr(10) + chr(10) +
-             "지금은 [연결 코드 받기] 를 눌러도 그 코드가 이 화면 안에만 "
-             "만들어져서, PC 에서 입력해도 연결되지 않습니다."
-             + chr(10) + chr(10) +
-             "**Settings → Secrets** 에 다음 항목을 넣고 저장해 주세요 → "
-             + ", ".join(f"`{k}`" for k in _gap))
-elif not agent_ready:
-    st.warning("⚠ **아직 어느 PC 에서 돌릴지 정해지지 않았습니다.**"
-               f"{chr(10)}{chr(10)}왼쪽 **내 PC** 에서 본인 컴퓨터를 고르세요. "
-               "목록에 없으면 그 컴퓨터에 Agent 를 **한 번만** 설치하면 됩니다 — "
-               "**[⬇ Windows Agent 설치]** → 설치 → **[연결 코드 받기]** 의 6자리 입력."
-               f"{chr(10)}{chr(10)}※ 다른 사람 PC 를 고르면 **그 사람 컴퓨터에서 "
-               "그 사람 네이버 계정으로** 글이 올라갑니다. 꼭 본인 PC 를 고르세요.")
+#  오른쪽 칸 — 계정 관리 자리. 아래에서 `with ACCOUNT_BOX.container(...)` 로 채운다.
+ACCOUNT_BOX = SIDE_COL.empty()
+with ACCOUNT_BOX.container(border=True):
+    st.markdown("##### 🔐 네이버 계정 관리")
+    st.caption("왼쪽에서 **기준 계정**을 고르면 여기에 로그인 상태와 "
+               "로그아웃·보류 기능이 나타납니다.")
 
-left, right = st.columns([3, 2], gap="large")
+#  왼쪽 칸 — 제목 · 브랜드/기준시트/UTM · 연결 경고
+with MAIN_COL:
+    st.title("네이버 블로그 랜딩 생성기")
+    st.markdown(info_block(("브랜드", brand.title),
+                           ("기준시트", brand.reference_title),
+                           ("UTM 빌더", brand.utm_title)),
+                unsafe_allow_html=True)
+
+    _gap = cloud_not_wired()
+    if _gap:
+        st.error("🔌 **이 화면이 아직 각자 PC 와 이어져 있지 않습니다.**"
+                 + chr(10) + chr(10) +
+                 "지금은 [연결 코드 받기] 를 눌러도 그 코드가 이 화면 안에만 "
+                 "만들어져서, PC 에서 입력해도 연결되지 않습니다."
+                 + chr(10) + chr(10) +
+                 "**Settings → Secrets** 에 다음 항목을 넣고 저장해 주세요 → "
+                 + ", ".join(f"`{k}`" for k in _gap))
+    elif not agent_ready:
+        st.warning("⚠ **아직 어느 PC 에서 돌릴지 정해지지 않았습니다.**"
+                   f"{chr(10)}{chr(10)}왼쪽 **내 PC** 에서 본인 컴퓨터를 고르세요. "
+                   "목록에 없으면 그 컴퓨터에 Agent 를 **한 번만** 설치하면 됩니다 — "
+                   "**[⬇ Windows Agent 설치]** → 설치 → **[연결 코드 받기]** 의 6자리 입력."
+                   f"{chr(10)}{chr(10)}※ 다른 사람 PC 를 고르면 **그 사람 컴퓨터에서 "
+                   "그 사람 네이버 계정으로** 글이 올라갑니다. 꼭 본인 PC 를 고르세요.")
+
+#  ★`left` = 왼쪽 칸 안쪽(작업 설정이 여기로 들어간다 — 아래 `with left:` 그대로)
+#  ★`right` = **컬럼 밖** 하단 전체 너비(최근 실행 기록 — 아래 `with right:` 그대로)
+#    컬럼 뒤에 만든 그릇이므로 두 칸 아래에 한 줄로 깔린다.
+left = MAIN_COL.container()
+right = st.container()
 
 # ── 왼쪽: 작업 설정 ────────────────────────────────────────────────
 with left:
@@ -1454,25 +1664,20 @@ with left:
                                       "목록은 시트에서 자동으로 읽어옵니다")
         account = resolve_account(brand, ref_tab)
 
-        # ── 참고용 랜딩 기준 시트 바로가기 · 선택 계정의 로그인 ID ──
-        #   ★URL 은 하드코딩하지 않고 **선택한 브랜드 설정**에서 만든다.
+        # ── 선택 계정의 로그인 ID ─────────────────────────────────
         #   ★로그인 ID 는 accounts.json(git 제외)에서 읽어 **표시만** 한다.
         #     비밀번호는 저장하지도 보여주지도 않는다.
-        lcol, icol = st.columns([1, 2])
-        ref_url = brand.sheet_url(brand.reference_sheet_id)
-        if ref_url:
-            lcol.link_button(f"📄 {brand.title} 참고용 랜딩 기준 시트 열기", ref_url,
-                             use_container_width=True,
-                             help="새 탭에서 기준시트가 열립니다")
+        #   ★'참고용 랜딩 기준 시트 열기' 버튼은 2026-11-04 에 오른쪽
+        #     **네이버 계정 관리 카드 맨 아래**로 옮겼다(URL·동작은 그대로).
         if account and account.login_id:
-            icol.markdown(info_block((account.title, f"ID: {account.login_id}")),
-                          unsafe_allow_html=True)
+            st.markdown(info_block((account.title, f"ID: {account.login_id}")),
+                        unsafe_allow_html=True)
         elif account:
-            icol.caption(f"{account.title} · 로그인 ID 미등록"
-                         f"(accounts.json 의 login_id 에 적으면 여기에 표시됩니다)")
+            st.caption(f"{account.title} · 로그인 ID 미등록"
+                       f"(accounts.json 의 login_id 에 적으면 여기에 표시됩니다)")
         else:
-            icol.caption("이 기준랜딩 탭은 아직 계정이 없습니다 — "
-                         "[실행 준비] 를 누르면 만들어집니다")
+            st.caption("이 기준랜딩 탭은 아직 계정이 없습니다 — "
+                       "[실행 준비] 를 누르면 만들어집니다")
 
         try:
             cat = load_catalog(brand.id, account.id if account else "", ref_tab)
@@ -1540,10 +1745,16 @@ with left:
         else:
             content_from = "ref"
 
+        # ★key 를 명시한다(2026-11-04). 예전에는 key 가 없어 위젯 id 가 **놓인
+        #   자리**에서 만들어졌다 — 칸·컨테이너 구조를 바꾸면 id 가 달라져
+        #   체크 상태가 기본값으로 돌아갔다. key 를 주면 자리와 무관하게 유지된다.
+        #   ★기본값(value)·disabled·동작은 그대로다.
         show_window = st.checkbox("브라우저 창 보기", value=False,
+                                  key="show_window",
                                   help="끄면 창 없이(headless) 돕니다. "
                                        "로그인할 때만 창이 뜹니다")
         keep_going = st.checkbox("한 건 실패해도 나머지 계속 (실전용)", value=True,
+                                 key="keep_going",
                                  disabled=not is_prod,
                                  help="실패한 건은 발행하지 않고 시트에도 남기지 않습니다. "
                                       "끄면 예전처럼 그 배치를 통째로 멈춥니다")
@@ -1728,7 +1939,11 @@ with left:
         #   ★평소 발행에는 **아무것도 누를 필요가 없다.** 접어 둔다.
         #   ★여기서 하는 일은 모두 **고른 계정 하나**에만 적용된다.
         if account:
-            render_account_tools(store, brand, account, ready_info, device)
+            # ★맨 위 오른쪽 칸을 **지금** 채운다(계정·로그인 상태가 정해진 뒤).
+            #   같은 함수를 그대로 쓰므로 로그아웃·보류·재개 동작은 동일하다.
+            with ACCOUNT_BOX.container(border=True):
+                render_account_tools(store, brand, account, ready_info, device,
+                                     logged_in=logged_in, job_state=job_state)
 
         if not agent_ready:
             st.info("이 컴퓨터의 **Agent 가 연결되면** 실행 버튼이 열립니다 "
