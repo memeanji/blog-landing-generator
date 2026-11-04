@@ -32,6 +32,7 @@ from pathlib import Path
 
 from .accounts import account_id
 from .appdir import ROOT
+from .loginid import NAVER_MAIL_DOMAINS, norm_login, same_login   # noqa: F401
 
 SESSIONS_ROOT = ROOT / "sessions"
 ALIAS_PATH = SESSIONS_ROOT / "login_aliases.json"       # login_id → session_id
@@ -63,7 +64,12 @@ def norm_id(value: str) -> str:
 
 
 def same_id(a: str, b: str) -> bool:
-    """login_id·blog_id 비교는 대소문자를 구분하지 않는다(네이버가 그렇다)."""
+    """**blog_id** 비교 — 대소문자를 구분하지 않는다(네이버가 그렇다).
+
+    ★`login_id` 비교에는 `same_login`(= `v2/loginid.py`)을 쓴다. 로그인 ID 는
+      `shin894894` / `shin894894@naver.com` 두 형태로 적히기 때문이다.
+      blog_id 에는 도메인 표기가 없으므로 여기서 도메인을 떼면 안 된다.
+    """
     a, b = norm_id(a), norm_id(b)
     return bool(a) and bool(b) and a.casefold() == b.casefold()
 
@@ -205,9 +211,9 @@ def record_login_result(acc, *, seen_blog_id: str = "", expected_blog_id: str = 
     auth_lid, ent_lid = norm_id(authenticated_login_id), norm_id(entered_login_id)
     want_lid = norm_id(expected_login_id) or norm_id(account_map(acc).get("login_id"))
 
-    if auth_lid and want_lid and same_id(auth_lid, want_lid):
+    if auth_lid and want_lid and same_login(auth_lid, want_lid):
         grade, by = AUTHENTICATED, "naver_account_api"
-    elif ent_lid and want_lid and same_id(ent_lid, want_lid):
+    elif ent_lid and want_lid and same_login(ent_lid, want_lid):
         grade, by = INPUT, "login_form_input"
     elif manual_ok:
         grade, by = MANUAL, "user_confirmed"
@@ -272,7 +278,7 @@ def check_publish(acc, *, expected_login_id: str = "", expected_blog_id: str = "
                           f"확인된 블로그 {now_bid}")
 
     got_lid = norm_id(st.get("authenticated_login_id"))
-    if got_lid and want_lid and not same_id(got_lid, want_lid):
+    if got_lid and want_lid and not same_login(got_lid, want_lid):
         return False, g, (f"로그인 계정이 다릅니다 — 기대 login_id {want_lid} / "
                           f"인증된 login_id {got_lid}")
 
@@ -310,7 +316,7 @@ def session_for_login(login_id: str) -> str:
         return ""
     table = aliases()
     for key, row in table.items():
-        if key.casefold() == lid.casefold():
+        if same_login(key, lid):
             return str((row or {}).get("session_id") or "")
     return ""
 
@@ -341,14 +347,22 @@ def link_session(login_id: str, acc, *, grade: str = "", ref_tab: str = "",
     if not session_store.session_dir(acc).exists():
         return False, f"세션 폴더가 없습니다({sid})"
     mapped = norm_id(account_map(acc).get("login_id"))
-    if mapped and not same_id(mapped, lid):
+    if mapped and not same_login(mapped, lid):
         return False, (f"그 세션 폴더는 다른 로그인 계정({mapped})의 것입니다 — "
+                       f"연결하지 않습니다")
+    # ★매핑이 아직 비어 있어도(= '처음 연결'), 계정 등록표가 말하는 login_id 와
+    #   어긋나면 연결하지 않는다(2026-11-04). 예전에는 매핑이 비면 **어떤
+    #   login_id 든** 그 세션에 붙을 수 있었다 — 운영 경로에서는 같은 값이
+    #   들어오므로 동작 변화는 없고, 잘못 부르는 경우만 막힌다.
+    own = norm_id(getattr(acc, "login_id", ""))
+    if own and not same_login(own, lid):
+        return False, (f"그 세션은 {own} 계정의 것입니다 — {lid} 를 "
                        f"연결하지 않습니다")
 
     table = _read(ALIAS_PATH)
     rows = dict(table.get("aliases") or {})
     for key, row in list(rows.items()):
-        if key.casefold() != lid.casefold():
+        if not same_login(key, lid):
             continue
         cur = str((row or {}).get("session_id") or "")
         if cur and cur != sid:
@@ -368,7 +382,7 @@ def unlink_session(login_id: str) -> bool:
     lid = norm_id(login_id)
     table = _read(ALIAS_PATH)
     rows = dict(table.get("aliases") or {})
-    hit = [k for k in rows if k.casefold() == lid.casefold()]
+    hit = [k for k in rows if same_login(k, lid)]
     for k in hit:
         rows.pop(k)
     if not hit:
@@ -389,7 +403,7 @@ def is_logout_pending(login_id: str) -> bool:
     lid = norm_id(login_id)
     if not lid:
         return False
-    return any(k.casefold() == lid.casefold() for k in logout_pending())
+    return any(same_login(k, lid) for k in logout_pending())
 
 
 def mark_logout_pending(login_id: str, *, session_id: str = "",
@@ -412,9 +426,11 @@ def mark_logout_pending(login_id: str, *, session_id: str = "",
 
 def clear_logout_pending(login_id: str) -> bool:
     lid = norm_id(login_id)
+    if not lid:                      # ★빈 값으로 전체를 지우는 일이 없게
+        return False
     table = _read(PENDING_PATH)
     rows = dict(table.get("pending") or {})
-    hit = [k for k in rows if k.casefold() == lid.casefold()]
+    hit = [k for k in rows if same_login(k, lid)]
     for k in hit:
         rows.pop(k)
     if not hit:
@@ -489,7 +505,7 @@ def logout_allowed(acc, path=None) -> tuple[bool, list[dict], str]:
         return True, [], ""
     mine = norm_id(getattr(acc, "login_id", "")) \
         or norm_id(account_map(acc).get("login_id"))
-    odd = [p for p in peers if not (mine and same_id(p["login_id"], mine))]
+    odd = [p for p in peers if not (mine and same_login(p["login_id"], mine))]
     if not odd:
         return True, peers, (f"같은 로그인 계정({mine})의 다른 등록 {len(peers)}건도 "
                              f"함께 재로그인이 필요해집니다")

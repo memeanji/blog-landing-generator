@@ -505,6 +505,117 @@ async def resolve_blog_id(ctx, settings, log) -> str:
     raise RuntimeError(f"내 블로그 ID 를 찾지 못했습니다(url={page.url}). --blog-id 로 지정하세요.")
 
 
+# ══════════════════════════════════════════════════════════════════
+#  네이버 **인증 ID** 읽기 (2026-11-04 · 기본 꺼짐)
+#
+#  왜 필요한가
+#    `login_state` 의 검증 등급 네 단계 중 `authenticated` 는 "네이버가 인증한
+#    로그인 ID 를 **실제로 읽어** 기대값과 맞췄다" 는 뜻이다. 그런데 그 ID 를
+#    채우는 코드가 없어서(11/03 기준) 등급이 `manual` 이상으로 올라갈 길이
+#    없었다 — 4단계가 사실상 2단계였다.
+#
+#  왜 기본으로 꺼 두는가
+#    · 선택자·주소는 **실제 네이버 화면에서 한 번 확인**해야 확정된다. 지금은
+#      오프라인 테스트(가짜 page)로 '구조가 안전한가' 까지만 검증했다.
+#    · 이 함수는 `--login/--check` 경로에서만 불린다(발행 경로는 부르지 않는다).
+#      그래도 기존 로그인 흐름에 페이지 이동 한 번을 더하는 일이므로,
+#      `BLOG_FAST_WAIT` 과 같은 규칙으로 **설정을 빠뜨리면 꺼진 쪽**이 되게 한다.
+#    · 켠 상태에서 실패해도 **빈 문자열과 사유**만 돌려준다. 예외를 던지지 않고
+#      등급을 올리지도 않는다 → 기존 동작과 같아진다.
+#
+#  ★쿠키·비밀번호·토큰을 읽지도 기록하지도 않는다. 읽는 것은 로그인 ID 뿐이다.
+# ══════════════════════════════════════════════════════════════════
+LOGIN_ID_ENV = "BLOG_READ_LOGIN_ID"
+LOGIN_ID_ON = ("1", "on", "true", "yes", "y")
+
+#  (이름, 주소) — 앞에서부터 시도하고 하나라도 읽으면 멈춘다.
+LOGIN_ID_SOURCES = (
+    ("내정보", "https://nid.naver.com/user2/help/myInfoV2?lang=ko_KR"),
+    ("네이버홈", "https://www.naver.com/"),
+)
+
+#  로그인 ID 가 들어 있을 법한 자리만 **콕 집어** 읽는다(본문 전체를 훑지 않는다).
+LOGIN_ID_JS = r"""() => {
+     const out = [];
+     const push = v => { if (v) out.push(String(v).trim()); };
+     const sels = [
+       '[data-login-id]', '#id', 'input[name="id"]',
+       '.ident', '.txt_id', '.id_text', '.user_id', '.my_id',
+       '[class*="desc_email"]', '[class*="link_login"]',
+       '[class*="MyView-module__desc"]', '#account .link_login',
+     ];
+     for (const s of sels) {
+       for (const el of document.querySelectorAll(s)) {
+         push(el.getAttribute && el.getAttribute('data-login-id'));
+         push(el.value);
+         push(el.getAttribute && el.getAttribute('title'));
+         push(el.getAttribute && el.getAttribute('aria-label'));
+         push(el.textContent);
+       }
+     }
+     return {href: location.href, cands: out.slice(0, 40)};
+   }"""
+
+#  화면 단어가 ID 로 잡히는 일을 막는다(값 검증과 함께 쓴다).
+_BAD_LOGIN_WORDS = {
+    "id", "아이디", "로그인", "logout", "login", "naver", "네이버", "내정보",
+    "myinfo", "me", "mail", "메일", "회원정보", "undefined", "null", "none",
+}
+_LOGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.]{2,39}(@naver\.com)?$", re.I)
+
+
+def read_login_id_enabled(env: dict | None = None) -> bool:
+    """`BLOG_READ_LOGIN_ID` 가 **명시적으로 켜져** 있을 때만 True."""
+    import os
+
+    src = os.environ if env is None else env
+    return (str(src.get(LOGIN_ID_ENV) or "").strip().lower() in LOGIN_ID_ON)
+
+
+def _extract_login_id(cands) -> str:
+    """후보 문자열들 중 **로그인 ID 로 쓸 수 있는 모양**인 첫 값. 없으면 빈 문자열."""
+    for raw in list(cands or []):
+        for piece in re.split(r"[\s,;|/()\[\]]+", str(raw or "")):
+            v = piece.strip().strip(".:·-")
+            if not v or v.casefold() in _BAD_LOGIN_WORDS:
+                continue
+            if _LOGIN_ID_RE.match(v):
+                return v
+    return ""
+
+
+async def read_login_id(ctx, log=None) -> tuple[str, str]:
+    """네이버가 인증한 로그인 ID 를 읽는다 → `(id, 사유)`.
+
+    · 꺼져 있으면 `("", "꺼짐…")` — 아무 페이지도 열지 않는다.
+    · 못 읽으면 `("", 사유)`. **예외를 던지지 않는다.**
+    · 읽으면 `(id, 출처)`.
+    """
+    say = log or (lambda *_a, **_k: None)
+    if not read_login_id_enabled():
+        return "", f"꺼짐({LOGIN_ID_ENV} 미설정) — 인증 ID 를 읽지 않습니다"
+
+    tried: list[str] = []
+    try:
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+    except Exception as exc:                                   # noqa: BLE001
+        return "", f"페이지를 열지 못했습니다({type(exc).__name__})"
+
+    for name, url in LOGIN_ID_SOURCES:
+        try:
+            await page.goto(url, wait_until="domcontentloaded")
+            await page.wait_for_timeout(1200)
+            marks = await page.evaluate(LOGIN_ID_JS)
+            got = _extract_login_id((marks or {}).get("cands"))
+            if got:
+                say(f"[검증] 네이버 인증 ID = {got} (출처: {name})")
+                return got, f"출처 {name}"
+            tried.append(f"{name}: 후보 {len((marks or {}).get('cands') or [])}개 중 없음")
+        except Exception as exc:                               # noqa: BLE001
+            tried.append(f"{name}: {type(exc).__name__}")
+    return "", "읽지 못했습니다 — " + " · ".join(tried or ["시도한 출처 없음"])
+
+
 # ── frame 탐색 ────────────────────────────────────────────────────────
 #   ★수정화면(PostUpdateForm)의 실제 에디터는 about:blank 중첩 iframe 에 있다.
 #     frame.url 로 거르면 절대 못 찾는다 → 모든 frame 을 훑어 '점수'가 가장 높은 것을 쓴다.

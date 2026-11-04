@@ -386,10 +386,18 @@ check("[Supabase] claim_job 은 for update skip locked 로 행을 잠근다",
 check("[Supabase] status 는 text 다(enum·CHECK 아님) → held 를 넣을 수 있다",
       "status      text not null default 'pending'" in schema
       and "check (status" not in schema.lower())
-check("[Supabase] 보류는 status=eq.pending 조건부 UPDATE 1회다",
-      "jobs?status=eq.{frm}&kind=eq.run" in
-      (ROOT / "v2" / "supabase_store.py").read_text(encoding="utf-8"))
-print("     → 경합 결론: claim 이 먼저면 행은 running 이 되어 `status=eq.pending`")
+#  ★2026-11-04 — 보류 대상을 '상태로 좁혀 고른 뒤 job_id + status 조건으로 PATCH'
+#    하는 2단계로 바꿨다. 조건(`status=eq.<frm>`)이 PATCH 에 그대로 붙어 있으므로
+#    원자성은 전과 같다. 바꾼 이유는 ①조회 창에 밀려 보류 대상을 놓치지 않기
+#    ②login_id 표기 차이(@naver.com)를 흡수하기 — 아래 두 줄로 둘 다 검증한다.
+sup = (ROOT / "v2" / "supabase_store.py").read_text(encoding="utf-8")
+check("[Supabase] 보류 PATCH 에 status 조건이 그대로 붙어 있다(원자성 유지)",
+      "job_id=in.(" in sup and "&status=eq.{quote(frm" in sup)
+check("[Supabase] 보류 대상은 **상태로 좁혀** 고른다(조회 창에 밀리지 않는다)",
+      'self.list_by_status(frm, lid, aid, kind="run")' in sup)
+check("[Supabase] 보류 대상 선별은 matches(= login_id 정규화)를 쓴다",
+      "matches(r, login_id, account_id)" in sup)
+print("     → 경합 결론: claim 이 먼저면 행은 running 이 되어 `status=eq.<frm>`")
 print("        조건에 안 걸리고, 보류가 먼저면 claim 의 하위질의가 그 행을 못 고른다.")
 print("        어느 쪽이 이겨도 **한 번만** 처리된다(Postgres 행 잠금이 보장).")
 
@@ -416,9 +424,14 @@ check("재부팅 뒤에도 대기 중 로그아웃 작업이 보인다",
       any(is_logout(r) for r in fresh.list_jobs(limit=50)
           if r.get("status") in (PENDING, RUNNING)))
 check("상태 판단이 화면 메모리에 의존하지 않는다(큐만 읽는다)",
-      "rows = store_obj.list_jobs(limit=120)" in app
+      "store_obj.list_by_status(status, lid, aid, kind=kind)" in app
       and "st.session_state" not in app.split("def logout_state")[1].split(
           "def logout_block")[0])
+#  ★2026-11-04 — 예전에는 `list_jobs(limit=120)` 를 훑어 held 를 골랐다.
+#    작업이 120건을 넘으면 보류 작업이 조회 창 밖으로 밀려 '보류 없음' 이 되고,
+#    그러면 로그아웃 대기 계정에 새 발행 작업이 다시 만들어졌다.
+check("화면이 조회 창(limit) 안에서 held 를 찾는 방식이 아니다",
+      "rows = store_obj.list_jobs(limit=120)" not in app)
 check("화면은 보류가 있으면 그 계정 새 작업을 막는다",
       "if kind == \"run\":" in app and "logout_block(store_obj" in app)
 check("보류가 풀리면 막지 않는다",

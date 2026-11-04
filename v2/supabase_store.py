@@ -29,7 +29,7 @@ from typing import Any
 
 from .job import Job
 from .queue_store import (CANCELED, DONE, FAILED, HELD, JobStore, PENDING, RUNNING,
-                          host_name, now_iso)
+                          host_name, matches, now_iso)
 
 TIMEOUT = 20
 LOG_FLUSH_LINES = 25          # 로그를 이만큼 모으면 보낸다(HTTP 왕복 줄이기)
@@ -230,6 +230,19 @@ class SupabaseStore(JobStore):
     #   ★`payload->>login_id` 로만 고른다 — blog_id 로 묶지 않는다.
     def _switch_status(self, login_id: str, frm: str, to: str,
                        device: str = "", account_id: str = "") -> list[str]:
+        """`frm` 상태인 그 계정의 작업을 `to` 로 바꾼다. 바뀐 job_id 목록.
+
+        ★①바꿀 대상을 **상태로 좁혀 조회**해 `matches`(login_id 정규화)로 고르고,
+          ②`job_id` 목록 + `status=eq.<frm>` 조건으로 PATCH 한다.
+          조건이 그대로 붙어 있으므로 **원자성은 그대로다** — 그 사이 Agent 가
+          집어 간 작업(running)은 조건에 걸리지 않고 끝까지 간다.
+        ★예전에는 `payload->>login_id=eq.…` 로 한 번에 PATCH 했다. 서버 필터는
+          문자열 정확일치라 `shin894894` / `shin894894@naver.com` 표기가 어긋나면
+          **한 건도 못 고르고 '보류 0건' 으로 조용히 끝났다.** 그래서 고른다.
+        ★kind=run 만 — 로그인/세션확인/로그아웃 작업은 보류하지 않는다
+          (보류하면 사용자가 재로그인으로 복구할 길이 막힌다).
+        ★blog_id 로는 절대 고르지 않는다.
+        """
         from urllib.parse import quote
 
         lid, aid = (login_id or "").strip(), (account_id or "").strip()
@@ -238,18 +251,22 @@ class SupabaseStore(JobStore):
         if self.mode != "service":
             raise SupabaseError("작업 보류/재개는 UI(service 모드)에서만 합니다.",
                                 definite_failure=True)
-        # ★kind=run 만 — 로그인/세션확인/로그아웃 작업은 보류하지 않는다
-        #   (보류하면 사용자가 재로그인으로 복구할 길이 막힌다).
-        # ★식별자: login_id 1순위, 없으면 payload->>account(세션 폴더) 정확일치.
-        #   blog_id 로는 절대 고르지 않는다.
-        key = ("login_id", lid) if lid else ("account", aid)
-        q = (f"jobs?status=eq.{frm}&kind=eq.run"
-             f"&payload->>{key[0]}=eq.{quote(key[1], safe='')}")
-        if device:
-            q += f"&device_id=eq.{quote(device, safe='')}"
-        rows = self._rest("PATCH", q, json={"status": to},
-                          headers={"Prefer": "return=representation"}) or []
-        return [str(r.get("job_id")) for r in rows if r.get("job_id")]
+
+        want = self.list_by_status(frm, lid, aid, kind="run")
+        ids = [str(r.get("id")) for r in want if r.get("id")
+               and (not device or str(r.get("target_agent") or "") == device)]
+        if not ids:
+            return []
+
+        done: list[str] = []
+        for i in range(0, len(ids), 50):      # URL 이 길어지지 않게 나눠 보낸다
+            chunk = ids[i:i + 50]
+            lst = ",".join(quote(x, safe="") for x in chunk)
+            q = f"jobs?job_id=in.({lst})&status=eq.{quote(frm, safe='')}"
+            rows = self._rest("PATCH", q, json={"status": to},
+                              headers={"Prefer": "return=representation"}) or []
+            done += [str(r.get("job_id")) for r in rows if r.get("job_id")]
+        return done
 
     def hold_account(self, login_id: str = "", *, device: str = "",
                      account_id: str = "") -> list[str]:
@@ -270,6 +287,32 @@ class SupabaseStore(JobStore):
     def list_jobs(self, limit: int = 30) -> list[dict]:
         rows = self._rest("GET", f"jobs?order=created_at.desc&limit={int(limit)}")
         return [self._rec(r) for r in (rows or [])]
+
+    def list_by_status(self, status: str, login_id: str = "",
+                       account_id: str = "", kind: str = "",
+                       limit: int = 0) -> list[dict]:
+        """**서버에서 상태로 좁혀** 조회한다 → 보류 작업이 조회 창에 밀리지 않는다.
+
+        ★계정 식별은 받아온 뒤 `matches`(login_id 정규화 포함)로 가린다.
+          서버 필터(`payload->>login_id=eq.…`)는 문자열 정확일치라
+          `shin894894` / `shin894894@naver.com` 표기 차이를 흡수하지 못한다.
+          상태로 좁히면 held·running 은 몇 건뿐이어서 이 방식이 더 안전하다.
+        """
+        from urllib.parse import quote
+
+        want = (status or "").strip()
+        if not want:
+            return []
+        q = (f"jobs?status=eq.{quote(want, safe='')}"
+             f"&order=created_at.desc&limit={int(limit or self.SCAN_LIMIT)}")
+        if kind:
+            q += f"&kind=eq.{quote(kind, safe='')}"
+        rows = self._rest("GET", q) or []
+        recs = [r for r in (self._rec(x) for x in rows) if r]
+        both = not (login_id or "").strip() and not (account_id or "").strip()
+        if both:
+            return recs
+        return [r for r in recs if matches(r, login_id, account_id)]
 
     def accounts_list(self) -> list[dict]:
         """블로그 계정 목록(중앙 관리) — **읽기 전용**.

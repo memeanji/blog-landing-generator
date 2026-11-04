@@ -995,23 +995,46 @@ def logout_state(store_obj, login_id: str, account_id: str = "") -> dict:
     """
     lid, aid = (login_id or "").strip(), (account_id or "").strip()
     out = {"login_id": lid, "account_id": aid, "held": [], "running": [],
-           "logout_job": None, "pending": False}
+           "logout_job": None, "pending": False, "read_error": ""}
     if not lid and not aid:
         return out
+
+    # ★상태별로 좁혀 조회한다(2026-11-04). 예전에는 `list_jobs(limit=120)` 를 훑어
+    #   그 안에서 held 를 골랐다 — 작업이 많으면 **보류 작업이 조회 창 밖으로
+    #   밀려나 '보류 없음' 으로 보이고**, 로그아웃 대기 중인 계정에 새 발행 작업이
+    #   다시 만들어졌다. held·running 은 몇 건뿐이라 상태로 좁히면 밀리지 않는다.
+    def by_status(status: str, kind: str = "") -> list:
+        return store_obj.list_by_status(status, lid, aid, kind=kind)
+
     try:
-        rows = store_obj.list_jobs(limit=120)
-    except Exception:                                          # noqa: BLE001
-        return out                          # 큐를 못 읽으면 아무것도 단정하지 않는다
-    for rec in rows:
-        if not queue_store.matches(rec, lid, aid):
-            continue
-        status = rec.get("status") or ""
-        if status == queue_store.HELD:
-            out["held"].append(rec)
-        elif status == queue_store.RUNNING and (rec.get("kind") or "run") == "run":
-            out["running"].append(rec)
-        elif is_logout_job(rec) and status in RUNNING_STATES:
-            out["logout_job"] = out["logout_job"] or rec
+        out["held"] = by_status(queue_store.HELD)
+        out["running"] = by_status(queue_store.RUNNING, kind="run")
+        for rec in by_status(queue_store.PENDING) + by_status(queue_store.RUNNING):
+            if is_logout_job(rec):
+                out["logout_job"] = rec
+                break
+    except AttributeError:
+        # 옛 저장소(상태별 조회가 없는 구현) — 예전 방식으로 훑는다.
+        try:
+            rows = store_obj.list_jobs(limit=200)
+        except Exception as exc:                               # noqa: BLE001
+            out["read_error"] = f"{type(exc).__name__}: {exc}"
+            return out
+        for rec in rows:
+            if not queue_store.matches(rec, lid, aid):
+                continue
+            status = rec.get("status") or ""
+            if status == queue_store.HELD:
+                out["held"].append(rec)
+            elif status == queue_store.RUNNING and (rec.get("kind") or "run") == "run":
+                out["running"].append(rec)
+            elif is_logout_job(rec) and status in RUNNING_STATES:
+                out["logout_job"] = out["logout_job"] or rec
+    except Exception as exc:                                   # noqa: BLE001
+        # 큐를 못 읽으면 아무것도 단정하지 않는다 — 다만 **못 읽었다는 사실을 남긴다.**
+        out["read_error"] = f"{type(exc).__name__}: {exc}"
+        return out
+
     out["pending"] = bool(out["held"] or out["logout_job"])
     return out
 
@@ -1082,6 +1105,12 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
         line = grade_line(ready_info)
         if line:
             st.markdown(line)
+
+        # ★큐를 못 읽었으면 '보류 없음' 이 아니라 **모른다**는 뜻이다. 그대로 알린다.
+        if stt.get("read_error"):
+            st.warning("작업 큐를 읽지 못해 **보류 상태를 확인하지 못했습니다** — "
+                       "로그아웃 대기 중일 수 있습니다. 위 [연결 다시 맺기] 뒤 "
+                       f"다시 확인해 주세요.{chr(10)}원인: `{stt['read_error']}`")
 
         if stt["pending"]:
             bits = []

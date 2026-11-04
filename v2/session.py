@@ -120,9 +120,23 @@ async def _open(acc, log, headless: bool, relogin: bool) -> int:
         from . import login_state
         login_state.set_account_map(acc, login_id=acc.login_id, blog_id=blog_id,
                                     ref_tab=acc.ref_tab, brand=acc.brand)
+
+        # ★네이버 인증 ID 읽기 — **기본 꺼짐**(BLOG_READ_LOGIN_ID=1 에서만).
+        #   읽히면 등급이 authenticated 로 올라갈 수 있고, 못 읽으면 예전과 똑같다.
+        #   실패해도 로그인 흐름을 멈추지 않는다(사유만 남긴다).
+        auth_lid = ""
+        try:
+            auth_lid, why_lid = await browser.read_login_id(ctx, log)
+            if not auth_lid:
+                log(f"[검증] 네이버 인증 ID — {why_lid}")
+        except Exception as exc:                               # noqa: BLE001
+            log(f"[검증] 네이버 인증 ID 읽기 실패({type(exc).__name__}) — "
+                f"등급을 올리지 않고 계속합니다")
+
         state = login_state.record_login_result(
             acc, seen_blog_id=blog_id, expected_blog_id=acc.blog_id,
-            expected_login_id=acc.login_id, inherit=bool(headless))
+            expected_login_id=acc.login_id, authenticated_login_id=auth_lid,
+            inherit=bool(headless))
         log(f"[검증] 로그인 계정 확인 수준 = {state['grade']}"
             f"({state['grade_label']}) · 발행 대상 블로그 대조="
             f"{'일치' if state.get('blog_verified') else '확인 불가'}"
@@ -138,6 +152,7 @@ async def _open(acc, log, headless: bool, relogin: bool) -> int:
                   blog_id=blog_id, grade=state["grade"],
                   grade_label=state["grade_label"],
                   blog_verified=bool(state.get("blog_verified")),
+                  auth_id_read=bool(auth_lid),
                   check_mode=login_state.mode())
         return 0
     except Exception as exc:                                   # noqa: BLE001
