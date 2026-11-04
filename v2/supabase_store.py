@@ -351,77 +351,43 @@ class SupabaseStore(JobStore):
             q += f"&payload->>account=eq.{quote(aid, safe='')}"
         return q
 
-    def _rest_range(self, query: str, count: bool = False
-                    ) -> tuple[list[dict], int | None]:
-        """GET 한 번으로 `(행들, 총건수)` 를 함께 받는다 (2026-11-04).
-
-        ★왜 따로 만들었나 — 예전에는 총건수를 세는 요청(`count=exact`)과 행을 받는
-          요청을 **따로** 보내 상태 1종마다 2회, 세 상태에 6회가 나갔다. 운영
-          Supabase 는 statement timeout·connection pool 고갈 이력이 있어 요청 수를
-          줄이는 것이 안전에 직접 도움이 된다.
-          PostgREST 는 `Prefer: count=exact` 를 주면 **같은 응답**의
-          `Content-Range: 0-199/512` 헤더로 총건수를 알려준다 → 1회로 합칠 수 있다.
-        ★같은 응답에서 온 수이므로 '행과 총건수의 스냅샷이 어긋나는' 문제도 줄어든다.
-        ★오류 처리는 `_rest` 와 같다 — 4xx/5xx·네트워크 예외를 그대로 올린다
-          (호출한 쪽이 '확인 불가' 로 다뤄 새 발행을 막는다).
-        """
-        r = self._requests.request(
-            "GET", f"{self.url}/rest/v1/{query}",
-            headers=self._headers({"Prefer": "count=exact",
-                                   "Range-Unit": "items"} if count else None),
-            timeout=TIMEOUT)
-        if not r.ok:
-            raise SupabaseError(
-                f"GET {query} 실패({r.status_code}): {r.text[:200]}",
-                status=r.status_code,
-                definite_failure=400 <= r.status_code < 500)
-        self._last_ok = now_iso()
+    def _count(self, query: str) -> int | None:
+        """그 조건의 **총 건수**. 못 구하면 None(그때는 검증을 건너뛴다)."""
         try:
-            rows = r.json() or []
+            r = self._requests.request(
+                "GET", f"{self.url}/rest/v1/{query}&limit=1",
+                headers=self._headers({"Prefer": "count=exact",
+                                       "Range-Unit": "items", "Range": "0-0"}),
+                timeout=TIMEOUT)
         except Exception:                                      # noqa: BLE001
-            rows = []
-        total = None
-        tail = (r.headers.get("Content-Range") or "").split("/")[-1].strip()
-        if tail.isdigit():
-            total = int(tail)
-        return (rows if isinstance(rows, list) else []), total
+            return None
+        if not r.ok:
+            return None
+        rng = r.headers.get("Content-Range") or ""        # 예: "0-0/37"
+        tail = rng.split("/")[-1].strip()
+        if not tail.isdigit():
+            return None
+        self._last_ok = now_iso()
+        return int(tail)
 
-    def _page_all(self, query: str, cap: int = 0
-                  ) -> tuple[list[dict], int | None, bool]:
-        """페이지를 끝까지 읽어 `(레코드, 총건수, 더 남았나)`. job_id 로 중복 제거.
-
-        ★'끝까지 읽었다' 고 말할 수 있는 근거는 **둘뿐**이다
-            ① 총건수를 받았고 그만큼 다 모았다
-            ② 페이지가 **0행**으로 돌아왔다(그 뒤에 아무것도 없다)
-        ★"요청한 limit 보다 적게 왔다" 는 근거가 **아니다** — PostgREST 의
-          `db-max-rows` 가 limit 보다 작게 설정돼 있으면 매 페이지가 짧게 오고,
-          그걸 '전수' 로 믿으면 오래된 보류를 놓친다. 그래서 짧은 페이지가 와도
-          총건수를 모르면 **다음 페이지를 한 번 더** 확인한다.
-        """
+    def _page_all(self, query: str, cap: int = 0) -> tuple[list[dict], bool]:
+        """페이지를 끝까지 읽어 `(레코드, 더 남았나)`. job_id 로 중복을 없앤다."""
         seen: dict[str, dict] = {}
-        total: int | None = None
-        off = 0
+        more = False
         for page in range(self.MAX_PAGES):
-            rows, got = self._rest_range(
-                f"{query}&offset={off}&limit={self.PAGE}", count=(page == 0))
-            if page == 0:
-                total = got
+            off = page * self.PAGE
+            rows = self._rest("GET", f"{query}&offset={off}&limit={self.PAGE}") or []
             for raw in rows:
                 rec = self._rec(raw)
                 if rec and rec.get("id"):
                     seen[str(rec["id"])] = rec       # ★같은 job_id 는 한 번만
-            if not rows:
-                return list(seen.values()), total, False       # ② 끝(확실)
-            if total is not None and len(seen) >= total:
-                return list(seen.values()), total, False       # ① 끝(확실)
+            if len(rows) < self.PAGE:
+                return list(seen.values()), False
             if cap and len(seen) >= cap:
-                return list(seen.values())[:cap], total, True
-            # ★다음 offset 은 **받은 행 수만큼** 전진시킨다(요청한 크기가 아니다).
-            #   PostgREST 의 `db-max-rows` 가 우리 limit 보다 작으면 응답이 잘려
-            #   오는데, 요청 크기만큼 뛰면 그 사이 구간을 **건너뛴다**
-            #   (실측: cap=100·limit=200·총 250건 → 150건만 받고 조용히 끝났다).
-            off += len(rows)
-        return list(seen.values()), total, True                # 상한 초과
+                return list(seen.values())[:cap], True
+        else:
+            more = True
+        return list(seen.values()), more
 
     def list_by_status(self, status: str, login_id: str = "",
                        account_id: str = "", kind: str = "",
@@ -436,14 +402,16 @@ class SupabaseStore(JobStore):
             return []
         query = self._status_query(want, login_id, account_id, kind)
 
-        recs, total, more = self._page_all(query, cap=int(limit or 0))
+        total = self._count(query)
+        recs, more = self._page_all(query, cap=int(limit or 0))
         if more:
             raise SupabaseError(
                 f"{want} 작업이 너무 많아 끝까지 읽지 못했습니다"
                 f"({self.MAX_PAGES * self.PAGE}행 초과) — 결과를 신뢰할 수 없습니다.")
         if total is not None and len(recs) < total:
             # 그 사이 상태가 바뀌어 수가 어긋날 수 있다 → **한 번 다시** 읽어 본다.
-            recs2, total2, more2 = self._page_all(query, cap=int(limit or 0))
+            total2 = self._count(query)
+            recs2, more2 = self._page_all(query, cap=int(limit or 0))
             if more2:
                 raise SupabaseError(
                     f"{want} 작업이 너무 많아 끝까지 읽지 못했습니다 — "
