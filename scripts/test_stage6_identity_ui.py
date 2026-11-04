@@ -368,10 +368,26 @@ check("  상태 판단이 session_state 에 의존하지 않는다",
 # ══════════════════════════════════════════════════════════════════
 head("⑥ UI 이동 회귀 — 자리만 바뀌고 기능은 그대로인가")
 
-check("★상단 두 칸을 st.columns 로 만든다",
-      '_top_left, _top_right = st.columns([2, 1], gap="large")' in APP)
+check("★화면을 두 칸으로 나눈다(왼쪽 작업 ≈69% / 오른쪽 계정 ≈31%)",
+      'MAIN_COL, SIDE_COL = st.columns([2.2, 1], gap="large")' in APP)
 check("★오른쪽 칸을 자리(st.empty)로 잡아 둔다",
-      "ACCOUNT_BOX = _top_right.empty()" in APP)
+      "ACCOUNT_BOX = SIDE_COL.empty()" in APP)
+#  ★2026-11-04 2차 — 상단을 두 줄로 나눠 놓으니 오른쪽 패널 높이만큼 작업
+#    영역이 아래로 밀려 왼쪽에 큰 공백이 생겼다. 칸을 한 쌍으로 합쳐 해결.
+check("★작업 설정이 **왼쪽 칸 안쪽**에 들어간다(아래로 밀리지 않는다)",
+      "left = MAIN_COL.container()" in APP and "\nwith left:" in APP)
+check("★최근 실행 기록은 **컬럼 밖** 하단 전체 너비다",
+      "right = st.container()" in APP and "\nwith right:" in APP)
+check("  그 그릇은 컬럼을 만든 **뒤에** 생성된다(두 칸 아래에 깔린다)",
+      APP.index("MAIN_COL, SIDE_COL = st.columns")
+      < APP.index("right = st.container()"))
+check("제목·브랜드 정보·연결 경고도 왼쪽 칸 안에 있다",
+      "with MAIN_COL:" in APP
+      and 'st.title("네이버 블로그 랜딩 생성기")' in
+      APP.split("with MAIN_COL:")[1][:400]
+      and "_gap = cloud_not_wired()" in APP.split("with MAIN_COL:")[1][:1200])
+check("기존 작업 설정 블록은 그대로 재사용한다(컬럼 중첩 2단 없음)",
+      "left, right = st.columns([3, 2]" not in APP)
 check("계정이 정해진 뒤 그 자리를 채운다(순서 변경 없음)",
       "with ACCOUNT_BOX.container(border=True):" in APP
       and APP.index("ready_info = session_ready")
