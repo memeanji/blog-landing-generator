@@ -28,8 +28,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .job import Job
-from .queue_store import (CANCELED, DONE, FAILED, HELD, JobStore, PENDING, RUNNING,
-                          host_name, matches, now_iso)
+from .queue_store import (CANCELED, DONE, FAILED, HELD, JobStore, PartialHoldError,
+                          PENDING, RUNNING, host_name, matches, now_iso)
 
 TIMEOUT = 20
 LOG_FLUSH_LINES = 25          # 로그를 이만큼 모으면 보낸다(HTTP 왕복 줄이기)
@@ -263,8 +263,25 @@ class SupabaseStore(JobStore):
             chunk = ids[i:i + 50]
             lst = ",".join(quote(x, safe="") for x in chunk)
             q = f"jobs?job_id=in.({lst})&status=eq.{quote(frm, safe='')}"
-            rows = self._rest("PATCH", q, json={"status": to},
-                              headers={"Prefer": "return=representation"}) or []
+            try:
+                rows = self._rest("PATCH", q, json={"status": to},
+                                  headers={"Prefer": "return=representation"}) or []
+            except Exception as exc:                           # noqa: BLE001
+                # ★앞 묶음은 **이미 서버에 반영돼 있다.** 몇 건이 정말 바뀌었는지
+                #   다시 조회해 확인하고, 그 사실을 예외에 실어 올린다
+                #   (빈손으로 올리면 화면이 '하나도 못 했다' 로 잘못 안내한다).
+                verified = None
+                try:
+                    verified = [str(r.get("id")) for r
+                                in self.list_by_status(to, lid, aid, kind="run")
+                                if r.get("id")]
+                except Exception:                              # noqa: BLE001
+                    verified = None            # 재조회 실패 = **결과 확인 불가**
+                raise PartialHoldError(
+                    f"{frm}→{to} 변경을 일부만 반영한 채 실패했습니다: "
+                    f"{type(exc).__name__}: {exc}",
+                    done=done, verified=verified, remaining=ids[i:],
+                    cause=exc) from exc
             done += [str(r.get("job_id")) for r in rows if r.get("job_id")]
         return done
 
@@ -288,30 +305,128 @@ class SupabaseStore(JobStore):
         rows = self._rest("GET", f"jobs?order=created_at.desc&limit={int(limit)}")
         return [self._rec(r) for r in (rows or [])]
 
+    # ══ 상태별 조회 — 서버 필터 + 실제 페이지네이션 (2026-11-04) ════
+    #   ★왜 이렇게까지 하나 — 이 조회 결과가 '보류 없음' 이면 화면은 그 계정의
+    #     **새 발행을 허용**한다. 그래서 "못 읽었다" 와 "0건" 을 절대 섞으면 안 되고,
+    #     조회가 중간에서 잘려도 0건으로 보여선 안 된다.
+    #   ① 서버에서 status(+kind)로 좁히고, 식별자도 **서버에서** 거른다.
+    #      login_id 는 표기가 두 가지(`a` / `a@naver.com`)이고 대소문자도 섞이므로
+    #      `or=(…ilike.a, …ilike.a@naver.com, …)` 로 후보를 모두 넣는다.
+    #      ※ LIKE 에서 `_` 는 한 글자 와일드카드다 — `shin894894_2` 같은 id 는
+    #        남의 행까지 끌어올 수 있다. 그래서 받아온 뒤 `matches` 로 **다시** 거른다
+    #        (서버 필터는 '덜 가져오는' 쪽이 아니라 '더 가져오는' 쪽으로만 틀린다).
+    #   ② `offset` 페이지네이션으로 **끝까지** 읽는다. 정렬키는 고정
+    #      (`created_at.desc,job_id.desc`) — 안 그러면 페이지가 흔들려 누락이 생긴다.
+    #   ③ `count=exact` 로 총건수를 받아 **받은 수와 맞는지 검증**한다. 모자라면
+    #      한 번 다시 읽고, 그래도 모자라면 **예외**를 던진다(→ 화면은 fail-safe).
+    PAGE = 200                      # 한 번에 받는 행 수
+    MAX_PAGES = 100                 # 20,000행까지. 그보다 많으면 예외(조용히 자르지 않는다)
+
+    def _login_candidates(self, login_id: str) -> list[str]:
+        """서버 필터에 넣을 login_id 표기 후보(정규화 규칙과 같은 집합)."""
+        from .loginid import NAVER_MAIL_DOMAINS, norm_login
+
+        bare = norm_login(login_id)
+        if not bare:
+            return []
+        out = [bare] + [bare + d for d in NAVER_MAIL_DOMAINS]
+        return list(dict.fromkeys(out))
+
+    def _status_query(self, status: str, login_id: str = "",
+                      account_id: str = "", kind: str = "") -> str:
+        from urllib.parse import quote
+
+        q = (f"jobs?status=eq.{quote(status, safe='')}"
+             f"&order=created_at.desc,job_id.desc")
+        if kind:
+            q += f"&kind=eq.{quote(kind, safe='')}"
+        lid, aid = (login_id or "").strip(), (account_id or "").strip()
+        if lid:
+            cands = self._login_candidates(lid)
+            if cands:
+                ors = ",".join(f"payload->>login_id.ilike.{quote(c, safe='')}"
+                               for c in cands)
+                q += f"&or=({ors})"
+        elif aid:
+            q += f"&payload->>account=eq.{quote(aid, safe='')}"
+        return q
+
+    def _count(self, query: str) -> int | None:
+        """그 조건의 **총 건수**. 못 구하면 None(그때는 검증을 건너뛴다)."""
+        try:
+            r = self._requests.request(
+                "GET", f"{self.url}/rest/v1/{query}&limit=1",
+                headers=self._headers({"Prefer": "count=exact",
+                                       "Range-Unit": "items", "Range": "0-0"}),
+                timeout=TIMEOUT)
+        except Exception:                                      # noqa: BLE001
+            return None
+        if not r.ok:
+            return None
+        rng = r.headers.get("Content-Range") or ""        # 예: "0-0/37"
+        tail = rng.split("/")[-1].strip()
+        if not tail.isdigit():
+            return None
+        self._last_ok = now_iso()
+        return int(tail)
+
+    def _page_all(self, query: str, cap: int = 0) -> tuple[list[dict], bool]:
+        """페이지를 끝까지 읽어 `(레코드, 더 남았나)`. job_id 로 중복을 없앤다."""
+        seen: dict[str, dict] = {}
+        more = False
+        for page in range(self.MAX_PAGES):
+            off = page * self.PAGE
+            rows = self._rest("GET", f"{query}&offset={off}&limit={self.PAGE}") or []
+            for raw in rows:
+                rec = self._rec(raw)
+                if rec and rec.get("id"):
+                    seen[str(rec["id"])] = rec       # ★같은 job_id 는 한 번만
+            if len(rows) < self.PAGE:
+                return list(seen.values()), False
+            if cap and len(seen) >= cap:
+                return list(seen.values())[:cap], True
+        else:
+            more = True
+        return list(seen.values()), more
+
     def list_by_status(self, status: str, login_id: str = "",
                        account_id: str = "", kind: str = "",
                        limit: int = 0) -> list[dict]:
-        """**서버에서 상태로 좁혀** 조회한다 → 보류 작업이 조회 창에 밀리지 않는다.
+        """그 상태의 작업을 **빠짐없이** 돌려준다(식별자를 주면 그 계정만).
 
-        ★계정 식별은 받아온 뒤 `matches`(login_id 정규화 포함)로 가린다.
-          서버 필터(`payload->>login_id=eq.…`)는 문자열 정확일치라
-          `shin894894` / `shin894894@naver.com` 표기 차이를 흡수하지 못한다.
-          상태로 좁히면 held·running 은 몇 건뿐이어서 이 방식이 더 안전하다.
+        ★못 읽거나 중간에서 잘리면 **예외**를 던진다 — 빈 목록으로 돌려주지 않는다.
+          호출한 쪽(화면)은 그것을 '확인 불가' 로 다루고 새 발행을 막는다.
         """
-        from urllib.parse import quote
-
         want = (status or "").strip()
         if not want:
             return []
-        q = (f"jobs?status=eq.{quote(want, safe='')}"
-             f"&order=created_at.desc&limit={int(limit or self.SCAN_LIMIT)}")
-        if kind:
-            q += f"&kind=eq.{quote(kind, safe='')}"
-        rows = self._rest("GET", q) or []
-        recs = [r for r in (self._rec(x) for x in rows) if r]
+        query = self._status_query(want, login_id, account_id, kind)
+
+        total = self._count(query)
+        recs, more = self._page_all(query, cap=int(limit or 0))
+        if more:
+            raise SupabaseError(
+                f"{want} 작업이 너무 많아 끝까지 읽지 못했습니다"
+                f"({self.MAX_PAGES * self.PAGE}행 초과) — 결과를 신뢰할 수 없습니다.")
+        if total is not None and len(recs) < total:
+            # 그 사이 상태가 바뀌어 수가 어긋날 수 있다 → **한 번 다시** 읽어 본다.
+            total2 = self._count(query)
+            recs2, more2 = self._page_all(query, cap=int(limit or 0))
+            if more2:
+                raise SupabaseError(
+                    f"{want} 작업이 너무 많아 끝까지 읽지 못했습니다 — "
+                    f"결과를 신뢰할 수 없습니다.")
+            if total2 is not None and len(recs2) < total2:
+                raise SupabaseError(
+                    f"{want} 작업 조회가 중간에서 잘렸습니다 — 서버 {total2}건 중 "
+                    f"{len(recs2)}건만 받았습니다. '보류 없음' 으로 단정하지 않습니다.")
+            recs = recs2
+
         both = not (login_id or "").strip() and not (account_id or "").strip()
+        recs.sort(key=lambda r: (r.get("created_at") or ""), reverse=True)
         if both:
             return recs
+        #  ★서버 필터(ilike)는 느슨하다 → 정규화 규칙으로 **다시** 거른다.
         return [r for r in recs if matches(r, login_id, account_id)]
 
     def accounts_list(self) -> list[dict]:

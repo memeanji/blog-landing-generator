@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -260,9 +261,29 @@ head("C-2. 화면(logout_state) 이 그 보류를 보고 새 작업을 막는가
 src = (ROOT / "streamlit_app.py").read_text(encoding="utf-8")
 tree = ast.parse(src)
 want = {"is_logout_job", "logout_state", "logout_block"}
-ns: dict = {"queue_store": queue_store,
+#  ★운영 코드가 쓰는 모듈 수준 이름을 그대로 넣어 준다(새로 생기면 여기에 추가).
+#    `QUEUE_READ_TRIES/WAIT` = 큐 조회 재시도(2026-11-04).
+ns: dict = {"queue_store": queue_store, "time": time,
             "RUNNING_STATES": (queue_store.PENDING, queue_store.RUNNING),
-            "chr": chr}
+            "QUEUE_READ_TRIES": 2, "QUEUE_READ_WAIT": 0.01, "chr": chr}
+for _node in tree.body:                       # 상수는 소스에서 직접 읽어 맞춘다
+    if not isinstance(_node, ast.Assign) or len(_node.targets) != 1:
+        continue
+    _t = _node.targets[0]
+    _names = ([getattr(e, "id", "") for e in _t.elts]
+              if isinstance(_t, ast.Tuple) else [getattr(_t, "id", "")])
+    if "QUEUE_READ_TRIES" not in _names:
+        continue
+    try:
+        _vals = ast.literal_eval(_node.value)
+    except Exception:                                          # noqa: BLE001
+        continue
+    _vals = _vals if isinstance(_vals, tuple) else (_vals,)
+    for _n, _v in zip(_names, _vals):
+        ns[_n] = _v
+ns["QUEUE_READ_WAIT"] = 0.01                  # 테스트는 기다리지 않는다
+check("재시도 횟수를 운영 코드에서 그대로 읽어 왔다",
+      ns.get("QUEUE_READ_TRIES", 0) >= 2, f"tries={ns.get('QUEUE_READ_TRIES')}")
 picked = []
 for node in tree.body:
     if isinstance(node, ast.FunctionDef) and node.name in want:
@@ -407,7 +428,7 @@ check("재개 PATCH 에도 status 조건이 붙어 있다(held 만)",
       all("status=eq.held" in p for m, p in calls if m == "PATCH"))
 
 check("list_by_status 는 서버에서 상태로 좁힌다(소스 확인)",
-      "jobs?status=eq.{quote(want" in
+      'q = (f"jobs?status=eq.{quote(status' in
       (ROOT / "v2" / "supabase_store.py").read_text(encoding="utf-8"))
 check("claim 경로(claim_job RPC)는 손대지 않았다",
       "update public.jobs j set status = 'running'" in

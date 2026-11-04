@@ -53,6 +53,39 @@ KINDS = ("run", "session")          # run = 랜딩 생성/전환, session = 로�
 #     ② `strict=True` 로 부르면 **폴백하지 않고 예외**를 던진다.
 #     ③ 기본값(strict=False)은 예전과 똑같이 동작한다 — Agent·CLI 영향 없음.
 # ══════════════════════════════════════════════════════════════════
+class PartialHoldError(RuntimeError):
+    """보류/재개를 **일부만** 반영한 채 실패했다 (2026-11-04).
+
+    왜 따로 만들었나
+        보류는 50건씩 나눠 보낸다. 두 번째 묶음이 실패하면 **첫 묶음은 이미
+        서버에 반영된 상태**다. 그런데 평범한 예외로 올려 보내면 반환값(바뀐
+        job_id 목록)이 사라져, 화면은 "하나도 보류하지 못했다" 고 안내한다.
+        실제로는 N 건이 보류돼 있으므로 사용자가 [보류 작업 재개] 를 눌러야 한다.
+
+    들고 있는 것
+        done     : 성공을 **확인한** job_id 목록(서버가 돌려준 것)
+        verified : 실패 직후 **다시 조회한** 실제 그 상태의 job_id 목록.
+                   재조회까지 실패하면 `None` — 그때는 '0건' 이 아니라
+                   **'결과 확인 불가'** 로 안내해야 한다.
+        remaining: 보내지 못한(또는 결과를 모르는) job_id 목록
+    """
+
+    def __init__(self, message: str, *, done=None, verified=None,
+                 remaining=None, cause: BaseException | None = None) -> None:
+        super().__init__(message)
+        self.done = list(done or [])
+        self.verified = None if verified is None else list(verified)
+        self.remaining = list(remaining or [])
+        self.cause = cause
+
+    @property
+    def confirmed(self) -> int:
+        """실제로 바뀐 것으로 **확인된** 건수. 확인 불가면 -1."""
+        if self.verified is not None:
+            return len(self.verified)
+        return len(self.done) if self.done else -1
+
+
 class QueueBackendError(RuntimeError):
     """원격 큐(Supabase)에 붙지 못했다 — 로컬 큐로 숨기지 않고 알린다."""
 

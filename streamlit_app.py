@@ -983,6 +983,11 @@ def is_logout_job(rec: dict) -> bool:
     return "--logout" in list(job.get("extra") or [])
 
 
+#  큐 조회가 일시적으로 실패할 때 다시 시도하는 횟수·간격(2026-11-04).
+#    ★`list_by_status` 자체도 안에서 한 번 더 확인하므로 여기선 짧게만 붙인다.
+QUEUE_READ_TRIES, QUEUE_READ_WAIT = 2, 0.6
+
+
 def logout_state(store_obj, login_id: str, account_id: str = "") -> dict:
     """그 계정의 로그아웃 진행 상태. 큐를 한 번만 읽는다.
 
@@ -1003,13 +1008,30 @@ def logout_state(store_obj, login_id: str, account_id: str = "") -> dict:
     #   그 안에서 held 를 골랐다 — 작업이 많으면 **보류 작업이 조회 창 밖으로
     #   밀려나 '보류 없음' 으로 보이고**, 로그아웃 대기 중인 계정에 새 발행 작업이
     #   다시 만들어졌다. held·running 은 몇 건뿐이라 상태로 좁히면 밀리지 않는다.
+    # ★일시적인 오류는 **제한적으로만** 다시 시도한다(2026-11-04).
+    #   화면을 그릴 때마다 불리는 함수라 길게 매달리면 화면이 멈춘다.
     def by_status(status: str, kind: str = "") -> list:
-        return store_obj.list_by_status(status, lid, aid, kind=kind)
+        last = None
+        for i in range(QUEUE_READ_TRIES):
+            if i:
+                time.sleep(QUEUE_READ_WAIT)
+            try:
+                return store_obj.list_by_status(status, lid, aid, kind=kind)
+            except AttributeError:
+                raise                      # 옛 저장소 → 아래 폴백으로 넘긴다
+            except Exception as exc:                           # noqa: BLE001
+                last = exc
+        raise last if last else RuntimeError("큐를 읽지 못했습니다")
 
     try:
+        # ★조회는 **세 번만** 한다(held · running · pending). running 을 두 번
+        #   읽지 않고 한 번 읽어 나눠 쓴다 — 화면을 그릴 때마다 불리는 함수라
+        #   요청 수를 늘리면 그대로 느려진다.
         out["held"] = by_status(queue_store.HELD)
-        out["running"] = by_status(queue_store.RUNNING, kind="run")
-        for rec in by_status(queue_store.PENDING) + by_status(queue_store.RUNNING):
+        running_all = by_status(queue_store.RUNNING)
+        out["running"] = [r for r in running_all
+                          if (r.get("kind") or "run") == "run"]
+        for rec in by_status(queue_store.PENDING) + running_all:
             if is_logout_job(rec):
                 out["logout_job"] = rec
                 break
@@ -1040,8 +1062,28 @@ def logout_state(store_obj, login_id: str, account_id: str = "") -> dict:
 
 
 def logout_block(store_obj, login_id: str, account_id: str = "") -> str:
-    """로그아웃 대기 중이면 **새 작업을 만들지 못하게** 할 이유를 돌려준다."""
+    """새 작업을 만들지 못하게 할 이유를 돌려준다(없으면 빈 문자열).
+
+    막는 경우
+      ① 그 계정이 로그아웃 대기 중이다(보류 작업·로그아웃 작업이 있다)
+      ② **큐를 읽지 못했다** — 보류가 있는지 없는지 모른다(2026-11-04, fail-safe)
+
+    ★②가 왜 차단인가 — 예전에는 조회 실패를 '보류 없음' 과 같이 다뤄 새 발행이
+      그대로 만들어졌다. 로그아웃을 눌러 둔 계정에 다음 배치가 올라가면
+      사용자 의도와 정반대가 된다. 모르면 막는 쪽이 안전하다.
+    ★이 판단은 **그 계정 하나의 조회 결과**로만 한다. 다른 계정은 각자 자기
+      조회로 판단하므로, 한 계정이 막혀도 나머지는 그대로 발행할 수 있다.
+    """
     stt = logout_state(store_obj, login_id, account_id)
+    who = login_id or f"계정 {account_id}"
+    if stt.get("read_error"):
+        return (f"**{who} 의 보류 작업을 확인하지 못해 새 작업을 만들지 "
+                f"않았습니다**(안전을 위해 막았습니다)."
+                f"{chr(10)}{chr(10)}큐를 읽지 못하면 그 계정이 로그아웃 대기 중인지 "
+                f"알 수 없습니다. 왼쪽 **연결 상태** 에서 [연결 다시 맺기] 를 "
+                f"누른 뒤 다시 시도해 주세요."
+                f"{chr(10)}{chr(10)}원인: `{stt['read_error']}`"
+                f"{chr(10)}{chr(10)}※ 다른 계정의 발행은 영향받지 않습니다.")
     if not stt["pending"]:
         return ""
     bits = []
@@ -1190,8 +1232,36 @@ def do_logout(store_obj, brand, account, login_id: str, device_id: str,
         st.error("이 큐에서는 보류를 지원하지 않습니다 — 로그아웃을 하지 않았습니다.")
         return
     except Exception as exc:                                   # noqa: BLE001
-        st.error(f"대기 작업을 보류하지 못해 **로그아웃을 하지 않았습니다**."
-                 f"{chr(10)}{chr(10)}원인: `{type(exc).__name__}: {exc}`")
+        # ★보류가 **일부만** 반영됐을 수 있다(50건씩 나눠 보낸다).
+        #   그때 "하나도 못 했다" 고 안내하면 사용자가 보류된 작업을 방치한다.
+        #   성공 확인 건수 / 실패 건수를 나눠 보여 주고, 확인조차 못 했으면
+        #   **0건이라고 하지 않고 '확인 불가'** 로 안내한다(2026-11-04).
+        hint = ("{nl}{nl}[보류 작업 재개] 를 눌러 **대기 상태로 되돌린 뒤** 다시 "
+                "시도해 주세요.").format(nl=chr(10))
+        n = getattr(exc, "confirmed", None)
+        if n is None:                              # 부분 실패 정보가 없는 예외
+            held_now = None
+            try:
+                held_now = len(store_obj.held_jobs(login_id, account_id))
+            except Exception:                                  # noqa: BLE001
+                held_now = None
+            n = -1 if held_now is None else held_now
+        if n < 0:
+            st.error(f"대기 작업 보류 결과를 **확인하지 못했습니다** — "
+                     f"보류된 작업이 있을 수 있습니다(0건이 아닙니다). "
+                     f"**로그아웃은 하지 않았습니다.**"
+                     f"{chr(10)}{chr(10)}원인: `{type(exc).__name__}: {exc}`" + hint)
+        elif n:
+            failed = len(getattr(exc, "remaining", []) or [])
+            st.error(f"대기 작업을 **일부만 보류했습니다** — 보류 확인 "
+                     f"**{n}건**"
+                     + (f" · 실패/미확인 **{failed}건**" if failed else "")
+                     + f". **로그아웃은 하지 않았습니다.**"
+                     f"{chr(10)}{chr(10)}원인: `{type(exc).__name__}: {exc}`" + hint)
+        else:
+            st.error(f"대기 작업을 보류하지 못해 **로그아웃을 하지 않았습니다**"
+                     f"(보류된 작업 0건 — 확인했습니다)."
+                     f"{chr(10)}{chr(10)}원인: `{type(exc).__name__}: {exc}`")
         return
 
     running = []
@@ -1217,7 +1287,20 @@ def do_logout(store_obj, brand, account, login_id: str, device_id: str,
                        "[보류 작업 재개] 를 눌러 주세요.")
         return
     st.session_state["job_id"] = res.job_id
-    msg = [f"보류 {len(held)}건"]
+
+    # ★2차 스윕 — 로그아웃 작업을 등록하는 **사이**에 들어온 대기 작업을 한 번 더
+    #   보류한다(2026-11-04). ①보류 → ②등록 순서라, 그 틈에 제출된 작업은
+    #   ①을 지나쳐 pending 으로 남는다. 여기서 한 번 더 긁어 가면 창이 훨씬 좁아진다.
+    #   ※ 창이 **완전히** 닫히지는 않는다(아래 보고서 참고) — DB 수준 처리가 필요하다.
+    swept: list = []
+    try:
+        swept = store_obj.hold_account(login_id, device=device_id or "",
+                                       account_id=account_id)
+    except Exception:                                          # noqa: BLE001
+        swept = []                     # 2차 스윕 실패는 로그아웃을 되돌리지 않는다
+
+    msg = [f"보류 {len(held) + len(swept)}건"
+           + (f"(2차 스윕 {len(swept)}건 포함)" if swept else "")]
     if running:
         msg.append(f"실행 중인 배치 {len(running)}건은 **끝까지 발행**합니다")
     msg.append("그 뒤 로그아웃이 실행됩니다")
@@ -1231,7 +1314,24 @@ def do_resume(store_obj, login_id: str, device_id: str,
         back = store_obj.resume_account(login_id, device=device_id or "",
                                         account_id=account_id)
     except Exception as exc:                                   # noqa: BLE001
-        st.error(f"보류 작업을 재개하지 못했습니다 — `{type(exc).__name__}: {exc}`")
+        # ★재개도 50건씩 나눠 보낸다 → 일부만 되돌아갔을 수 있다.
+        n = getattr(exc, "confirmed", None)
+        if n is None or n < 0:
+            st.error(f"보류 작업 재개 결과를 **확인하지 못했습니다** — 일부가 "
+                     f"되돌아갔을 수 있습니다(0건이 아닙니다). 잠시 뒤 "
+                     f"[보류 작업 재개] 를 다시 눌러 주세요."
+                     f"{chr(10)}{chr(10)}원인: `{type(exc).__name__}: {exc}`")
+        else:
+            st.error(f"보류 작업을 **일부만 재개했습니다** — 재개 확인 **{n}건**. "
+                     f"[보류 작업 재개] 를 다시 누르면 남은 것만 이어서 "
+                     f"되돌립니다(이미 돌아간 것은 다시 건드리지 않습니다)."
+                     f"{chr(10)}{chr(10)}원인: `{type(exc).__name__}: {exc}`")
+        return
+    if not back:
+        # ★중복 재개 방지 — 이미 재개됐으면 아무것도 바꾸지 않고 그렇게 알린다.
+        #   (조건부 UPDATE 라 held 가 아닌 작업은 애초에 대상이 아니다)
+        st.info("되돌릴 보류 작업이 없습니다 — 이미 재개된 상태입니다.")
+        st.rerun()
         return
     st.success(f"보류 작업 {len(back)}건을 다시 대기 상태로 돌렸습니다.")
     st.rerun()
