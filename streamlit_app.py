@@ -1745,10 +1745,16 @@ with left:
         else:
             content_from = "ref"
 
+        # ★key 를 명시한다(2026-11-04). 예전에는 key 가 없어 위젯 id 가 **놓인
+        #   자리**에서 만들어졌다 — 칸·컨테이너 구조를 바꾸면 id 가 달라져
+        #   체크 상태가 기본값으로 돌아갔다. key 를 주면 자리와 무관하게 유지된다.
+        #   ★기본값(value)·disabled·동작은 그대로다.
         show_window = st.checkbox("브라우저 창 보기", value=False,
+                                  key="show_window",
                                   help="끄면 창 없이(headless) 돕니다. "
                                        "로그인할 때만 창이 뜹니다")
         keep_going = st.checkbox("한 건 실패해도 나머지 계속 (실전용)", value=True,
+                                 key="keep_going",
                                  disabled=not is_prod,
                                  help="실패한 건은 발행하지 않고 시트에도 남기지 않습니다. "
                                       "끄면 예전처럼 그 배치를 통째로 멈춥니다")
