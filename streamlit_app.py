@@ -1256,6 +1256,17 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
     st.caption("※ 여기서 하는 일은 **이 계정에만** 적용됩니다. 다른 로그인 계정·"
                "다른 PC 의 세션과 작업은 건드리지 않습니다.")
 
+    # ── 카드 맨 아래 — 참고용 랜딩 기준 시트 바로가기 (2026-11-04 이동) ──
+    #   ★가운데 발행 설정 영역에 있던 버튼을 여기로 옮긴 것이다.
+    #     URL 은 하드코딩하지 않고 **선택한 브랜드 설정**에서 만든다(동작 동일).
+    ref_url = brand.sheet_url(brand.reference_sheet_id) if brand else ""
+    if ref_url:
+        st.divider()
+        st.link_button("📄 랜딩 기준 시트 열기", ref_url,
+                       use_container_width=True,
+                       help=f"{brand.title} 참고용 랜딩 기준 시트가 새 탭에서 "
+                            f"열립니다")
+
 
 def do_logout(store_obj, brand, account, login_id: str, device_id: str,
               account_id: str = "", confirm_shared: bool = False) -> None:
@@ -1653,25 +1664,20 @@ with left:
                                       "목록은 시트에서 자동으로 읽어옵니다")
         account = resolve_account(brand, ref_tab)
 
-        # ── 참고용 랜딩 기준 시트 바로가기 · 선택 계정의 로그인 ID ──
-        #   ★URL 은 하드코딩하지 않고 **선택한 브랜드 설정**에서 만든다.
+        # ── 선택 계정의 로그인 ID ─────────────────────────────────
         #   ★로그인 ID 는 accounts.json(git 제외)에서 읽어 **표시만** 한다.
         #     비밀번호는 저장하지도 보여주지도 않는다.
-        lcol, icol = st.columns([1, 2])
-        ref_url = brand.sheet_url(brand.reference_sheet_id)
-        if ref_url:
-            lcol.link_button(f"📄 {brand.title} 참고용 랜딩 기준 시트 열기", ref_url,
-                             use_container_width=True,
-                             help="새 탭에서 기준시트가 열립니다")
+        #   ★'참고용 랜딩 기준 시트 열기' 버튼은 2026-11-04 에 오른쪽
+        #     **네이버 계정 관리 카드 맨 아래**로 옮겼다(URL·동작은 그대로).
         if account and account.login_id:
-            icol.markdown(info_block((account.title, f"ID: {account.login_id}")),
-                          unsafe_allow_html=True)
+            st.markdown(info_block((account.title, f"ID: {account.login_id}")),
+                        unsafe_allow_html=True)
         elif account:
-            icol.caption(f"{account.title} · 로그인 ID 미등록"
-                         f"(accounts.json 의 login_id 에 적으면 여기에 표시됩니다)")
+            st.caption(f"{account.title} · 로그인 ID 미등록"
+                       f"(accounts.json 의 login_id 에 적으면 여기에 표시됩니다)")
         else:
-            icol.caption("이 기준랜딩 탭은 아직 계정이 없습니다 — "
-                         "[실행 준비] 를 누르면 만들어집니다")
+            st.caption("이 기준랜딩 탭은 아직 계정이 없습니다 — "
+                       "[실행 준비] 를 누르면 만들어집니다")
 
         try:
             cat = load_catalog(brand.id, account.id if account else "", ref_tab)

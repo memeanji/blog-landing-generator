@@ -388,6 +388,28 @@ check("제목·브랜드 정보·연결 경고도 왼쪽 칸 안에 있다",
       and "_gap = cloud_not_wired()" in APP.split("with MAIN_COL:")[1][:1200])
 check("기존 작업 설정 블록은 그대로 재사용한다(컬럼 중첩 2단 없음)",
       "left, right = st.columns([3, 2]" not in APP)
+
+#  ★'랜딩 기준 시트 열기' 버튼 — 발행 설정 영역 → 계정 카드 맨 아래로 이동
+#    (2026-11-04). URL·동작은 그대로고 자리만 바뀌었다.
+check("★시트 열기 버튼이 계정 관리 카드 안에 있다",
+      "랜딩 기준 시트 열기" in panel_src())
+#   ★주석에도 같은 문구가 있으므로 **실제 렌더 호출**만 센다.
+_btn_calls = APP.count('link_button("📄 랜딩 기준 시트 열기"')
+check("★버튼이 **한 곳**뿐이다(중복 없음)", _btn_calls == 1, f"{_btn_calls}곳")
+check("  발행 설정 영역(lcol)에서 제거됐다",
+      "lcol.link_button" not in APP and "lcol, icol = st.columns" not in APP)
+check("  URL 출처가 그대로다(브랜드 설정에서 만든다)",
+      "brand.sheet_url(brand.reference_sheet_id)" in panel_src())
+check("  카드 너비에 맞춘다(use_container_width)",
+      "랜딩 기준 시트 열기" in panel_src()
+      and "use_container_width=True" in
+      panel_src().split("랜딩 기준 시트 열기")[1][:120])
+check("  로그아웃·안내 문구 **아래**에 온다",
+      panel_src().index("이 계정에만** 적용됩니다")
+      < panel_src().index("랜딩 기준 시트 열기"))
+check("  시트 ID 가 없으면 버튼을 그리지 않는다", "if ref_url:" in panel_src())
+check("선택 계정 로그인 ID 표시는 그대로 남아 있다",
+      'info_block((account.title, f"ID: {account.login_id}"))' in APP)
 check("계정이 정해진 뒤 그 자리를 채운다(순서 변경 없음)",
       "with ACCOUNT_BOX.container(border=True):" in APP
       and APP.index("ready_info = session_ready")
