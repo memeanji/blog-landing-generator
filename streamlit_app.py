@@ -1000,7 +1000,8 @@ def logout_state(store_obj, login_id: str, account_id: str = "") -> dict:
     """
     lid, aid = (login_id or "").strip(), (account_id or "").strip()
     out = {"login_id": lid, "account_id": aid, "held": [], "running": [],
-           "logout_job": None, "pending": False, "read_error": ""}
+           "waiting": [], "logout_job": None, "pending": False,
+           "read_error": ""}
     if not lid and not aid:
         return out
 
@@ -1031,7 +1032,12 @@ def logout_state(store_obj, login_id: str, account_id: str = "") -> dict:
         running_all = by_status(queue_store.RUNNING)
         out["running"] = [r for r in running_all
                           if (r.get("kind") or "run") == "run"]
-        for rec in by_status(queue_store.PENDING) + running_all:
+        pending_all = by_status(queue_store.PENDING)
+        #  ★표시용 — 로그아웃 전에 "지금 대기 중인 발행 작업이 몇 건인지" 보여 준다.
+        #    이미 받아 온 목록을 나눠 쓰는 것뿐이고, 조회를 더 하지 않는다.
+        out["waiting"] = [r for r in pending_all
+                          if (r.get("kind") or "run") == "run"]
+        for rec in pending_all + running_all:
             if is_logout_job(rec):
                 out["logout_job"] = rec
                 break
@@ -1046,10 +1052,13 @@ def logout_state(store_obj, login_id: str, account_id: str = "") -> dict:
             if not queue_store.matches(rec, lid, aid):
                 continue
             status = rec.get("status") or ""
+            kind = (rec.get("kind") or "run")
             if status == queue_store.HELD:
                 out["held"].append(rec)
-            elif status == queue_store.RUNNING and (rec.get("kind") or "run") == "run":
+            elif status == queue_store.RUNNING and kind == "run":
                 out["running"].append(rec)
+            elif status == queue_store.PENDING and kind == "run":
+                out["waiting"].append(rec)
             elif is_logout_job(rec) and status in RUNNING_STATES:
                 out["logout_job"] = out["logout_job"] or rec
     except Exception as exc:                                   # noqa: BLE001
@@ -1122,11 +1131,17 @@ def grade_line(ready_info: dict) -> str:
 
 
 def render_account_tools(store_obj, brand, account, ready_info: dict,
-                         device: dict | None = None) -> None:
-    """계정 세션 관리(보조) — 상태확인 / 로그아웃 / 보류 재개.
+                         device: dict | None = None, *,
+                         logged_in: bool | None = None,
+                         job_state: str = "") -> None:
+    """**네이버 계정 관리** — 상태확인 / 로그아웃 / 보류 재개.
 
-    ★기존 발행 흐름(기준랜딩 탭 선택 → 실행 준비 → Dry-run → 실전 실행)은
-      그대로다. 이 영역은 **필요할 때만** 펼쳐 쓰는 보조 기능이다.
+    ★2026-11-04 — 자리만 옮겼다(실행 준비 영역 안의 접힌 패널 → 메인 화면
+      상단 오른쪽). **기능은 하나도 바꾸지 않았다**: 식별자 결정(login_id 1순위,
+      없으면 account.id), `logout_state` 조회, `do_logout`/`do_resume`,
+      버전 게이트, 공유 세션 확인 체크박스가 모두 그대로다.
+    ★`logged_in`·`job_state` 는 **표시용**이다(없으면 그 줄을 생략한다).
+      판단 로직은 호출하는 쪽(기존 실행 준비 영역)이 그대로 갖고 있다.
     """
     device_id = (device or {}).get("device_id") or ""
     can_logout = agent_can_logout(device)
@@ -1135,40 +1150,62 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
     #     그 계정의 유일한 정확한 식별자는 **세션 폴더 이름(account.id)** 이다.
     aid = "" if lid else (getattr(account, "id", "") or "").strip()
     stt = logout_state(store_obj, lid, aid)
-    title = "계정 세션 관리 (보조)"
+
+    st.markdown("##### 🔐 네이버 계정 관리")
+    st.markdown(f"**{account.label or account.id}**")
+    #  ★세션 폴더 이름(account.id)은 화면에 노출하지 않는다(2026-09-17 결정).
+    #    login_id 가 없으면 '이 계정 전용 세션 기준' 이라고만 적는다.
+    st.caption(("아이디 `" + lid + "`") if lid
+               else "login_id 미등록 — 이 계정 전용 세션 기준")
+
+    # ── 로그인 상태(표시용) ──────────────────────────────────────
+    if logged_in is None:
+        pass                               # 호출한 쪽이 알려주지 않았다 → 생략
+    elif logged_in:
+        st.success("● 로그인됨", icon="✅")
+    elif job_state in RUNNING_STATES:
+        st.info("▶ 로그인 진행 중 — PC 에서 네이버 로그인을 마쳐 주세요")
+    else:
+        st.warning("○ 로그인 안 됨 — 아래 **[실행 준비]** 로 로그인해 주세요")
+    line = grade_line(ready_info)
+    if line:
+        st.caption(line.lstrip("· "))
+
+    # ── 이 계정의 작업 현황 ──────────────────────────────────────
+    #   ★로그아웃을 누르기 **전에** 무엇이 멈추고 무엇이 끝까지 가는지 보이게 한다.
+    if stt.get("read_error"):
+        # 큐를 못 읽었으면 '0건' 이 아니라 **모른다**는 뜻이다. 숫자를 지어내지 않는다.
+        st.warning("작업 큐를 읽지 못해 **보류 상태를 확인하지 못했습니다** — "
+                   "로그아웃 대기 중일 수 있습니다. 왼쪽 **연결 상태** 에서 "
+                   "[연결 다시 맺기] 뒤 다시 확인해 주세요."
+                   f"{chr(10)}{chr(10)}이 계정의 새 발행은 **안전을 위해 막혀 "
+                   f"있습니다**(다른 계정은 영향 없음)."
+                   f"{chr(10)}원인: `{stt['read_error']}`")
+    else:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("대기", len(stt.get("waiting") or []),
+                  help="아직 시작하지 않은 발행 작업 — 로그아웃하면 **보류**됩니다")
+        m2.metric("실행 중", len(stt["running"]),
+                  help="지금 돌고 있는 배치 — 로그아웃해도 **끝까지 발행**합니다")
+        m3.metric("보류", len(stt["held"]),
+                  help="로그아웃 때문에 멈춰 둔 작업 — [보류 작업 재개] 로 되돌립니다")
+
     if stt["pending"]:
-        title += " — 로그아웃 대기 중"
-    with st.expander(title, expanded=bool(stt["pending"])):
-        st.caption(f"· 대상 계정: **{account.label or account.id}**"
-                   + (f" (login_id: {lid})" if lid
-                      else " (login_id 미등록 — 이 계정 전용 세션 기준)")
-                   + f"{chr(10)}· 여기서 하는 일은 **이 계정에만** 적용됩니다. "
-                     "다른 로그인 계정의 세션·쿠키는 건드리지 않습니다.")
-        line = grade_line(ready_info)
-        if line:
-            st.markdown(line)
+        bits = []
+        if stt["running"]:
+            bits.append(f"**실행 중인 배치 {len(stt['running'])}건은 끝까지 "
+                        f"발행합니다**(중간에 끊지 않습니다)")
+        if stt["held"]:
+            bits.append(f"대기 작업 {len(stt['held'])}건을 **보류**했습니다")
+        if stt["logout_job"]:
+            bits.append("배치가 끝나면 로그아웃이 실행됩니다")
+        st.warning("로그아웃 대기 — " + " · ".join(bits)
+                   + f"{chr(10)}{chr(10)}재로그인은 아래 **[실행 준비]** 로 하고, 그 뒤 "
+                     "**[보류 작업 재개]** 를 눌러 주세요.")
 
-        # ★큐를 못 읽었으면 '보류 없음' 이 아니라 **모른다**는 뜻이다. 그대로 알린다.
-        if stt.get("read_error"):
-            st.warning("작업 큐를 읽지 못해 **보류 상태를 확인하지 못했습니다** — "
-                       "로그아웃 대기 중일 수 있습니다. 위 [연결 다시 맺기] 뒤 "
-                       f"다시 확인해 주세요.{chr(10)}원인: `{stt['read_error']}`")
-
-        if stt["pending"]:
-            bits = []
-            if stt["running"]:
-                bits.append(f"**실행 중인 배치 {len(stt['running'])}건은 끝까지 "
-                            f"발행합니다**(중간에 끊지 않습니다)")
-            if stt["held"]:
-                bits.append(f"대기 작업 {len(stt['held'])}건을 **보류**했습니다")
-            if stt["logout_job"]:
-                bits.append("배치가 끝나면 로그아웃이 실행됩니다")
-            st.warning("로그아웃 대기 — " + " · ".join(bits)
-                       + f"{chr(10)}{chr(10)}재로그인은 위 **[실행 준비]** 로 하고, 그 뒤 아래 "
-                         "**[보류 작업 재개]** 를 눌러 주세요.")
-
-        c1, c2 = st.columns(2)
-        if c1.button("로그인 상태 다시 확인", use_container_width=True,
+    c1, c2 = st.container(), st.container()
+    with c1:
+        if st.button("로그인 상태 다시 확인", use_container_width=True,
                      disabled=not device_id,
                      help="창을 띄우지 않고 저장된 세션이 살아 있는지, 발행 대상 "
                           "블로그가 맞는지 확인합니다"):
@@ -1180,6 +1217,7 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                 st.toast("로그인 상태를 확인하고 있습니다.")
                 st.rerun()
 
+    with c2:
         if not stt["pending"]:
             #   세션을 공유하는 계정이 있어 **불분명한 경우**에만 체크가 필요하다.
             #   판정은 계정 목록이 있는 PC(Agent)가 하고, 여기서는 그 결과를 보여 준다.
@@ -1189,14 +1227,15 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                 help="PC 에서 '이 세션을 함께 쓰는 계정' 이 발견되면 로그아웃이 "
                      "중단됩니다. 영향 범위를 확인하셨다면 이걸 체크하고 다시 "
                      "눌러 주세요")
-            if c2.button("선택 계정 로그아웃", use_container_width=True,
+            if st.button("선택 계정 로그아웃", use_container_width=True,
                          disabled=not (device_id and (lid or aid) and can_logout),
                          help="이 계정만 로그아웃합니다. 실행 중인 10건 배치는 "
                               "끝까지 발행한 뒤 로그아웃합니다"):
                 do_logout(store_obj, brand, account, lid, device_id,
                           account_id=aid, confirm_shared=bool(shared_ok))
             if not (lid or aid):
-                st.caption("※ 계정을 특정할 수 없습니다(세션 폴더 이름도 비어 있음).")
+                st.caption("※ 계정을 특정할 수 없습니다(세션 폴더 이름도 비어 "
+                           "있음) — 로그아웃 대상을 고르지 않습니다.")
             elif not lid:
                 st.caption("※ login_id 가 등록되지 않은 계정이라 **이 계정 전용 "
                            "세션**만 초기화합니다. blog_id 는 기준으로 쓰지 "
@@ -1210,10 +1249,12 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                            + " 이상**에서 동작합니다. "
                            "왼쪽에서 설치본을 다시 받아 설치하면 열립니다"
                            "(설치해도 저장된 로그인 세션은 그대로입니다).")
-        elif c2.button("보류 작업 재개", type="primary", use_container_width=True,
+        elif st.button("보류 작업 재개", type="primary", use_container_width=True,
                        disabled=not (lid or aid),
                        help="보류해 둔 작업을 다시 대기 상태로 돌립니다"):
             do_resume(store_obj, lid, device_id, account_id=aid)
+    st.caption("※ 여기서 하는 일은 **이 계정에만** 적용됩니다. 다른 로그인 계정·"
+               "다른 PC 의 세션과 작업은 건드리지 않습니다.")
 
 
 def do_logout(store_obj, brand, account, login_id: str, device_id: str,
@@ -1475,10 +1516,26 @@ alive = live_agents(store)          # 실행 에이전트 현황(아래 여러 �
 # 본문
 # ══════════════════════════════════════════════════════════════════
 st.title("네이버 블로그 랜딩 생성기")
-st.markdown(info_block(("브랜드", brand.title),
-                       ("기준시트", brand.reference_title),
-                       ("UTM 빌더", brand.utm_title)),
-            unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════
+# 상단 두 칸 — 왼쪽 정보 / **오른쪽 네이버 계정 관리** (2026-11-04)
+#   ★계정 관리는 예전에 '실행 준비' 영역 안의 접힌 패널이어서 찾기 어려웠다.
+#     그래서 자리만 위로 올린다 — 기능·판단 로직은 그대로다.
+#   ★`st.empty()` 를 먼저 잡아 두고, 아래에서 계정이 정해진 **뒤에** 그 안을
+#     채운다. 계정 선택·로그인 상태 계산 순서를 바꾸지 않기 위해서다
+#     (순서를 바꾸면 기존 발행 흐름을 건드리게 된다).
+# ══════════════════════════════════════════════════════════════════
+_top_left, _top_right = st.columns([2, 1], gap="large")
+with _top_left:
+    st.markdown(info_block(("브랜드", brand.title),
+                           ("기준시트", brand.reference_title),
+                           ("UTM 빌더", brand.utm_title)),
+                unsafe_allow_html=True)
+ACCOUNT_BOX = _top_right.empty()
+with ACCOUNT_BOX.container(border=True):
+    st.markdown("##### 🔐 네이버 계정 관리")
+    st.caption("아래에서 **기준 계정**을 고르면 여기에 로그인 상태와 "
+               "로그아웃·보류 기능이 나타납니다.")
 
 _gap = cloud_not_wired()
 if _gap:
@@ -1857,7 +1914,11 @@ with left:
         #   ★평소 발행에는 **아무것도 누를 필요가 없다.** 접어 둔다.
         #   ★여기서 하는 일은 모두 **고른 계정 하나**에만 적용된다.
         if account:
-            render_account_tools(store, brand, account, ready_info, device)
+            # ★맨 위 오른쪽 칸을 **지금** 채운다(계정·로그인 상태가 정해진 뒤).
+            #   같은 함수를 그대로 쓰므로 로그아웃·보류·재개 동작은 동일하다.
+            with ACCOUNT_BOX.container(border=True):
+                render_account_tools(store, brand, account, ready_info, device,
+                                     logged_in=logged_in, job_state=job_state)
 
         if not agent_ready:
             st.info("이 컴퓨터의 **Agent 가 연결되면** 실행 버튼이 열립니다 "
