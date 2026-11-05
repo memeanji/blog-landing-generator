@@ -553,10 +553,32 @@ locked = ["v2/run.py", "v2/run_production.py", "v2/writer.py",
           "v2/edit_post.py", "v2/sheets.py", "v2/landing_sheet.py",
           "v2/job.py", "v2/batch_plan.py", "v2/agent.py", "agent_tray.py",
           "v2/accounts.py", "v2/session_store.py", "supabase/schema.sql"]
-check("발행·시트·Job·배치·Agent·스키마 파일 무변경",
-      not [f for f in locked if f in diff],
-      f"변경={[f for f in locked if f in diff] or '없음'}")
+#  ★`v2/agent.py` 만 예외다(2026-11-05, 작업 중단 개선으로 승인된 변경).
+#    목록에서 빼 버리면 보호가 사라지므로, **그 파일의 변경이 '집은 직후
+#    취소 확인' 하나뿐인지**를 아래에서 따로 못 박는다.
+_AGENT_OK = "v2/agent.py"
+check("발행·시트·Job·배치·스키마 파일 무변경(Agent 는 아래에서 따로 본다)",
+      not [f for f in locked if f in diff and f != _AGENT_OK],
+      f"변경={[f for f in locked if f in diff and f != _AGENT_OK] or '없음'}")
+
 ag = (ROOT / "v2" / "agent.py").read_text(encoding="utf-8")
+_agent_diff = (subprocess.run(
+    ["git", "-C", str(ROOT), "diff", "-U0", "da602b9", "HEAD", "--", _AGENT_OK],
+    stdout=subprocess.PIPE, encoding="utf-8", errors="replace").stdout or "")
+_added = [l[1:].strip() for l in _agent_diff.splitlines()
+          if l.startswith("+") and not l.startswith("+++")]
+_removed = [l[1:].strip() for l in _agent_diff.splitlines()
+            if l.startswith("-") and not l.startswith("---")]
+check("★Agent 변경은 **더하기만** 이다(기존 줄을 지우지 않았다)",
+      not [l for l in _removed if l], f"지운 줄={_removed[:3]}")
+check("★Agent 에 더한 것은 '집은 직후 취소 확인' 뿐이다",
+      all(("cancel_requested" in l or "CANCELED" in l or "append_log" in l
+           or "_say" in l or "return 130" in l or l.startswith("#") or not l)
+          for l in _added),
+      f"더한 코드 {len([l for l in _added if l and not l.startswith('#')])}줄")
+check("  실행 경로(claim→run_record→finish)는 그대로다",
+      "store.claim(agent_id)" in ag and "runner.start(job" in ag
+      and "store.finish(job_id, status, code)" in ag)
 check("Agent 는 새 API·예외를 쓰지 않는다",
       "list_by_status" not in ag and "PartialHoldError" not in ag
       and "loginid" not in ag)

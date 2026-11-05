@@ -1228,19 +1228,21 @@ def watch_login_wanted() -> bool:
     return bool(seq) and want == seq
 
 
-def store_takes_deadline(store_obj) -> bool:
-    """이 저장소의 `list_by_status` 가 `deadline` 을 받는가(렌더당 1회만 확인).
+def store_takes_deadline(store_obj, method: str = "list_by_status") -> bool:
+    """그 저장소의 `method` 가 `deadline` 을 받는가(렌더당 1회만 확인).
 
     ★`try: ... except TypeError:` 로 떠보지 않는다 — 조회 **안쪽**에서 난 진짜
       TypeError 를 삼켜 '예산 없이 다시 조회' 로 넘어가 버린다.
+    ★`method` 는 2026-11-05 에 더했다(배너의 `list_active` 도 같은 판정이 필요).
+      기본값이 예전 그대로라 **기존 호출부는 한 글자도 바뀌지 않는다.**
     """
     box = render_scope()
-    key = ("takes_deadline", type(store_obj).__name__)
+    key = ("takes_deadline", type(store_obj).__name__, method)
     if key not in box:
         try:
             import inspect
             box[key] = "deadline" in inspect.signature(
-                store_obj.list_by_status).parameters
+                getattr(store_obj, method)).parameters
         except Exception:                                      # noqa: BLE001
             box[key] = False
     return box[key]
@@ -1979,15 +1981,28 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════
 alive = live_agents(store)          # 실행 에이전트 현황(아래 여러 곳에서 쓴다)
 
-#  최근 작업 목록 — **한 번만** 조회해 상단 배너와 '최근 실행 기록' 이 나눠 쓴다.
-#  ★실패를 '없음' 으로 바꾸지 않는다 — 사유를 들고 가서 배너가 그렇게 말한다.
+#  '최근 실행 기록' 목록(최신 20건). 끝난 작업까지 섞인 **표시용**이다.
 JOBS_ERR = ""
 try:
     jobs = store.list_jobs(limit=20)
 except Exception as _exc:                                      # noqa: BLE001
     jobs, JOBS_ERR = None, f"{type(_exc).__name__}: {_exc}"
 
-render_active_banner(store, jobs, JOBS_ERR,
+#  ★배너는 **상태로 좁혀** 따로 조회한다 — '최신 20건' 을 나눠 쓰면 안 된다.
+#    그 창에는 끝난 작업도 들어차므로, 새 작업이 20건 넘게 쌓이면
+#      · 오래 도는 running 이 밀려나고
+#      · **다음에 실행될 가장 오래된 대기**가 먼저 밀려난다
+#    → 배너에서 사라지고 중단 버튼이 없어진다(2026-11-05 재현해서 확인).
+#    요청이 1회 늘지만 결과가 작고(진행 중·대기만) 렌더 예산 안에서 끊긴다.
+ACTIVE_ERR = ""
+try:
+    active = (store.list_active(limit=100, deadline=query_deadline())
+              if store_takes_deadline(store, "list_active")
+              else store.list_active(limit=100))
+except Exception as _exc:                                      # noqa: BLE001
+    active, ACTIVE_ERR = None, f"{type(_exc).__name__}: {_exc}"
+
+render_active_banner(store, active, ACTIVE_ERR,
                      (device or {}).get("device_id") or "")
 
 # ══════════════════════════════════════════════════════════════════

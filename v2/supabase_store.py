@@ -498,6 +498,33 @@ class SupabaseStore(JobStore):
         #  ★서버 필터(ilike)는 느슨하다 → 정규화 규칙으로 **다시** 거른다.
         return [r for r in recs if matches(r, login_id, account_id)]
 
+    def list_active(self, limit: int = 100,
+                    deadline: float | None = None) -> list[dict]:
+        """**진행 중(running) + 대기(pending)** 작업만. 화면 상단 배너가 쓴다.
+
+        ★왜 `list_jobs(limit=20)` 를 쓰면 안 되나 — 그건 `created_at` 내림차순
+          **최신 20건**이다. 그 뒤로 새 작업이 20건 넘게 들어오면
+            · 오래 도는 running 이 창 밖으로 밀려나고
+            · **다음에 실행될 가장 오래된 대기**가 먼저 밀려난다
+          그러면 배너에 안 보이고 **중단 버튼이 사라진다**(2026-11-05 재현).
+          상태로 좁히면 그 창 문제가 사라진다 — 끝난 작업이 끼어들지 않는다.
+        ★정렬은 `created_at.desc, job_id.desc` 로 고정한다(`_status_query` 와 같다)
+          — 안 그러면 페이지가 흔들려 누락이 생긴다.
+        ★`deadline` 을 주면 `_page_all` 이 예산 안에서 끊고, 넘으면 **예외**다.
+          부분 결과를 성공으로 쓰지 않는다 — 화면은 '확인 불가' 로 말한다.
+        """
+        from urllib.parse import quote
+
+        both = ",".join(quote(s, safe="") for s in (PENDING, RUNNING))
+        query = (f"jobs?status=in.({both})"
+                 f"&order=created_at.desc,job_id.desc")
+        recs, _total, _more = self._page_all(query, cap=int(limit or 0),
+                                             deadline=deadline)
+        order = {RUNNING: 0, PENDING: 1}
+        recs.sort(key=lambda r: (order.get(r.get("status"), 9),
+                                 r.get("created_at") or ""))
+        return recs
+
     def accounts_list(self) -> list[dict]:
         """블로그 계정 목록(중앙 관리) — **읽기 전용**.
 

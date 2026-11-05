@@ -422,11 +422,8 @@ check("취소된 작업이 finished 로 남는다",
       (s10.get(r3.job_id) or {}).get("status") == CANCELED)
 
 #  조회 한 번으로 배너와 기록이 같이 돈다(요청 수를 늘리지 않았다)
-#  ★배너를 넣으면서 조회가 **늘지 않았는지**를 본다.
-#    - 본문에서 목록을 받아 두는 곳은 `jobs = store.list_jobs(...)` **한 곳**
-#    - '최근 실행 기록'(`with right:`) 안에서는 **다시 부르지 않는다**
-#    (`session_job()` 안의 호출은 로그인 작업을 찾는 **다른 용도**라 세지 않는다)
-check("★목록을 받아 두는 곳이 한 곳뿐이다",
+#  ★'최근 실행 기록' 은 최신 20건 한 번만 조회한다(그 안에서 다시 부르지 않는다).
+check("★'최근 실행 기록' 목록을 받는 곳이 한 곳뿐이다",
       APP.count("jobs = store.list_jobs(") == 1,
       str(APP.count("jobs = store.list_jobs(")))
 _rb = APP[APP.index("with right:"):]
@@ -434,12 +431,74 @@ _rb = _rb[:_rb.index("# ══", 10)]
 check("  '최근 실행 기록' 은 다시 조회하지 않는다", "list_jobs" not in _rb)
 #  ★`render_active_banner(` 의 첫 등장은 **함수 정의**다 — 호출부와 비교해야 한다.
 check("  배너 호출보다 조회가 먼저 온다",
-      APP.index("jobs = store.list_jobs(")
-      < APP.index("render_active_banner(store, jobs"))
+      APP.index("active = (store.list_active(")
+      < APP.index("render_active_banner(store, active"))
+
+
+head("8. ★최신 N건 창에 밀려 진행 중 작업을 놓치지 않는다")
+
+#  재현 — 오래 도는 작업 1건 + 그 뒤에 들어온 새 작업 25건
+s11 = store()
+old_id = put(s11)
+s11.claim("PC1")                                  # running (오래 돈다)
+for _i in range(25):
+    put(s11)
+win20, _ = active_jobs(s11.list_jobs(limit=20), "PC1")
+act, _ = active_jobs(s11.list_active(limit=100), "PC1")
+pend_ids = [r["id"] for r in s11.list_active(limit=100)
+            if r.get("status") == PENDING]
+check("최신 20건 창으로는 진행 중·대기를 다 못 본다(그래서 바꿨다)",
+      len(win20) < 26, f"{len(win20)}/26")
+check("★list_active 는 진행 중·대기를 **전부** 본다", len(act) == 26, str(len(act)))
+check("  오래 도는 running 이 들어온다",
+      old_id in [r["id"] for r in act])
+check("  ★다음에 실행될 '가장 오래된 대기' 가 들어온다",
+      pend_ids and pend_ids[-1] in [r["id"] for r in act])
+check("  끝난 작업은 섞이지 않는다",
+      all(r.get("status") in (PENDING, RUNNING) for r in act))
+check("  실행 중이 대기보다 먼저 온다",
+      (s11.list_active(limit=100)[0] or {}).get("status") == RUNNING)
+
+#  보류는 여전히 빠진다
+s12 = store()
+j12 = put(s12)
+s12.hold_account("", account_id="acc_a")
+check("보류(held)는 list_active 에 안 나온다",
+      not any(r.get("id") == j12 for r in s12.list_active(limit=100)))
+
+#  기본 구현(이 메서드가 없는 저장소)도 상태로 거른다
+class OnlyList:
+    def __init__(self, rows): self.rows = rows
+    def list_jobs(self, limit=30): return self.rows[:limit]
+
+
+base_rows = [rec("X", status=RUNNING), rec("Y", status=PENDING),
+             rec("Z", status="done"), rec("W", status=HELD)]
+got = queue_store.JobStore.list_active(OnlyList(base_rows), 100)
+check("기본 구현도 진행 중·대기만 고른다",
+      [r["id"] for r in got] == ["X", "Y"], str([r["id"] for r in got]))
+
+#  Supabase — 상태 필터가 서버에서 걸리는지
+#  ★`_page_all` 은 `_rest` 가 아니라 `_rest_range` 를 부른다 — 그쪽을 막아야
+#    실제 HTTP 가 나가지 않는다(처음에 `_rest` 만 막았다가 연결 시도가 났다).
+qseen: list[str] = []
+
+spa = SupabaseStore(mode="service", url="http://127.0.0.1:9", key="dummy")
+spa._rest_range = lambda q, count=False, timeout=None: (      # noqa: SLF001
+    qseen.append(q) or ([], 0))
+spa.list_active(limit=50)
+check("★Supabase 가 status=in.(pending,running) 으로 좁힌다",
+      any("status=in." in q and "pending" in q and "running" in q
+          for q in qseen), str(qseen[:1]))
+check("  정렬키를 고정한다(created_at.desc,job_id.desc)",
+      any("order=created_at.desc,job_id.desc" in q for q in qseen))
+check("  deadline 을 받는다(렌더 예산 안에서 끊긴다)",
+      "deadline" in __import__("inspect").signature(
+          SupabaseStore.list_active).parameters)
 check("  조회 실패를 '진행 중 없음' 으로 바꾸지 않는다",
       "확인하지 못했습니다" in APP)
 check("  배너는 세션 상태가 아니라 큐를 본다",
-      "render_active_banner(store, jobs" in APP)
+      "render_active_banner(store, active" in APP)
 
 print("")
 print("=" * 76)

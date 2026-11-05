@@ -141,6 +141,22 @@ class JobStore(ABC):
     @abstractmethod
     def list_jobs(self, limit: int = 30) -> list[dict]: ...
 
+    def list_active(self, limit: int = 100) -> list[dict]:
+        """진행 중(running) + 대기(pending) 작업만 — 화면 상단 배너용.
+
+        ★`list_jobs(limit=N)` 로 대신하면 안 된다. 그건 **최신 N건**이라
+          새 작업이 N건 넘게 들어오면 오래 도는 작업과 '다음에 실행될 가장
+          오래된 대기' 가 창 밖으로 밀려나 **중단 버튼이 사라진다**.
+        ★기본 구현은 `list_jobs` 를 넉넉히 읽어 걸러 낸다 — 정확도는 떨어지지만
+          이 메서드가 없는 저장소에서도 화면이 돌아가게 하기 위한 것이다.
+        """
+        rows = [r for r in self.list_jobs(limit=max(int(limit or 0), 200))
+                if (r.get("status") or "") in (PENDING, RUNNING)]
+        order = {RUNNING: 0, PENDING: 1}
+        rows.sort(key=lambda r: (order.get(r.get("status"), 9),
+                                 r.get("created_at") or ""))
+        return rows[:limit] if limit else rows
+
     @abstractmethod
     def request_cancel(self, job_id: str) -> None: ...
 
@@ -456,6 +472,24 @@ class LocalStore(JobStore):
                     rows.append(rec)
         rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
         return rows[:limit]
+
+    def list_active(self, limit: int = 100) -> list[dict]:
+        """진행 중·대기 **폴더만** 읽는다 — 최신 N건 창에 밀리지 않는다."""
+        rows: list[dict] = []
+        self._last_ok = now_iso()
+        for state in (RUNNING, PENDING):
+            for p in self._dir(state).glob("*.json"):
+                rec = _read_json(p)
+                if not rec or (rec.get("status") or "") != state:
+                    continue
+                rec.setdefault(
+                    "cancel_requested",
+                    (self.root / "cancel" / str(rec.get("id") or "")).exists())
+                rows.append(rec)
+        order = {RUNNING: 0, PENDING: 1}
+        rows.sort(key=lambda r: (order.get(r.get("status"), 9),
+                                 r.get("created_at") or ""))
+        return rows[:limit] if limit else rows
 
     def list_by_status(self, status: str, login_id: str = "",
                        account_id: str = "", kind: str = "",
