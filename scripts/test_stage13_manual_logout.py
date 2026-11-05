@@ -122,6 +122,33 @@ check("★재확인이 로컬 초기화보다 **먼저** 온다",
       SES.index("_auto_login_recheck(acc, log))")
       < SES.index("session_store.logout(acc, hard=hard)"))
 
+#  ── ★로그아웃 안 하고 창만 닫은 경우 — 아무것도 지우지 않는다 ──────
+check("★로컬 초기화는 **확인된 경우에만** 한다", 'if auto == "clean":' in SES)
+_tail = SES[SES.index("auto = asyncio.run(_auto_login_recheck"):]
+_yes = _tail[:_tail.index("else:")]
+_no = _tail[_tail.index("else:"):_tail.index('local = "cleared"')]
+check("  확인된 쪽에서만 session_store.logout 을 부른다",
+      "session_store.logout(acc, hard=hard)" in _yes
+      and "session_store.logout" not in _no)
+check("  ★확인 안 된 쪽에서는 인증 기록도 지우지 않는다",
+      "clear_auth_state" in _yes and "clear_auth_state" not in _no)
+check("  ★프로필을 보존한다고 표시한다", '"profile_kept": True' in _no)
+check("  왜 안 지웠는지 알려 준다", "로컬 초기화 **안 함**" in _no)
+check("  로그아웃을 안 한 것 같다고 짚어 준다",
+      "창만 닫으신 것" in _no)
+check("  지운 것이 없으면 결과가 nothing_to_clear 다",
+      'local = "cleared" if res["local_cleared"] else "nothing_to_clear"' in SES)
+
+#  ── ★확인 실패를 성공으로 처리하지 않는다 ─────────────────────────
+check("★unknown 이면 종료코드가 1 이다(성공으로 보지 않는다)",
+      'return 0 if server in ("ok", "unknown") and auto != "unknown" else 1'
+      in SES)
+check("  재확인은 쿠키를 **심지 않고** 프로필만 연다",
+      "_restore_cookies" not in
+      SES[SES.index("async def _auto_login_recheck"):SES.index("def cmd_logout")])
+check("  재확인이 실패하면 unknown 이다(성공 아님)",
+      "자동 로그인 재발 확인 실패" in SES and 'return "unknown"' in SES)
+
 
 # ══════════════════════════════════════════════════════════════════
 head("④ 기다리기 — 창을 닫을 때까지 **건드리지 않는다**")

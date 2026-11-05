@@ -377,13 +377,28 @@ def cmd_logout(acc, log, hard: bool = False, confirm_shared: bool = False,
     #      다만 '검증 전에 초기화하지 않는다' 를 코드 순서로도 분명히 해 둔다.
     auto = asyncio.run(_auto_login_recheck(acc, log))
 
-    res = session_store.logout(acc, hard=hard)
-    login_state.clear_auth_state(acc)
-    log(f"[로그아웃] 로컬 초기화 — 지운 항목 {res['local_cleared'] or '없음'}"
-        + (f" · 건너뜀 {res['skipped']}" if res["skipped"] else "")
-        + f" · 프로필 {'보존' if res['profile_kept'] else '삭제'}")
-    if lid:
-        login_state.clear_logout_pending(lid)
+    #  ★로컬 초기화는 **로그아웃이 확인된 경우에만** 한다(2026-11-05).
+    #    사용자가 로그아웃하지 않고 창만 닫았다면(= `auto_login_detected`)
+    #    저장 쿠키와 인증 기록을 지울 이유가 없다 — 지우면 멀쩡한 로그인을
+    #    쓸데없이 깨고, 다음 발행에서 다시 로그인하게 만든다.
+    #    확인하지 못한 경우(`unknown`)도 건드리지 않는다 — 모르는 것을
+    #    '됐다' 로 보고 지우면 안 된다.
+    if auto == "clean":
+        res = session_store.logout(acc, hard=hard)
+        login_state.clear_auth_state(acc)
+        log(f"[로그아웃] 로컬 초기화 — 지운 항목 {res['local_cleared'] or '없음'}"
+            + (f" · 건너뜀 {res['skipped']}" if res["skipped"] else "")
+            + f" · 프로필 {'보존' if res['profile_kept'] else '삭제'}")
+        if lid:
+            login_state.clear_logout_pending(lid)
+    else:
+        res = {"local_cleared": [], "profile_kept": True, "hard": False,
+               "skipped": [], "reason": "로그아웃이 확인되지 않아 보존"}
+        log("[로그아웃] 로컬 초기화 **안 함** — 로그아웃이 확인되지 않았습니다"
+            f"({auto}). 저장된 쿠키·인증 기록·프로필을 그대로 둡니다.")
+        if auto == "auto_login_detected":
+            log("           ※ 네이버에서 로그아웃하지 않고 창만 닫으신 것 "
+                "같습니다. 다시 눌러 주세요.")
 
     local = "cleared" if res["local_cleared"] else "nothing_to_clear"
     log("")
