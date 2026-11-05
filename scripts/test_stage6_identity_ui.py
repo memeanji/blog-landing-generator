@@ -580,11 +580,28 @@ r2 = queue_store.submit_checked(idem, Job(brand="b", account="a",
                                 title="t", target_agent="PC1", client_key=key)
 check("client_key 중복 방지 유지", r1.ok and r2.ok
       and len(idem.list_jobs(limit=50)) == 1)
-check("배포 버전 표기는 한 곳에서만 온다(pairing.AGENT_VERSION)",
-      'AGENT_VERSION = "1.3.0"' in
-      (ROOT / "v2" / "pairing.py").read_text(encoding="utf-8"))
-note("★AGENT_VERSION 이 아직 1.3.0 이다 — 11/03 빌드본(Stage 4·5 미포함)과 "
-     "내용이 달라진다", "재빌드 전에 1.3.1 로 올려야 한다(승인 대기)")
+#  ★배포 번호는 `v2/pairing.py` 한 곳에서만 온다. 번호 자체를 글자로 박으면
+#    올릴 때마다 이 검사가 거짓 실패하므로(2026-11-05 실제 발생), '한 곳에 있고
+#    설치본이 그것과 같은가' 만 본다.
+import re as _re
+
+from v2 import pairing as _pair                                # noqa: E402
+
+_src = (ROOT / "v2" / "pairing.py").read_text(encoding="utf-8")
+_hits = _re.findall(r'^AGENT_VERSION\s*=\s*"([0-9.]+)"', _src, _re.M)
+check("배포 버전 표기가 pairing.py 에 **한 번만** 있다", len(_hits) == 1, str(_hits))
+check(f"설치본(.iss)이 그 번호와 같다 ({_hits[0] if _hits else '?'})",
+      bool(_hits) and f'#define AppVer "{_hits[0]}"' in (
+          ROOT / "installer" / "BlogLandingAgent.iss").read_text(
+          encoding="utf-8-sig"))
+#  ★`NEEDS` 는 **최소 버전**이라 번호를 올려도 따라 올리지 않는다 —
+#    올리면 1.3.0 으로 깔린 PC 의 로그아웃이 잠겨 버린다.
+check("로그아웃 게이트가 현재 번호에서 열린다",
+      bool(_hits) and _pair.supports(_hits[0], "logout") is True,
+      f"NEEDS[logout]={_pair.NEEDS['logout']}")
+check("1.2.5 는 여전히 잠긴다", _pair.supports("1.2.5", "logout") is False)
+note(f"배포 번호 = {_hits[0] if _hits else '?'} — 11/03 빌드본(1.3.0, Stage 4·5 미포함)과 "
+     "하트비트로 구분된다", "NEEDS 는 (1,3,0) 그대로 두어 옛 설치본도 잠기지 않는다")
 
 
 # ══════════════════════════════════════════════════════════════════

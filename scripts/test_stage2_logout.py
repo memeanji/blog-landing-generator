@@ -457,9 +457,12 @@ check("버전을 모르면 잠근다(추측하지 않는다)",
       not pairing.supports("", "logout") and not pairing.supports(None, "logout"))
 check("표에 없는 기능은 막지 않는다(기존 기능 영향 없음)",
       pairing.supports("1.0.0", "login") and pairing.supports("", "check"))
-check("설치본 번호(.iss)도 같이 올라갔다",
-      '#define AppVer "1.3.0"' in (ROOT / "installer" /
-                                   "BlogLandingAgent.iss").read_text(
+#  ★번호를 글자로 박지 않는다 — `pairing.AGENT_VERSION` 하나를 출처로 삼고
+#    설치본(.iss)이 **그것과 같은지**만 본다. 전에는 "1.3.0" 을 박아 두어서
+#    번호를 1.3.1 로 올리자 이 검사가 거짓 실패했다(2026-11-05).
+check(f"설치본 번호(.iss)가 pairing.AGENT_VERSION 과 같다 ({pairing.AGENT_VERSION})",
+      f'#define AppVer "{pairing.AGENT_VERSION}"' in (
+          ROOT / "installer" / "BlogLandingAgent.iss").read_text(
           encoding="utf-8-sig"))
 
 print("")

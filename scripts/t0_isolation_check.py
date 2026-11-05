@@ -256,8 +256,15 @@ else:
             d = json.loads(hb.read_text(encoding="utf-8"))
             print(f"     하트비트: agent={d.get('agent')} "
                   f"version={d.get('version')} state={d.get('state')}")
-            check("  하트비트 version 이 1.3.0(소스 실행)이다",
-                  d.get("version") == "1.3.0", str(d.get("version")))
+            #  ★기대값을 박지 않는다 — `v2/pairing.py` 가 유일한 출처다.
+            #    (부모는 v2 를 import 하지 않는다 — 격리를 깨지 않으려고 글자로 읽는다)
+            import re as _re
+
+            _m = _re.search(r'AGENT_VERSION\s*=\s*"([0-9.]+)"',
+                            (ROOT / "v2" / "pairing.py").read_text(encoding="utf-8"))
+            _want = _m.group(1) if _m else ""
+            check(f"  하트비트 version 이 {_want}(소스 실행)이다",
+                  d.get("version") == _want, str(d.get("version")))
         blob = (rr.stdout or "") + (rr.stderr or "")
         check("★출력에 토큰·비밀번호가 없다",
               not any(k in blob for k in ("device_token", "eyJ", "password",
