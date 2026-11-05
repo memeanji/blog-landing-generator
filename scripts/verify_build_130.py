@@ -194,8 +194,15 @@ check("롤백 설치파일 있음", OLD_SETUP.exists(),
 check("롤백 Agent exe 있음", OLD_EXE.exists())
 check("SHA256SUMS 기록 있음", (RB / "SHA256SUMS-1.2.5.txt").exists())
 if INSTALLED.exists():
-    check("지금 설치돼 실행 중인 것 = 롤백본 1.2.5 (교체하지 않았다)",
-          sha(INSTALLED) == sha(OLD_EXE), sha(INSTALLED)[:16] + "…")
+    #  ★이 검사의 목적은 "이번에 만든 빌드를 **설치하지 않았다**" 를 못 박는 것이다.
+    #    예전에는 '설치본 == 1.2.5 롤백본' 으로 적어 두었는데, 1.3.1 이 깔린 뒤로는
+    #    빌드와 무관하게 실패했다(2026-11-05). 비교 대상을 바꿔 뜻을 되살린다.
+    check("★이번 빌드를 설치하지 않았다(설치본이 새 EXE 와 다르다)",
+          sha(INSTALLED) != sha(NEW_EXE), "설치본 " + sha(INSTALLED)[:16] + "…")
+    _known = {sha(OLD_EXE): "1.2.5(롤백본)"}
+    print(f"       참고 — 지금 설치돼 있는 것: "
+          f"{_known.get(sha(INSTALLED), '1.2.5 롤백본이 아닌 다른 빌드')} "
+          f"· 버전 {version_of(INSTALLED)}")
 
 head("7. 설치 안전성 (정적 확인)")
 new_iss = NEW_ISS.read_text(encoding="utf-8-sig")
