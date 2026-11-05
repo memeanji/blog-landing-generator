@@ -185,6 +185,10 @@ class SupabaseStore(JobStore):
             "published": row.get("published") or [],
             "error": row.get("error") or "",
             "command": row.get("command") or "",
+            #  ★중단 '요청' 이 걸려 있는가. 예전에는 이 값을 버려서 화면이
+            #    '중단을 눌렀는데 아직 도는 중' 과 '그냥 도는 중' 을 구분하지
+            #    못했다. 조회 쿼리는 열을 좁히지 않으므로 그냥 실어 주면 된다.
+            "cancel_requested": bool(row.get("cancel_requested")),
         }
 
     # ══ UI 쪽 (service 모드) ═════════════════════════════════════
@@ -506,6 +510,32 @@ class SupabaseStore(JobStore):
     def request_cancel(self, job_id: str) -> None:
         self._rest("PATCH", f"jobs?job_id=eq.{job_id}",
                    json={"cancel_requested": True})
+
+    def cancel_pending(self, job_id: str) -> bool:
+        """대기 상태일 때만 그 자리에서 `canceled` 로 바꾼다 → 바뀌었으면 True.
+
+        ★`_switch_status`(보류/재개)와 **같은 방식**이다 — `status=eq.pending` 을
+          조건으로 붙여 PATCH 하고 `Prefer: return=representation` 으로 **실제로
+          바뀐 행**을 돌려받는다. 그 사이 Agent 가 집어 간 작업(running)은 조건에
+          걸리지 않으므로 바뀌지 않고, 돌아온 행이 없으니 False 가 된다.
+        ★돌아온 행 수를 **추측하지 않는다.** 0행이면 호출한 쪽이 `request_cancel`
+          로 요청을 남기고, 화면은 '중단됨' 이 아니라 '중단 요청함' 이라고 말한다.
+        """
+        jid = (job_id or "").strip()
+        if not jid:
+            return False
+        if self.mode != "service":
+            raise SupabaseError("대기 작업 취소는 UI(service 모드)에서만 합니다.",
+                                definite_failure=True)
+        from urllib.parse import quote
+
+        q = (f"jobs?job_id=eq.{quote(jid, safe='')}"
+             f"&status=eq.{quote(PENDING, safe='')}")
+        rows = self._rest("PATCH", q,
+                          json={"status": CANCELED, "cancel_requested": True,
+                                "exit_code": 130},
+                          headers={"Prefer": "return=representation"}) or []
+        return bool(rows)
 
     def read_log(self, job_id: str, offset: int = 0) -> tuple[str, int]:
         rows = self._rest(

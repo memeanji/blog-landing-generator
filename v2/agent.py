@@ -75,6 +75,19 @@ def run_record(store: JobStore, rec: dict, agent_id: str) -> int:
         result["code"] = int(code)
         done.set()
 
+    #  ★집은 직후 · **프로세스를 띄우기 전에** 중단 요청을 한 번 본다.
+    #    예전에는 실행을 시작한 뒤 0.4초마다 보는 길밖에 없어서, 대기 중에 취소해
+    #    둔 작업도 **크로미움이 잠깐 떴다가** 죽었다. 사용자가 중단을 누른 뒤에
+    #    새 창이 뜨는 것은 그 자체로 '안 멈췄다' 로 보인다.
+    #    여기서 막으면 띄우지 않고 끝낸다(이미 발행된 글은 건드리지 않는다).
+    #    ※조회가 실패하면 `cancel_requested` 는 False 를 준다 → 예전과 같은 길로
+    #      간다(실행 후 0.4초 루프가 다시 본다). 못 읽었다고 작업을 버리지 않는다.
+    if store.cancel_requested(job_id):
+        store.append_log(job_id, "[agent] 중단 요청이 걸려 있어 실행하지 않습니다")
+        store.finish(job_id, CANCELED, 130)
+        _say(f"중단 — {job_id} (실행 전)")
+        return 130
+
     runner = Runner(on_line=on_line, on_event=on_event, on_exit=on_exit)
     # ★설치본 PC 에는 brands.json 이 없다 — 화면이 실어 보낸 브랜드 설정을
     #   자식 프로세스의 환경변수로 넘긴다(파일이 있으면 파일이 우선).
