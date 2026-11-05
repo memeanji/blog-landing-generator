@@ -605,6 +605,52 @@ def session_job_state(store, account) -> str:
     return (rec or {}).get("status") or ""
 
 
+#  수동 로그아웃 결과 3상태 — **창에서 무엇을 눌렀는지로 판단하지 않는다.**
+#    PC 가 쿠키 없이 그 프로필을 다시 열어 로그인되는지 본 결과(`auto_login`)가
+#    유일한 근거다. 'clean' 이 아니면 로그아웃됐다고 말하지 않는다.
+LOGOUT_VERDICT = {
+    "clean": ("✅ 로그아웃 확인됨",
+              "이 계정은 재로그인이 필요한 상태입니다. 다른 계정으로 로그인해도 "
+              "됩니다."),
+    "auto_login_detected": ("⚠ 아직 로그인돼 있습니다",
+                            "프로필만으로 다시 들어가집니다 — **로그아웃되지 "
+                            "않았습니다.** 창에서 로그아웃을 마쳤는지 확인하고 "
+                            "다시 눌러 주세요."),
+    "unknown": ("❓ 확인하지 못했습니다",
+                "로그아웃됐는지 **알 수 없습니다.** 로그아웃된 것으로 보지 마시고 "
+                "[로그인 상태 다시 확인] 을 눌러 주세요."),
+}
+
+
+def logout_verdict(store_obj, rec: dict | None) -> tuple[str, str, str] | None:
+    """끝난 로그아웃 작업의 결과를 `(상태키, 제목, 설명)` 으로 돌려준다.
+
+    ★`logout_done` 이벤트의 `auto_login` 값만 본다. 작업이 '완료' 로 끝났다는
+      것과 **로그아웃이 됐다는 것은 다른 이야기**다 — 섞으면 안 된다.
+    ★이벤트를 못 읽으면 `unknown` 이다(없는 것을 성공으로 만들지 않는다).
+    """
+    if not rec or not is_logout_job(rec):
+        return None
+    if (rec.get("status") or "") in RUNNING_STATES:
+        return None                       # 아직 진행 중 — 판정하지 않는다
+    try:
+        events, _ = store_obj.read_events(rec.get("id") or "")
+    except Exception:                                          # noqa: BLE001
+        events = []
+    got = ""
+    for ev in reversed(list(events or [])):
+        if (ev or {}).get("event") == "logout_done":
+            got = str(ev.get("auto_login") or "")
+            break
+        if (ev or {}).get("event") == "logout_blocked":
+            return ("blocked", "⛔ 로그아웃하지 않았습니다",
+                    "영향 범위가 확인되지 않아 PC 가 중단했습니다. 아래 "
+                    "'공유 세션 확인' 을 읽고 체크한 뒤 다시 눌러 주세요.")
+    key = got if got in LOGOUT_VERDICT else "unknown"
+    title, desc = LOGOUT_VERDICT[key]
+    return (key, title, desc)
+
+
 def render_progress(store, rec: dict, title: str = "진행 상황") -> None:
     """지금 무엇을 하고 있는지 짧게 보여 준다.
 
@@ -1228,19 +1274,21 @@ def watch_login_wanted() -> bool:
     return bool(seq) and want == seq
 
 
-def store_takes_deadline(store_obj) -> bool:
-    """이 저장소의 `list_by_status` 가 `deadline` 을 받는가(렌더당 1회만 확인).
+def store_takes_deadline(store_obj, method: str = "list_by_status") -> bool:
+    """그 저장소의 `method` 가 `deadline` 을 받는가(렌더당 1회만 확인).
 
     ★`try: ... except TypeError:` 로 떠보지 않는다 — 조회 **안쪽**에서 난 진짜
       TypeError 를 삼켜 '예산 없이 다시 조회' 로 넘어가 버린다.
+    ★`method` 는 2026-11-05 에 더했다(배너의 `list_active` 도 같은 판정이 필요).
+      기본값이 예전 그대로라 **기존 호출부는 한 글자도 바뀌지 않는다.**
     """
     box = render_scope()
-    key = ("takes_deadline", type(store_obj).__name__)
+    key = ("takes_deadline", type(store_obj).__name__, method)
     if key not in box:
         try:
             import inspect
             box[key] = "deadline" in inspect.signature(
-                store_obj.list_by_status).parameters
+                getattr(store_obj, method)).parameters
         except Exception:                                      # noqa: BLE001
             box[key] = False
     return box[key]
@@ -1546,6 +1594,15 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                 st.rerun()
 
     with c2:
+        #  ★직전 로그아웃 결과 — '작업 완료' 가 아니라 **실제 인증 상태**를 말한다.
+        _last = session_job(store_obj, account, getattr(account, "brand", None))
+        _ver = logout_verdict(store_obj, _last)
+        if _ver:
+            _key, _title, _desc = _ver
+            (st.success if _key == "clean" else
+             st.warning if _key == "auto_login_detected" else st.error)(
+                f"**{_title}** — {_desc}")
+
         if not stt["pending"]:
             #   세션을 공유하는 계정이 있어 **불분명한 경우**에만 체크가 필요하다.
             #   판정은 계정 목록이 있는 PC(Agent)가 하고, 여기서는 그 결과를 보여 준다.
@@ -1555,14 +1612,31 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                 help="PC 에서 '이 세션을 함께 쓰는 계정' 이 발견되면 로그아웃이 "
                      "중단됩니다. 영향 범위를 확인하셨다면 이걸 체크하고 다시 "
                      "눌러 주세요")
+            #  ★순차 운영 — 한 계정 발행을 **다 끝낸 뒤** 로그아웃하고 다음
+            #    계정으로 넘어간다. 그래서 그 계정이 **실행 중**이면 막는다.
+            #    (대기 작업은 기존대로 로그아웃이 **보류**로 옮긴다 — 보류·재개
+            #     동작은 바꾸지 않았다.)
+            _busy = list(stt.get("running") or [])
+            if _busy:
+                st.warning(
+                    f"⏳ **이 계정의 발행이 아직 돌고 있습니다({len(_busy)}건)** — "
+                    f"끝난 뒤에 로그아웃해 주세요."
+                    f"{chr(10)}{chr(10)}발행 도중에 로그아웃하면 그 배치가 중간에서 "
+                    f"끊깁니다. 지금 멈춰야 한다면 위 **[진행 중인 작업]** 에서 "
+                    f"중단한 뒤 다시 눌러 주세요.")
             if st.button("선택 계정 로그아웃", use_container_width=True,
-                         disabled=not (device_id and (lid or aid) and can_logout),
-                         help="이 계정만 로그아웃합니다. 실행 중인 10건 배치는 "
-                              "끝까지 발행한 뒤 로그아웃합니다"):
+                         disabled=not (device_id and (lid or aid) and can_logout)
+                         or bool(_busy),
+                         help="이 PC 에서 그 계정의 브라우저 창이 열립니다. "
+                              "네이버 화면에서 **직접 로그아웃**해 주세요"):
                 #  ★보류는 account.id 범위다 — login_id 를 넘기면 같은 네이버 ID 를
                 #    쓰는 **다른 등록**의 대기 작업까지 보류된다(2026-11-05).
                 do_logout(store_obj, brand, account, "", device_id,
                           account_id=aid, confirm_shared=bool(shared_ok))
+            st.caption("※ 로그아웃은 **수동**입니다 — 그 PC 에 브라우저 창이 뜨면 "
+                       "네이버에서 직접 로그아웃해 주세요. 창을 닫거나 "
+                       "로그아웃이 확인되면 PC 가 **실제 로그인 상태를 다시 "
+                       "확인**해 결과를 여기에 보여 줍니다.")
             if not (lid or aid):
                 st.caption("※ 계정을 특정할 수 없습니다(세션 폴더 이름도 비어 "
                            "있음) — 로그아웃 대상을 고르지 않습니다.")
@@ -1722,16 +1796,135 @@ def do_resume(store_obj, login_id: str, device_id: str,
     st.rerun()
 
 
-def cancel_guarded(store_obj, job_id: str, label: str = "작업") -> bool:
-    """중단 요청. 실패를 성공처럼 보이지 않게 **결과를 화면에 알린다**."""
+#  중단 결과 3상태 — '요청' 과 '확정' 을 섞지 않는다.
+CANCEL_DONE, CANCEL_ASKED, CANCEL_FAIL = "canceled", "requested", "failed"
+
+
+def cancel_job(store_obj, job_id: str) -> str:
+    """작업을 중단한다 → `CANCEL_DONE` / `CANCEL_ASKED` / `CANCEL_FAIL`.
+
+    ★두 길이 다르다.
+      · **아직 안 집힌 작업**(pending) — `cancel_pending()` 이 조건부로 그 자리에서
+        `canceled` 로 바꾼다. 바뀌었으면 **확정**이다(PC 는 띄우지도 않는다).
+      · **이미 도는 작업**(running) — 서버에서 상태를 바꾸면 안 된다. 요청만
+        남기고(`request_cancel`) Agent 가 프로세스를 정리한 뒤 스스로 끝낸다.
+    ★`cancel_pending()` 이 False 면 **그 사이 Agent 가 집어 간 것**이다. 그때
+      '취소됐다' 고 말하면 화면과 PC 가 어긋난다 — 그래서 요청으로 내려간다.
+    ★조건부 변경을 못 하는 저장소는 기본 구현이 False 라 예전과 똑같이 '요청' 이다.
+    """
+    jid = (job_id or "").strip()
+    if not jid:
+        return CANCEL_FAIL
     try:
-        store_obj.request_cancel(job_id)
+        if store_obj.cancel_pending(jid):
+            return CANCEL_DONE
+    except Exception:                                          # noqa: BLE001
+        #  조건부 취소가 안 되는 경우(권한·모드·네트워크) — 요청 길로 내려간다.
+        pass
+    try:
+        store_obj.request_cancel(jid)
     except Exception as exc:                                   # noqa: BLE001
-        st.error(f"{label} 중단 요청을 보내지 못했습니다 — **작업은 계속 돌고 "
+        st.error(f"중단 요청을 보내지 못했습니다 — **작업은 계속 돌고 "
                  f"있을 수 있습니다.**{chr(10)}{chr(10)}"
                  f"원인: `{type(exc).__name__}: {exc}`")
-        return False
-    return True
+        return CANCEL_FAIL
+    return CANCEL_ASKED
+
+
+def cancel_guarded(store_obj, job_id: str, label: str = "작업") -> bool:
+    """예전 호출부를 위한 껍데기 — 중단을 '보냈는가' 만 알려 준다.
+
+    ★기존 버튼(배치 전체 중단 등)의 동작을 바꾸지 않으려고 남겨 둔다.
+      3상태가 필요한 곳은 `cancel_job()` 을 직접 쓴다.
+    """
+    return cancel_job(store_obj, job_id) != CANCEL_FAIL
+
+
+# ══════════════════════════════════════════════════════════════════
+# 진행 중 작업 — 화면 **맨 위**에 띄운다
+#   ★왜 만들었나 — 중단 버튼은 전에도 있었지만 화면 **맨 아래 상세 패널**에,
+#     그것도 `session_state["job_id"]` 가 살아 있을 때만 그려졌다. 새로고침하거나
+#     다시 접속하거나 다른 탭에서 넣은 작업이면 **버튼 자체가 사라졌다**.
+#     이 배너는 큐를 보고 그리므로 세션 상태와 무관하다.
+#   ★조회를 늘리지 않는다 — '최근 실행 기록' 이 쓰던 `list_jobs(limit=20)` **하나**를
+#     위로 올려 둘이 나눠 쓴다(요청 수는 그대로다).
+# ══════════════════════════════════════════════════════════════════
+def active_jobs(rows, device_id: str) -> tuple[list, list]:
+    """(이 PC 작업, 다른 PC 작업) — 둘 다 진행 중(running)·대기(pending)만.
+
+    ★권한 — 중단은 **이 화면에서 고른 PC 의 작업**만 할 수 있다. `target_agent`
+      가 다르거나 비어 있으면 '다른 PC' 로 보내 **버튼을 주지 않는다.**
+      다른 사람 PC 에서 돌고 있는 글쓰기를 여기서 끊어 버리면 안 된다.
+    """
+    mine, others = [], []
+    dev = (device_id or "").strip()
+    for r in rows or []:
+        if (r.get("status") or "") not in RUNNING_STATES:
+            continue
+        tgt = (r.get("target_agent") or "").strip()
+        (mine if (dev and tgt == dev) else others).append(r)
+    order = {queue_store.RUNNING: 0, queue_store.PENDING: 1}
+    mine.sort(key=lambda r: (order.get(r.get("status"), 9),
+                            r.get("created_at") or ""))
+    others.sort(key=lambda r: (order.get(r.get("status"), 9),
+                               r.get("created_at") or ""))
+    return mine, others
+
+
+def active_line(rec: dict) -> str:
+    """배너 한 줄 — 무슨 작업이 누구 계정으로 어디까지 갔는지."""
+    job = rec.get("job") or {}
+    who = job.get("account_name") or job.get("account") or "(계정 미상)"
+    total = int(rec.get("total") or 0)
+    made = int(rec.get("made") or 0)
+    done = len(rec.get("published") or [])
+    step = f" · 작성 {made}/{total} · 발행 {done}/{total}" if total else ""
+    badge = BADGE.get(rec.get("status"), rec.get("status"))
+    if rec.get("cancel_requested") and rec.get("status") in RUNNING_STATES:
+        #  ★'요청' 과 '끝남' 은 다르다 — 요청만 간 상태를 그대로 보여 준다.
+        badge = "⏹ 중단 요청됨(정리 중)"
+    return (f"{badge} · **{rec.get('title') or '(제목 없음)'}** · {who}{step}"
+            f" · {(rec.get('created_at') or '')[5:16].replace('T', ' ')}")
+
+
+def render_active_banner(store_obj, rows, err: str, device_id: str) -> None:
+    """진행 중·대기 작업과 **중단 버튼**. 아무것도 없으면 그리지 않는다."""
+    if err:
+        #  ★못 읽은 것을 '진행 중 없음' 으로 보여 주지 않는다(fail-safe 원칙).
+        st.warning(f"⚠ 진행 중 작업을 **확인하지 못했습니다** — 돌고 있는 작업이 "
+                   f"있을 수 있습니다. 아래 '최근 실행 기록' 으로 확인해 주세요."
+                   f"{chr(10)}{chr(10)}원인: `{err}`")
+        return
+    mine, others = active_jobs(rows, device_id)
+    if not mine and not others:
+        return
+    with st.container(border=True):
+        st.markdown("##### ▶ 진행 중인 작업")
+        for rec in mine:
+            c = st.columns([5, 1])
+            c[0].markdown(active_line(rec))
+            asked = bool(rec.get("cancel_requested"))
+            if c[1].button("중단", key=f"stopnow_{rec['id']}",
+                           type="secondary", use_container_width=True,
+                           disabled=asked):
+                res = cancel_job(store_obj, rec["id"])
+                if res == CANCEL_DONE:
+                    st.success("**중단했습니다** — 아직 시작되지 않은 작업이라 "
+                               "PC 에서 창이 뜨지 않습니다.")
+                elif res == CANCEL_ASKED:
+                    st.info("**중단을 요청했습니다** — 이미 실행 중이라 PC 가 "
+                            "브라우저를 정리한 뒤 끝납니다. 아직 '중단됨' 이 "
+                            "아닙니다.{}{}**이미 올라간 글은 지우지 않습니다.**"
+                            .format(chr(10), chr(10)))
+                if res != CANCEL_FAIL:
+                    time.sleep(1.0)
+                    st.rerun()
+            if asked:
+                c[1].caption("요청 보냄")
+        for rec in others:
+            tgt = (rec.get("target_agent") or "").strip() or "(대상 미지정)"
+            st.caption(f"{active_line(rec)} — **다른 PC 작업**({tgt})이라 "
+                       f"여기서는 중단할 수 없습니다.")
 
 
 def submit_guarded(store_obj, job, *, kind: str = "run", title: str = "",
@@ -1859,6 +2052,30 @@ with st.sidebar:
 #     계정마다 기준랜딩 탭(ref_tab)이 다르므로, 그 탭 이름을 그대로 선택지로 쓴다.
 # ══════════════════════════════════════════════════════════════════
 alive = live_agents(store)          # 실행 에이전트 현황(아래 여러 곳에서 쓴다)
+
+#  '최근 실행 기록' 목록(최신 20건). 끝난 작업까지 섞인 **표시용**이다.
+JOBS_ERR = ""
+try:
+    jobs = store.list_jobs(limit=20)
+except Exception as _exc:                                      # noqa: BLE001
+    jobs, JOBS_ERR = None, f"{type(_exc).__name__}: {_exc}"
+
+#  ★배너는 **상태로 좁혀** 따로 조회한다 — '최신 20건' 을 나눠 쓰면 안 된다.
+#    그 창에는 끝난 작업도 들어차므로, 새 작업이 20건 넘게 쌓이면
+#      · 오래 도는 running 이 밀려나고
+#      · **다음에 실행될 가장 오래된 대기**가 먼저 밀려난다
+#    → 배너에서 사라지고 중단 버튼이 없어진다(2026-11-05 재현해서 확인).
+#    요청이 1회 늘지만 결과가 작고(진행 중·대기만) 렌더 예산 안에서 끊긴다.
+ACTIVE_ERR = ""
+try:
+    active = (store.list_active(limit=100, deadline=query_deadline())
+              if store_takes_deadline(store, "list_active")
+              else store.list_active(limit=100))
+except Exception as _exc:                                      # noqa: BLE001
+    active, ACTIVE_ERR = None, f"{type(_exc).__name__}: {_exc}"
+
+render_active_banner(store, active, ACTIVE_ERR,
+                     (device or {}).get("device_id") or "")
 
 # ══════════════════════════════════════════════════════════════════
 # 본문
@@ -2528,8 +2745,10 @@ with left:
 # ── 오른쪽: 최근 실행 기록 ────────────────────────────────────────
 with right:
     st.subheader("최근 실행 기록")
-    jobs = store.list_jobs(limit=20)
-    if not jobs:
+    #  ★위에서 이미 한 번 조회했다(배너와 공유) — 다시 부르지 않는다.
+    if JOBS_ERR:
+        st.error(f"작업 목록을 읽지 못했습니다 — `{JOBS_ERR}`")
+    elif not jobs:
         st.caption("아직 실행한 작업이 없습니다.")
     else:
         st.dataframe([job_summary(r) for r in jobs], use_container_width=True,
@@ -2561,11 +2780,25 @@ else:
     head[2].metric("작성", made)
     head[3].metric("발행", len(published))
     if status in RUNNING_STATES:
-        if head[4].button("중단", type="secondary", use_container_width=True):
-            if cancel_guarded(store, rec["id"]):
-                st.toast("중단을 요청했습니다.")
+        #  ★권한 — 이 화면에서 고른 PC 의 작업만 끊는다(다른 PC 작업은 잠근다).
+        _mine = ((rec.get("target_agent") or "").strip()
+                 and (rec.get("target_agent") or "").strip()
+                 == ((device or {}).get("device_id") or "").strip())
+        _asked = bool(rec.get("cancel_requested"))
+        if head[4].button("중단", type="secondary", use_container_width=True,
+                          disabled=not _mine or _asked):
+            res = cancel_job(store, rec["id"])
+            if res == CANCEL_DONE:
+                st.toast("중단했습니다(시작 전).")
+            elif res == CANCEL_ASKED:
+                st.toast("중단을 요청했습니다 — 정리 중입니다.")
+            if res != CANCEL_FAIL:
                 time.sleep(1.0)
                 st.rerun()
+        if _asked:
+            head[4].caption("요청 보냄 · 정리 중")
+        elif not _mine:
+            head[4].caption("다른 PC 작업")
     else:
         head[4].caption(f"코드 {rec.get('exit_code')}")
 

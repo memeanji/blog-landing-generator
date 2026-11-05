@@ -141,8 +141,43 @@ class JobStore(ABC):
     @abstractmethod
     def list_jobs(self, limit: int = 30) -> list[dict]: ...
 
+    def list_active(self, limit: int = 100) -> list[dict]:
+        """진행 중(running) + 대기(pending) 작업만 — 화면 상단 배너용.
+
+        ★`list_jobs(limit=N)` 로 대신하면 안 된다. 그건 **최신 N건**이라
+          새 작업이 N건 넘게 들어오면 오래 도는 작업과 '다음에 실행될 가장
+          오래된 대기' 가 창 밖으로 밀려나 **중단 버튼이 사라진다**.
+        ★기본 구현은 `list_jobs` 를 넉넉히 읽어 걸러 낸다 — 정확도는 떨어지지만
+          이 메서드가 없는 저장소에서도 화면이 돌아가게 하기 위한 것이다.
+        """
+        rows = [r for r in self.list_jobs(limit=max(int(limit or 0), 200))
+                if (r.get("status") or "") in (PENDING, RUNNING)]
+        order = {RUNNING: 0, PENDING: 1}
+        rows.sort(key=lambda r: (order.get(r.get("status"), 9),
+                                 r.get("created_at") or ""))
+        return rows[:limit] if limit else rows
+
     @abstractmethod
     def request_cancel(self, job_id: str) -> None: ...
+
+    def cancel_pending(self, job_id: str) -> bool:
+        """**아직 집히지 않은** 작업만 그 자리에서 `canceled` 로 바꾼다.
+
+        돌려주는 값
+          `True`  — 이 호출이 **대기 상태였던 작업을 실제로 취소했다**(확정).
+          `False` — 대기 상태가 아니었다(이미 Agent 가 집어 갔거나 끝났다).
+                    그때는 호출한 쪽이 `request_cancel()` 로 **요청**을 남긴다.
+
+        ★왜 따로 두나 — `request_cancel` 은 '요청' 일 뿐이라 Agent 가 그 작업을
+          집어 **프로세스를 띄운 뒤에야** 반응한다. 대기 작업은 띄울 필요가 없다.
+        ★경합 — 바로 이 순간 Agent 가 `claim()` 할 수 있다. 그래서 구현은 반드시
+          **조건부**(대기 상태일 때만 바뀜)여야 하고, 바뀌었는지를 되돌려 줘야 한다.
+          추측으로 `True` 를 돌려주면 화면이 '취소됨' 이라고 말하는데 PC 에서는
+          글이 올라가는, 가장 나쁜 불일치가 생긴다.
+        ★기본 구현은 **아무것도 하지 않고 False** — 조건부 변경을 보장할 수 없는
+          저장소는 이 길을 쓰지 않는다(= 지금까지와 똑같이 동작한다).
+        """
+        return False
 
     @abstractmethod
     def read_log(self, job_id: str, offset: int = 0) -> tuple[str, int]: ...
@@ -402,7 +437,13 @@ class LocalStore(JobStore):
 
     def get(self, job_id: str) -> dict | None:
         _state, path = self._find(job_id)
-        return _read_json(path) if path else None
+        rec = _read_json(path) if path else None
+        if rec is not None:
+            #  ★중단 '요청' 표시를 레코드에 실어 준다 — 화면이 '요청됨' 과
+            #    '중단됨' 을 구분할 수 있어야 한다(원격 큐도 같은 이름의 열을 준다).
+            rec.setdefault("cancel_requested",
+                           (self.root / "cancel" / str(job_id)).exists())
+        return rec
 
     def find_by_client_key(self, client_key: str) -> dict | None:
         key = (client_key or "").strip()
@@ -424,9 +465,31 @@ class LocalStore(JobStore):
             for p in self._dir(state).glob("*.json"):
                 rec = _read_json(p)
                 if rec:
+                    #  중단 '요청' 표시를 함께 싣는다(화면이 구분해 보여 준다).
+                    rec.setdefault(
+                        "cancel_requested",
+                        (self.root / "cancel" / str(rec.get("id") or "")).exists())
                     rows.append(rec)
         rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
         return rows[:limit]
+
+    def list_active(self, limit: int = 100) -> list[dict]:
+        """진행 중·대기 **폴더만** 읽는다 — 최신 N건 창에 밀리지 않는다."""
+        rows: list[dict] = []
+        self._last_ok = now_iso()
+        for state in (RUNNING, PENDING):
+            for p in self._dir(state).glob("*.json"):
+                rec = _read_json(p)
+                if not rec or (rec.get("status") or "") != state:
+                    continue
+                rec.setdefault(
+                    "cancel_requested",
+                    (self.root / "cancel" / str(rec.get("id") or "")).exists())
+                rows.append(rec)
+        order = {RUNNING: 0, PENDING: 1}
+        rows.sort(key=lambda r: (order.get(r.get("status"), 9),
+                                 r.get("created_at") or ""))
+        return rows[:limit] if limit else rows
 
     def list_by_status(self, status: str, login_id: str = "",
                        account_id: str = "", kind: str = "",
@@ -583,6 +646,34 @@ class LocalStore(JobStore):
 
     def cancel_requested(self, job_id: str) -> bool:
         return (self.root / "cancel" / job_id).exists()
+
+    def cancel_pending(self, job_id: str) -> bool:
+        """대기 폴더에 **아직 있을 때만** 옮겨서 취소한다(원자적).
+
+        ★`os.rename` 이 경합을 가른다 — `claim()` 이 같은 파일을 running 으로
+          옮기는 것과 똑같은 방식이다. 둘이 동시에 걸면 한쪽만 성공하고
+          진 쪽은 `OSError` 를 받아 `False` 가 된다.
+        """
+        src = self._dir(PENDING) / f"{job_id}.json"
+        dst = self._dir("finished") / f"{job_id}.json"
+        if not src.exists():
+            return False
+        try:
+            os.rename(src, dst)                     # ★원자적 — 진 쪽은 예외
+        except OSError:
+            return False                            # 그 사이 Agent 가 집어 갔다
+        rec = _read_json(dst) or {}
+        rec.update({"status": CANCELED, "exit_code": 130,
+                    "cancel_requested": True, "finished_at": now_iso()})
+        _atomic_write(dst, json.dumps(rec, ensure_ascii=False, indent=1))
+        #  요청 표시는 남겨 두지 않는다 — 이미 끝난 작업이다.
+        marker = self.root / "cancel" / job_id
+        if marker.exists():
+            try:
+                marker.unlink()
+            except Exception:                                  # noqa: BLE001
+                pass
+        return True
 
     # ── 페어링(로컬 mock) ────────────────────────────────────────
     #   ★Supabase 를 붙이기 전에도 화면 흐름을 그대로 검증하기 위한 것.

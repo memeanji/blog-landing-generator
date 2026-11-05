@@ -37,6 +37,11 @@ def parse_args(argv=None):
     p.add_argument("--hard", action="store_true",
                    help="--logout 시 프로필 안 로그인 파일까지 지운다"
                         "(별도 승인 기능: BLOG_ALLOW_HARD_LOGOUT=1 필요)")
+    #  ★기본은 **수동**이다 — 창을 띄워 사람이 직접 로그아웃한다.
+    #    옛 자동 경로는 지우지 않고 이 플래그로 남겨 둔다(되돌릴 때 코드를 안 고친다).
+    p.add_argument("--auto", action="store_true",
+                   help="--logout 을 **프로그램이** 수행한다(예전 방식). "
+                        "기본은 창을 띄워 사람이 직접 로그아웃하는 수동 방식이다.")
     p.add_argument("--confirm", metavar="ACCOUNT",
                    help="사용자가 계정을 확인했다고 기록한다(manual 등급, 인증 아님)")
     p.add_argument("--confirm-shared", action="store_true",
@@ -219,6 +224,49 @@ async def _server_logout(acc, log) -> str:
                 pass
 
 
+async def _manual_logout(acc, log) -> str:
+    """★기존 Chromium 프로필로 **창을 띄워** 사람이 직접 로그아웃하게 한다.
+
+    `ok` / `unknown` 을 돌려준다(최종 판정은 뒤의 재확인이 한다).
+
+    ★`_server_logout` 과 다른 점은 **딱 두 가지**다 — 창을 띄우고(headless=False),
+      로그아웃 주소로 보내는 대신 **사람을 기다린다**. 프로필·쿠키 취급은 같다.
+    ★새 프로필을 만들지 않는다 — `load_settings(account=acc)` 가 가리키는
+      `sessions/<account.id>/profile` 을 그대로 연다.
+    ★쿠키를 **지우지 않는다.** 저장 세션을 복원해 로그인된 상태로 보여 줘야
+      사용자가 로그아웃을 누를 수 있다(지우면 로그인 화면이 떠 버린다).
+      로컬 초기화는 이 함수가 끝난 뒤 `session_store.logout()` 이 한다.
+    """
+    from dataclasses import replace
+
+    from . import browser, session_store
+    settings = replace(load_settings(account=acc), headless=False)
+    pw = ctx = None
+    try:
+        pw, ctx = await browser.launch(settings, log)
+        cookies = session_store.load_cookies(acc)
+        if cookies:
+            await browser._restore_cookies(ctx, cookies, log)
+        else:
+            log("[로그아웃] 저장된 쿠키가 없습니다 — 프로필에 남은 세션으로 엽니다")
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await page.goto(settings.blog_home_url, wait_until="domcontentloaded")
+        return await browser.wait_manual_logout(
+            ctx, log, blog_home_url=settings.blog_home_url)
+    except Exception as exc:                                   # noqa: BLE001
+        log(f"[로그아웃] 창을 띄우지 못했습니다({type(exc).__name__}: {exc})"
+            f" — '확인 불가' 로 둡니다")
+        return "unknown"
+    finally:
+        for close in (getattr(ctx, "close", None), getattr(pw, "stop", None)):
+            if close is None:
+                continue
+            try:
+                await close()
+            except Exception:                                  # noqa: BLE001
+                pass
+
+
 async def _auto_login_recheck(acc, log) -> str:
     """로그아웃 뒤 **자동 로그인이 되살아나는지** 확인한다(쿠키를 심지 않고 띄운다).
 
@@ -251,8 +299,15 @@ async def _auto_login_recheck(acc, log) -> str:
                 pass
 
 
-def cmd_logout(acc, log, hard: bool = False, confirm_shared: bool = False) -> int:
-    """선택 계정 로그아웃 — 서버/로컬 결과를 **따로** 보고한다."""
+def cmd_logout(acc, log, hard: bool = False, confirm_shared: bool = False,
+               auto: bool = False) -> int:
+    """선택 계정 로그아웃 — 서버/로컬 결과를 **따로** 보고한다.
+
+    ★2026-11-05 — 기본이 **수동**이 됐다. 선택 계정의 기존 Chromium 창을 띄워
+      사용자가 네이버에서 직접 로그아웃한다. `auto=True`(`--auto`)면 예전처럼
+      프로그램이 로그아웃 주소로 보낸다 — **옛 경로를 지우지 않았다.**
+      바뀐 것은 가운데 한 단계뿐이고, 영향 범위 판정·로컬 초기화·재확인은 그대로다.
+    """
     import os
 
     from . import login_state, session_store
@@ -297,7 +352,11 @@ def cmd_logout(acc, log, hard: bool = False, confirm_shared: bool = False) -> in
             "(BLOG_ALLOW_HARD_LOGOUT=1 이 없어 중단).")
         return 1
 
-    server = asyncio.run(_server_logout(acc, log))
+    if auto:
+        log("[로그아웃] 자동 모드(--auto) — 프로그램이 로그아웃합니다.")
+        server = asyncio.run(_server_logout(acc, log))
+    else:
+        server = asyncio.run(_manual_logout(acc, log))
 
     if hard:
         ok, why = session_store.browser_closed(acc)
@@ -398,7 +457,8 @@ def main(argv=None) -> int:
         if args.logout:
             return cmd_logout(acc, log, hard=bool(args.hard),
                               confirm_shared=bool(getattr(args, "confirm_shared",
-                                                          False)))
+                                                          False)),
+                              auto=bool(getattr(args, "auto", False)))
         if args.confirm:
             return cmd_confirm(acc, log)
         if args.login:

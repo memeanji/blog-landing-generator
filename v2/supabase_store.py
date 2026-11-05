@@ -185,6 +185,10 @@ class SupabaseStore(JobStore):
             "published": row.get("published") or [],
             "error": row.get("error") or "",
             "command": row.get("command") or "",
+            #  ★중단 '요청' 이 걸려 있는가. 예전에는 이 값을 버려서 화면이
+            #    '중단을 눌렀는데 아직 도는 중' 과 '그냥 도는 중' 을 구분하지
+            #    못했다. 조회 쿼리는 열을 좁히지 않으므로 그냥 실어 주면 된다.
+            "cancel_requested": bool(row.get("cancel_requested")),
         }
 
     # ══ UI 쪽 (service 모드) ═════════════════════════════════════
@@ -494,6 +498,33 @@ class SupabaseStore(JobStore):
         #  ★서버 필터(ilike)는 느슨하다 → 정규화 규칙으로 **다시** 거른다.
         return [r for r in recs if matches(r, login_id, account_id)]
 
+    def list_active(self, limit: int = 100,
+                    deadline: float | None = None) -> list[dict]:
+        """**진행 중(running) + 대기(pending)** 작업만. 화면 상단 배너가 쓴다.
+
+        ★왜 `list_jobs(limit=20)` 를 쓰면 안 되나 — 그건 `created_at` 내림차순
+          **최신 20건**이다. 그 뒤로 새 작업이 20건 넘게 들어오면
+            · 오래 도는 running 이 창 밖으로 밀려나고
+            · **다음에 실행될 가장 오래된 대기**가 먼저 밀려난다
+          그러면 배너에 안 보이고 **중단 버튼이 사라진다**(2026-11-05 재현).
+          상태로 좁히면 그 창 문제가 사라진다 — 끝난 작업이 끼어들지 않는다.
+        ★정렬은 `created_at.desc, job_id.desc` 로 고정한다(`_status_query` 와 같다)
+          — 안 그러면 페이지가 흔들려 누락이 생긴다.
+        ★`deadline` 을 주면 `_page_all` 이 예산 안에서 끊고, 넘으면 **예외**다.
+          부분 결과를 성공으로 쓰지 않는다 — 화면은 '확인 불가' 로 말한다.
+        """
+        from urllib.parse import quote
+
+        both = ",".join(quote(s, safe="") for s in (PENDING, RUNNING))
+        query = (f"jobs?status=in.({both})"
+                 f"&order=created_at.desc,job_id.desc")
+        recs, _total, _more = self._page_all(query, cap=int(limit or 0),
+                                             deadline=deadline)
+        order = {RUNNING: 0, PENDING: 1}
+        recs.sort(key=lambda r: (order.get(r.get("status"), 9),
+                                 r.get("created_at") or ""))
+        return recs
+
     def accounts_list(self) -> list[dict]:
         """블로그 계정 목록(중앙 관리) — **읽기 전용**.
 
@@ -506,6 +537,32 @@ class SupabaseStore(JobStore):
     def request_cancel(self, job_id: str) -> None:
         self._rest("PATCH", f"jobs?job_id=eq.{job_id}",
                    json={"cancel_requested": True})
+
+    def cancel_pending(self, job_id: str) -> bool:
+        """대기 상태일 때만 그 자리에서 `canceled` 로 바꾼다 → 바뀌었으면 True.
+
+        ★`_switch_status`(보류/재개)와 **같은 방식**이다 — `status=eq.pending` 을
+          조건으로 붙여 PATCH 하고 `Prefer: return=representation` 으로 **실제로
+          바뀐 행**을 돌려받는다. 그 사이 Agent 가 집어 간 작업(running)은 조건에
+          걸리지 않으므로 바뀌지 않고, 돌아온 행이 없으니 False 가 된다.
+        ★돌아온 행 수를 **추측하지 않는다.** 0행이면 호출한 쪽이 `request_cancel`
+          로 요청을 남기고, 화면은 '중단됨' 이 아니라 '중단 요청함' 이라고 말한다.
+        """
+        jid = (job_id or "").strip()
+        if not jid:
+            return False
+        if self.mode != "service":
+            raise SupabaseError("대기 작업 취소는 UI(service 모드)에서만 합니다.",
+                                definite_failure=True)
+        from urllib.parse import quote
+
+        q = (f"jobs?job_id=eq.{quote(jid, safe='')}"
+             f"&status=eq.{quote(PENDING, safe='')}")
+        rows = self._rest("PATCH", q,
+                          json={"status": CANCELED, "cancel_requested": True,
+                                "exit_code": 130},
+                          headers={"Prefer": "return=representation"}) or []
+        return bool(rows)
 
     def read_log(self, job_id: str, offset: int = 0) -> tuple[str, int]:
         rows = self._rest(
