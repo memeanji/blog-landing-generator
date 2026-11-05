@@ -18,7 +18,22 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+# ★화면 테스트(AppTest)는 **기준시트 탭 목록**을 읽어야 본문까지 그려진다.
+#   없으면 `st.stop()` 으로 끝나 아래쪽(제출 확인 패널 등)을 검증할 수 없었다
+#   (2026-11-04 확인). 그래서 운영 설정에 기대지 않고 **합성 fixture** 를 만들어
+#   그 폴더를 데이터 폴더로 쓴다 — 운영 brands.json·accounts.json·세션·큐를
+#   읽지도 쓰지도 않는다. 밖에서 BLOG_DATA_DIR 을 준 경우에는 그것을 존중한다.
+if not (os.getenv("BLOG_DATA_DIR") or "").strip():
+    import make_test_fixture                                   # noqa: E402
+
+    _FIX = Path(tempfile.mkdtemp(prefix="blog_stage1_fixture_"))
+    make_test_fixture.build(_FIX)                              # 작업은 만들지 않는다
+    os.environ["BLOG_DATA_DIR"] = str(_FIX)
+    os.environ.setdefault("BLOG_ACCOUNTS_REMOTE", "0")
+    print(f"(테스트 fixture: {_FIX})")
 
 from v2 import queue_store, timeutil                           # noqa: E402
 from v2.job import Job                                         # noqa: E402

@@ -120,9 +120,23 @@ async def _open(acc, log, headless: bool, relogin: bool) -> int:
         from . import login_state
         login_state.set_account_map(acc, login_id=acc.login_id, blog_id=blog_id,
                                     ref_tab=acc.ref_tab, brand=acc.brand)
+
+        # ★네이버 인증 ID 읽기 — **기본 꺼짐**(BLOG_READ_LOGIN_ID=1 에서만).
+        #   읽히면 등급이 authenticated 로 올라갈 수 있고, 못 읽으면 예전과 똑같다.
+        #   실패해도 로그인 흐름을 멈추지 않는다(사유만 남긴다).
+        auth_lid = ""
+        try:
+            auth_lid, why_lid = await browser.read_login_id(ctx, log)
+            if not auth_lid:
+                log(f"[검증] 네이버 인증 ID — {why_lid}")
+        except Exception as exc:                               # noqa: BLE001
+            log(f"[검증] 네이버 인증 ID 읽기 실패({type(exc).__name__}) — "
+                f"등급을 올리지 않고 계속합니다")
+
         state = login_state.record_login_result(
             acc, seen_blog_id=blog_id, expected_blog_id=acc.blog_id,
-            expected_login_id=acc.login_id, inherit=bool(headless))
+            expected_login_id=acc.login_id, authenticated_login_id=auth_lid,
+            inherit=bool(headless))
         log(f"[검증] 로그인 계정 확인 수준 = {state['grade']}"
             f"({state['grade_label']}) · 발행 대상 블로그 대조="
             f"{'일치' if state.get('blog_verified') else '확인 불가'}"
@@ -138,6 +152,7 @@ async def _open(acc, log, headless: bool, relogin: bool) -> int:
                   blog_id=blog_id, grade=state["grade"],
                   grade_label=state["grade_label"],
                   blog_verified=bool(state.get("blog_verified")),
+                  auth_id_read=bool(auth_lid),
                   check_mode=login_state.mode())
         return 0
     except Exception as exc:                                   # noqa: BLE001
@@ -250,11 +265,22 @@ def cmd_logout(acc, log, hard: bool = False, confirm_shared: bool = False) -> in
     # ── 세션 공유 영향 범위 — 불분명하면 **하지 않는다** ──────────
     allowed, peers, why = login_state.logout_allowed(acc)
     if peers:
-        log(f"[로그아웃] 이 세션을 함께 쓰는 등록 {len(peers)}건:")
+        #  ★무엇이 영향을 받을 수 있는지 **빠짐없이** 적는다(2026-11-05).
+        #    `--confirm-shared` 로 넘어갈지 사람이 판단하는 근거가 이 목록이다.
+        #    세션(쿠키)이 있는 등록만 서버 로그아웃으로 실제로 끊긴다.
+        _live = [p for p in peers if p.get("has_session")]
+        log(f"[로그아웃] 영향받을 수 있는 등록 {len(peers)}건"
+            + (f" (그중 {len(_live)}건은 이 PC 에 세션이 저장돼 있습니다)"
+               if _live else "") + ":")
         for pr in peers:
+            _sess = (f"쿠키 {pr.get('cookies', 0)}개 저장됨"
+                     if pr.get("has_session") else "이 PC 에 세션 없음")
             log(f"           · {pr['label']} (id={pr['id']}, "
                 f"login_id={pr['login_id'] or '없음'}, 브랜드={pr['brand'] or '기본'}) "
-                f"— {pr['why']}")
+                f"— {pr['why']} · {_sess}")
+        log("           ★네이버 서버 로그아웃은 **같은 네이버 계정** 전체의 세션을 "
+            "끊습니다.")
+        log("             쿠키 폴더는 계정별로 분리돼 있어도 이 영향은 막지 못합니다.")
     if not allowed and not confirm_shared:
         log(f"[로그아웃] ❌ 중단 — {why}")
         log("           영향 범위를 확인하신 뒤 다시 실행해 주세요"

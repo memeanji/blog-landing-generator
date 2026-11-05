@@ -11,7 +11,8 @@
 ;    구글 시트 인증 파일은 사용자가 트레이 메뉴에서 직접 지정한다.
 ; ══════════════════════════════════════════════════════════════════
 #define AppName "블로그 랜딩 Agent"
-#define AppVer "1.3.0"
+; ★1.3.1 — v2/pairing.py 의 AGENT_VERSION 과 **같아야 한다**(검증 스크립트가 대조한다).
+#define AppVer "1.3.1"
 #define AppExe "BlogLandingAgent.exe"
 
 [Setup]

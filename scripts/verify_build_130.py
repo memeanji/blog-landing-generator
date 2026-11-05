@@ -90,11 +90,28 @@ if not NEW_EXE.exists() or not NEW_SETUP.exists():
     print(f"  빌드 산출물이 없습니다: {NEW_EXE}")
     raise SystemExit(2)
 
+#  ★기대 버전을 박아 두지 않는다 — `v2/pairing.py` 를 **유일한 출처**로 읽는다.
+#    전에는 "1.3.0" 을 세 군데 적어 두어서 번호를 올리면 검증이 거짓 실패했다.
+WANT_VER = re.search(r'AGENT_VERSION\s*=\s*"([0-9.]+)"',
+                     (ROOT / "v2" / "pairing.py").read_text(encoding="utf-8")).group(1)
+
 head("1. AGENT_VERSION")
 v = version_of(NEW_EXE)
-check("빌드된 EXE 의 AGENT_VERSION = 1.3.0", v == ["1.3.0"], str(v))
-check("설치 프로그램 AppVer = 1.3.0",
-      '#define AppVer "1.3.0"' in NEW_ISS.read_text(encoding="utf-8-sig"))
+#  ★'한 개여야 한다' 를 따로 본다 — 버전처럼 보이는 문자열이 docstring 에 섞이면
+#    (docstring 은 `.pyc` 에 남는다) 여기서 두 개로 잡힌다. 실제로 겪었다.
+check(f"빌드된 EXE 의 버전 문자열이 **하나뿐**이다 ({WANT_VER})", v == [WANT_VER],
+      str(v) + ("  ← 여러 개면 pairing.py 의 docstring·상수에 버전 꼴 문자열이"
+                " 섞였는지 본다" if len(v) != 1 else ""))
+check(f"설치 프로그램 AppVer = {WANT_VER} (pairing.py 와 일치)",
+      f'#define AppVer "{WANT_VER}"' in NEW_ISS.read_text(encoding="utf-8-sig"))
+#  ★게이트는 '최소 버전' 이다 — 번호를 올려도 로그아웃이 잠기지 않아야 한다.
+sys.path.insert(0, str(ROOT))
+from v2 import pairing as _p                                   # noqa: E402
+
+check(f"로그아웃 게이트가 {WANT_VER} 에서 열린다",
+      _p.supports(WANT_VER, "logout") is True,
+      f"NEEDS[logout]={_p.NEEDS['logout']}")
+check("1.2.5 에서는 여전히 잠긴다", _p.supports("1.2.5", "logout") is False)
 check("롤백본은 1.2.5 그대로", version_of(OLD_EXE) == ["1.2.5"],
       str(version_of(OLD_EXE)))
 
@@ -200,7 +217,7 @@ check("관리자 권한 불필요(PrivilegesRequired=lowest)",
       "PrivilegesRequired=lowest" in new_iss)
 
 head("8. 산출물 해시 (SHA-256)")
-for label, p in (("1.3.0 설치파일", NEW_SETUP), ("1.3.0 Agent exe", NEW_EXE),
+for label, p in ((f"{WANT_VER} 설치파일", NEW_SETUP), (f"{WANT_VER} Agent exe", NEW_EXE),
                  ("1.2.5 설치파일(롤백)", OLD_SETUP),
                  ("1.2.5 Agent exe(롤백)", OLD_EXE)):
     if p.exists():

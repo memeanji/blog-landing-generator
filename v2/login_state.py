@@ -32,6 +32,7 @@ from pathlib import Path
 
 from .accounts import account_id
 from .appdir import ROOT
+from .loginid import NAVER_MAIL_DOMAINS, norm_login, same_login   # noqa: F401
 
 SESSIONS_ROOT = ROOT / "sessions"
 ALIAS_PATH = SESSIONS_ROOT / "login_aliases.json"       # login_id → session_id
@@ -63,7 +64,12 @@ def norm_id(value: str) -> str:
 
 
 def same_id(a: str, b: str) -> bool:
-    """login_id·blog_id 비교는 대소문자를 구분하지 않는다(네이버가 그렇다)."""
+    """**blog_id** 비교 — 대소문자를 구분하지 않는다(네이버가 그렇다).
+
+    ★`login_id` 비교에는 `same_login`(= `v2/loginid.py`)을 쓴다. 로그인 ID 는
+      `shin894894` / `shin894894@naver.com` 두 형태로 적히기 때문이다.
+      blog_id 에는 도메인 표기가 없으므로 여기서 도메인을 떼면 안 된다.
+    """
     a, b = norm_id(a), norm_id(b)
     return bool(a) and bool(b) and a.casefold() == b.casefold()
 
@@ -205,9 +211,9 @@ def record_login_result(acc, *, seen_blog_id: str = "", expected_blog_id: str = 
     auth_lid, ent_lid = norm_id(authenticated_login_id), norm_id(entered_login_id)
     want_lid = norm_id(expected_login_id) or norm_id(account_map(acc).get("login_id"))
 
-    if auth_lid and want_lid and same_id(auth_lid, want_lid):
+    if auth_lid and want_lid and same_login(auth_lid, want_lid):
         grade, by = AUTHENTICATED, "naver_account_api"
-    elif ent_lid and want_lid and same_id(ent_lid, want_lid):
+    elif ent_lid and want_lid and same_login(ent_lid, want_lid):
         grade, by = INPUT, "login_form_input"
     elif manual_ok:
         grade, by = MANUAL, "user_confirmed"
@@ -272,7 +278,7 @@ def check_publish(acc, *, expected_login_id: str = "", expected_blog_id: str = "
                           f"확인된 블로그 {now_bid}")
 
     got_lid = norm_id(st.get("authenticated_login_id"))
-    if got_lid and want_lid and not same_id(got_lid, want_lid):
+    if got_lid and want_lid and not same_login(got_lid, want_lid):
         return False, g, (f"로그인 계정이 다릅니다 — 기대 login_id {want_lid} / "
                           f"인증된 login_id {got_lid}")
 
@@ -310,7 +316,7 @@ def session_for_login(login_id: str) -> str:
         return ""
     table = aliases()
     for key, row in table.items():
-        if key.casefold() == lid.casefold():
+        if same_login(key, lid):
             return str((row or {}).get("session_id") or "")
     return ""
 
@@ -341,14 +347,22 @@ def link_session(login_id: str, acc, *, grade: str = "", ref_tab: str = "",
     if not session_store.session_dir(acc).exists():
         return False, f"세션 폴더가 없습니다({sid})"
     mapped = norm_id(account_map(acc).get("login_id"))
-    if mapped and not same_id(mapped, lid):
+    if mapped and not same_login(mapped, lid):
         return False, (f"그 세션 폴더는 다른 로그인 계정({mapped})의 것입니다 — "
+                       f"연결하지 않습니다")
+    # ★매핑이 아직 비어 있어도(= '처음 연결'), 계정 등록표가 말하는 login_id 와
+    #   어긋나면 연결하지 않는다(2026-11-04). 예전에는 매핑이 비면 **어떤
+    #   login_id 든** 그 세션에 붙을 수 있었다 — 운영 경로에서는 같은 값이
+    #   들어오므로 동작 변화는 없고, 잘못 부르는 경우만 막힌다.
+    own = norm_id(getattr(acc, "login_id", ""))
+    if own and not same_login(own, lid):
+        return False, (f"그 세션은 {own} 계정의 것입니다 — {lid} 를 "
                        f"연결하지 않습니다")
 
     table = _read(ALIAS_PATH)
     rows = dict(table.get("aliases") or {})
     for key, row in list(rows.items()):
-        if key.casefold() != lid.casefold():
+        if not same_login(key, lid):
             continue
         cur = str((row or {}).get("session_id") or "")
         if cur and cur != sid:
@@ -368,7 +382,7 @@ def unlink_session(login_id: str) -> bool:
     lid = norm_id(login_id)
     table = _read(ALIAS_PATH)
     rows = dict(table.get("aliases") or {})
-    hit = [k for k in rows if k.casefold() == lid.casefold()]
+    hit = [k for k in rows if same_login(k, lid)]
     for k in hit:
         rows.pop(k)
     if not hit:
@@ -389,7 +403,7 @@ def is_logout_pending(login_id: str) -> bool:
     lid = norm_id(login_id)
     if not lid:
         return False
-    return any(k.casefold() == lid.casefold() for k in logout_pending())
+    return any(same_login(k, lid) for k in logout_pending())
 
 
 def mark_logout_pending(login_id: str, *, session_id: str = "",
@@ -412,9 +426,11 @@ def mark_logout_pending(login_id: str, *, session_id: str = "",
 
 def clear_logout_pending(login_id: str) -> bool:
     lid = norm_id(login_id)
+    if not lid:                      # ★빈 값으로 전체를 지우는 일이 없게
+        return False
     table = _read(PENDING_PATH)
     rows = dict(table.get("pending") or {})
-    hit = [k for k in rows if k.casefold() == lid.casefold()]
+    hit = [k for k in rows if same_login(k, lid)]
     for k in hit:
         rows.pop(k)
     if not hit:
@@ -425,21 +441,51 @@ def clear_logout_pending(login_id: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  세션 공유 영향 범위 (2026-11-03)
-#    로그아웃은 **세션 폴더 하나**를 초기화한다. 그 폴더를 다른 계정도 쓰고 있다면
-#    그 계정들도 재로그인이 필요해진다 → **먼저 보여 주고**, 로그인 계정이 서로
-#    다르면(= 공유가 맞는지 불분명하면) 자동 로그아웃을 **막는다**.
+#  세션 공유 영향 범위 (2026-11-03 · ★blog_id 추가 2026-11-05)
+#    로그아웃은 두 층에서 영향을 준다
+#      · **로컬** — 세션 폴더 하나만 초기화한다(다른 폴더는 건드리지 않는다)
+#      · **서버** — `_server_logout` 이 네이버 서버 세션을 끊는다. 이건 **같은
+#        네이버 계정** 전체에 걸린다. 쿠키 폴더가 분리돼 있어도 막지 못한다.
+#    그래서 영향받을 수 있는 등록을 **먼저 보여 주고**, 로그인 계정이 같은지
+#    불분명하면 자동 로그아웃을 **막는다**(모르면 막는다).
 #
-#    같은 폴더를 쓰게 되는 경로는 셋뿐이다
+#    영향 후보를 찾는 경로
 #      ① 같은 `id`            — 기본값 sessions/<id> (id 는 유일하므로 자기 자신)
 #      ② `profile_dir` 지정   — 다른 계정이 같은 프로필 경로를 가리킬 수 있다
 #      ③ login_id 별칭        — login_id → session_id 표가 이 폴더를 가리킨다
-#    ★`blog_id` 는 보지 않는다 — 같은 blog_id 라도 로그인 계정이 다를 수 있다.
+#      ④ ★같은 `blog_id`     — 같은 블로그를 가리키면 **같은 네이버 계정일 수
+#                              있다**. 2026-11-05 추가 — ①②③ 는 운영에서 전부
+#                              비어 있어 차단이 한 번도 발동하지 않았다.
+#    ★④는 단정이 아니다 — 같은 blog_id 라도 로그인 계정은 다를 수 있다.
+#      그래서 위험 후보로만 올리고, 같은 로그인인지는 `logout_allowed` 가
+#      `login_id` 로 한 번 더 판정한다(판정 규칙은 바꾸지 않았다).
 # ══════════════════════════════════════════════════════════════════
 def session_peers(acc, path=None) -> list[dict]:
-    """이 계정과 **같은 세션 폴더**를 쓰는 다른 계정들. 없으면 빈 목록.
+    """이 계정을 로그아웃하면 **영향을 받을 수 있는** 다른 등록들. 없으면 빈 목록.
 
-    각 항목: {"id", "label", "login_id", "blog_id", "brand", "ref_tab", "why"}
+    각 항목:
+        {"id", "label", "login_id", "blog_id", "brand", "ref_tab", "why",
+         "has_session"(이 PC 에 저장된 세션이 있나), "cookies"(쿠키 수)}
+
+    찾는 근거 세 가지
+        ① `profile_dir` 가 **같은 폴더**를 가리킨다 → 쿠키를 실제로 공유한다
+        ② `login_id` 별칭이 이 세션을 가리킨다(`sessions/login_aliases.json`)
+        ③ ★`blog_id` 가 같다 (2026-11-05 추가)
+
+    ★왜 ③을 넣었나 — ①은 `profile_dir` 를 따로 지정한 계정만, ②는 별칭 파일이
+      있어야 걸린다. 운영에서는 둘 다 비어 있어 `session_peers` 가 **항상 빈
+      목록**이었고, 그래서 `logout_allowed` 의 공유 세션 차단이 **한 번도 발동하지
+      않았다**(2026-11-05 실측: 계정 18건 전부 peers 0 · 차단 0).
+      그런데 `_server_logout` 은 네이버 **서버** 세션을 끊으므로, 같은 네이버
+      계정으로 로그인한 다른 등록의 쿠키도 서버에서 죽는다. 로컬 쿠키 폴더가
+      분리돼 있어도 이 피해는 막지 못한다.
+
+    ★단정하지 않는다 — 같은 `blog_id` 라도 로그인 계정이 다를 수 있다. 그래서
+      여기서는 **위험 후보로만** 올리고, 같은 로그인인지는 `logout_allowed` 가
+      `login_id` 로 판정한다(이 함수는 판정 규칙을 바꾸지 않는다).
+
+    ★`has_session` 은 **이 PC 기준**이다. 다른 PC 에 세션이 있을 수 있으므로
+      '세션 없음' 을 '영향 없음' 으로 단정하면 안 된다 — 안내용 정보일 뿐이다.
     """
     from . import accounts as _accounts
     from . import session_store
@@ -449,10 +495,23 @@ def session_peers(acc, path=None) -> list[dict]:
         mine = session_store.profile_dir(acc).resolve()
     except Exception:                                          # noqa: BLE001
         mine = None
+    #  ★내 blog_id — 등록값이 없으면 세션에 적힌 값을 쓴다(둘 다 없으면 ③을 쓰지
+    #    않는다. 빈 값으로 비교하면 blog_id 없는 계정끼리 모두 묶여 버린다).
+    mine_blog = (norm_id(getattr(acc, "blog_id", ""))
+                 or norm_id(account_map(acc).get("blog_id"))
+                 or norm_id(auth_state(acc).get("blog_id")))
     try:
         rows = _accounts.load_accounts(path, include_disabled=True)
     except Exception:                                          # noqa: BLE001
         return []                             # 목록을 못 읽으면 '모른다' → 호출한 쪽이 판단
+
+    def peer_session(other) -> tuple[bool, int]:
+        """그 등록이 **이 PC 에** 저장된 세션을 갖고 있나(읽기만)."""
+        try:
+            info = session_store.describe(other)
+            return bool(info.get("state_exists")), int(info.get("cookies") or 0)
+        except Exception:                                      # noqa: BLE001
+            return False, 0
 
     out: list[dict] = []
     for other in rows:
@@ -468,35 +527,55 @@ def session_peers(acc, path=None) -> list[dict]:
         if not why and norm_id(other.login_id) \
                 and session_for_login(other.login_id) == me:
             why = f"login_id={other.login_id} 별칭이 이 세션을 가리킵니다"
+        #  ③ 같은 blog_id — 같은 네이버 계정일 **수** 있다(단정하지 않는다)
+        if not why and mine_blog and same_id(other.blog_id, mine_blog):
+            why = (f"blog_id={norm_id(other.blog_id)} 가 같습니다 — 같은 네이버 "
+                   f"계정일 수 있습니다(확인되지 않음)")
         if why:
+            has_sess, cookies = peer_session(other)
             out.append({"id": other.id, "label": other.label or other.id,
                         "login_id": norm_id(other.login_id),
                         "blog_id": norm_id(other.blog_id),
                         "brand": other.brand or "", "ref_tab": other.ref_tab or "",
-                        "why": why})
+                        "why": why,
+                        "has_session": has_sess, "cookies": cookies})
     return out
 
 
 def logout_allowed(acc, path=None) -> tuple[bool, list[dict], str]:
     """`(바로 로그아웃해도 되나, 영향받는 계정들, 사유)`.
 
-    · 공유 계정이 없으면        → 바로 가능
-    · 공유 계정의 login_id 가 **이 계정과 같으면** → 같은 로그인 계정이므로 가능
+    · 공유 후보가 없으면        → 바로 가능
+    · 공유 후보의 login_id 가 **이 계정과 같으면** → 같은 로그인 계정이므로 가능
     · 그 밖에(login_id 가 다르거나 비어 있으면) → **금지**(사용자 확인 필요)
+
+    ★판정 규칙은 2026-11-03 그대로다. 2026-11-05 에 바뀐 것은 `session_peers`
+      가 후보를 **더 찾아낸다**는 점뿐이다(같은 blog_id). 즉 '모르면 막는다' 가
+      실제로 작동하기 시작한다.
+    ★안내 문구에 **세션 보유 여부**를 함께 적는다 — `--confirm-shared` 로 넘어갈지
+      사람이 판단할 때 그게 가장 중요한 정보다(쿠키가 있는 등록만 실제로 끊긴다).
     """
     peers = session_peers(acc, path)
     if not peers:
         return True, [], ""
     mine = norm_id(getattr(acc, "login_id", "")) \
         or norm_id(account_map(acc).get("login_id"))
-    odd = [p for p in peers if not (mine and same_id(p["login_id"], mine))]
+    odd = [p for p in peers if not (mine and same_login(p["login_id"], mine))]
     if not odd:
         return True, peers, (f"같은 로그인 계정({mine})의 다른 등록 {len(peers)}건도 "
                              f"함께 재로그인이 필요해집니다")
-    names = " · ".join(f"{p['label']}(id={p['id']}, "
-                       f"login_id={p['login_id'] or '없음'})" for p in odd[:4])
-    return False, peers, (f"이 세션을 쓰는 다른 계정이 있고 로그인 계정이 같은지 "
-                          f"확인되지 않았습니다 — {names}")
+    live = [p for p in odd if p.get("has_session")]
+    names = " · ".join(
+        f"{p['label']}(id={p['id']}, login_id={p['login_id'] or '없음'}"
+        + (f", 저장된 세션 쿠키 {p['cookies']}개" if p.get("has_session")
+           else ", 이 PC 에 저장된 세션 없음") + ")"
+        for p in odd[:4])
+    return False, peers, (
+        f"같은 네이버 계정일 수 있는 등록이 {len(odd)}건 있고 로그인 계정이 같은지 "
+        f"확인되지 않았습니다"
+        + (f"(그중 {len(live)}건은 이 PC 에 세션이 저장돼 있어 **서버 로그아웃으로 "
+           f"함께 끊깁니다**)" if live else "")
+        + f" — {names}")
 
 
 def describe(acc, *, expected_login_id: str = "") -> dict:
