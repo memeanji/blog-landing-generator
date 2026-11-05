@@ -379,7 +379,8 @@ check("★상태 조회는 account.id 로만 한다(설계 ④)",
 check("  login_id 는 표시·공유세션 분석용으로만 남는다",
       'lid = (getattr(account, "login_id", "") or "").strip()' in panel)
 check("식별 불가면 버튼이 잠긴다",
-      "disabled=not (device_id and (lid or aid) and can_logout)" in panel)
+      ("_off = (not (device_id and (lid or aid) and can_logout)" in panel
+       and "disabled=_off" in panel))
 check("식별 불가 사유를 화면에 적는다", "계정을 특정할 수 없습니다" in panel)
 check("버전 게이트가 그대로다(1.3.0 미만 잠금)",
       "can_logout = agent_can_logout(device)" in panel)

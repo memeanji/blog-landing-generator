@@ -199,8 +199,8 @@ acc_file.write_text(json.dumps(
     {"accounts": [s_a.to_dict(), s_c.to_dict()]}, ensure_ascii=False),
     encoding="utf-8")
 allowed2, peers2, why2 = login_state.logout_allowed(s_a, acc_file)
-check("공유 세션 — 로그인 계정이 다르면 자동 로그아웃 금지(그대로)",
-      allowed2 is False and len(peers2) == 1, why2)
+check("공유 세션 — 로그인 계정이 달라도 **막지 않는다**(2026-11-05 정책)",
+      allowed2 is True and len(peers2) == 1, why2)
 
 
 # ══════════════════════════════════════════════════════════════════

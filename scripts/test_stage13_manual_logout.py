@@ -258,6 +258,142 @@ check("세션 폴더·토큰 경로 로직 무변경",
       "SESSIONS_ROOT = ROOT / \"sessions\"" in
       (ROOT / "v2" / "session_store.py").read_text(encoding="utf-8"))
 
+head("⑨ 공유 계정 차단 정책 변경 (2026-11-05) — 막지 않고 알린다")
+
+#  브랜드가 달라도 **같은 네이버 ID** 를 쓴다 → 그 자체는 차단 사유가 아니다.
+from v2 import login_state as LS                              # noqa: E402
+from v2.accounts import Account                               # noqa: E402
+import json                                                   # noqa: E402
+
+
+def _accounts(rows) -> Path:
+    p = SANDBOX / f"acc_{len(list(SANDBOX.glob('acc_*.json')))}.json"
+    p.write_text(json.dumps({"accounts": rows}, ensure_ascii=False),
+                 encoding="utf-8")
+    return p
+
+
+#  ① 같은 blog_id · 양쪽 다 login_id 미등록
+rows = [{"id": "x_re", "label": "브랜드A", "login_id": "", "blog_id": "same",
+         "brand": "repurely", "enabled": True},
+        {"id": "x_dn", "label": "브랜드B", "login_id": "", "blog_id": "same",
+         "brand": "doctor_nuscent", "enabled": True}]
+P1 = _accounts(rows)
+A1 = Account(id="x_re", label="브랜드A", blog_id="same", brand="repurely")
+ok1, pr1, why1 = LS.logout_allowed(A1, P1)
+check("★같은 blog_id · login_id 미등록 → **허용**", ok1 is True, str(ok1))
+check("  후보는 그대로 찾아낸다(안내용)", len(pr1) == 1, f"{len(pr1)}건")
+check("  영향 범위를 문구로 알린다", "같은 네이버 계정일 수 있는 등록이" in why1,
+      why1[:50])
+
+#  ② login_id 가 서로 다른 경우도 허용
+rows2 = [{"id": "y1", "label": "A", "login_id": "me", "blog_id": "sh2",
+          "brand": "repurely", "enabled": True},
+         {"id": "y2", "label": "B", "login_id": "someoneelse", "blog_id": "sh2",
+          "brand": "repurely", "enabled": True}]
+P2 = _accounts(rows2)
+ok2, _, why2 = LS.logout_allowed(
+    Account(id="y1", label="A", login_id="me", blog_id="sh2"), P2)
+check("★login_id 가 서로 달라도 **허용**", ok2 is True, str(ok2))
+check("  그 등록을 사유에 적는다", "someoneelse" in why2, why2[:60])
+
+#  ③ 후보가 없으면 예전처럼 조용히 허용
+P3 = _accounts([{"id": "z1", "label": "혼자", "login_id": "solo",
+                 "blog_id": "alone", "brand": "repurely", "enabled": True}])
+ok3, pr3, why3 = LS.logout_allowed(
+    Account(id="z1", label="혼자", login_id="solo", blog_id="alone"), P3)
+check("후보가 없으면 그대로 허용 · 안내 없음",
+      ok3 is True and pr3 == [] and why3 == "")
+
+#  ④ 화면 — 체크박스를 **요구하지 않는다**
+check("★'공유 세션 확인' 체크박스를 요구하지 않는다", "_shared_" not in APP)
+#  ★문구가 줄바꿈으로 쪼개져 있다 — 앞 조각으로 본다.
+check("  선택한 등록 외는 건드리지 않는다고 적는다",
+      "선택한 등록 외의 쿠키·프로필·계정 " in APP)
+
+#  ★가장 중요한 것 — `confirm_shared` 를 **묻지도 않고 True 로 보내지 않는다.**
+#    체크박스를 없애면서 한때 `shared_ok = True` 로 무조건 보냈는데, 그건
+#    Agent 의 보호 조건을 조용히 넘기는 것이었다(2026-11-05 지적받아 고침).
+check("★confirm_shared 를 무조건 True 로 보내지 않는다",
+      "shared_ok = True" not in APP and "confirm_shared=bool(shared_ok)" not in APP)
+check("★후보가 있을 때만 confirm_shared 가 간다(= 사용자가 보고 누른 경우)",
+      "confirm_shared=bool(_need)" in APP)
+check("★후보가 있으면 **한 번 더 눌러야** 실행된다(2단계)",
+      "_need and not _ready" in APP
+      and "st.session_state[_ckey] = True" in APP)
+check("  1단계 버튼은 '확인' 이고 2단계에서 실행된다",
+      "영향 범위를 확인했습니다 — 계속" in APP)
+check("  확인 상태는 계정마다 따로 기억한다(다른 계정에 번지지 않는다)",
+      '_ckey = f"_logout_ok_{aid or lid}"' in APP)
+check("  실행하면 확인 상태를 지운다(다음에 또 묻는다)",
+      "st.session_state.pop(_ckey, None)" in APP)
+check("  영향 범위를 **목록으로** 보여 준다",
+      "같은 네이버 계정일 수 있는 등록이" in APP and "login_id=" in APP)
+#  ★문구가 여러 줄로 쪼개져 있다 — 이어지는 조각으로 본다.
+check("  후보 조회가 실패해도 막지 않고 사실만 알린다",
+      "_peers_err" in APP and "같은 세션을 쓰는 등록이 있는지 **확인하지 " in APP
+      and "로그아웃을 막지는 " in APP)
+
+#  ★Agent 1.3.3 호환 — 그 설치본에는 **옛 차단 정책**이 들어 있다.
+#    화면이 보내는 `--confirm-shared` 로만 통과한다. 그래서 '후보를 못 봐서
+#    안 보냈는데 PC 는 막는' 경우가 **영구 차단**이 되면 안 된다.
+OLD_ALLOWED = """
+def logout_allowed_1_3_3(peers, mine, confirm_shared):
+    #  1.3.3 설치본의 판정을 그대로 옮긴 것(차단 분기 포함)
+    if not peers:
+        return True
+    odd = [p for p in peers if not (mine and p.get("login_id") == mine)]
+    allowed = not odd
+    return allowed or confirm_shared          # cmd_logout 의 통과 조건
+"""
+_ns: dict = {}
+exec(OLD_ALLOWED, _ns)
+old_ok = _ns["logout_allowed_1_3_3"]
+
+check("★[1.3.3] 후보 없음 → confirm 없이도 통과",
+      old_ok([], "me", False) is True)
+check("★[1.3.3] 후보 있고 login_id 같음 → confirm 없이도 통과",
+      old_ok([{"login_id": "me"}], "me", False) is True)
+check("★[1.3.3] 후보 있고 login_id 미등록 → confirm 없으면 **차단**",
+      old_ok([{"login_id": ""}], "me", False) is False)
+check("★[1.3.3] 그때 confirm 을 보내면 **통과**(화면 2단계가 이걸 보낸다)",
+      old_ok([{"login_id": ""}], "me", True) is True)
+check("★[1.3.3] login_id 가 서로 달라도 confirm 이면 통과",
+      old_ok([{"login_id": "other"}], "me", True) is True)
+
+check("★차단당한 뒤에는 화면이 **확인 단계를 연다**(영구 차단 방지)",
+      "_was_blocked = bool(_ver and _ver[0] == \"blocked\")" in APP
+      and "_need = bool(_peers) or _was_blocked" in APP)
+check("  차단 안내가 없어진 체크박스를 가리키지 않는다",
+      "'공유 세션 확인' 을 읽고 체크한 뒤" not in APP)
+check("  후보가 안 보이는데 막힌 경우 건수를 지어내지 않는다",
+      "PC 가 같은 세션을 쓰는 등록을 찾아 " in APP)
+
+#  후보 목록은 화면이 직접 본다 — 원격(Supabase) 포함
+LA = APP[APP.index("def logout_peers("):APP.index("def logout_verdict(")]
+check("★후보 조회는 session_peers 를 그대로 쓴다(판정을 베끼지 않는다)",
+      "_ls.session_peers(account)" in LA)
+check("  실패해도 빈 목록 + 사유로 돌려준다(터지지 않는다)", "return [], f" in LA)
+check("  원격 포함이라고 적어 둔다(로컬 파일만 보는 게 아니다)",
+      "원격(Supabase) 우선" in LA)
+check("  화면에서는 has_session 숫자를 쓰지 않는다(클라우드엔 세션 파일이 없다)",
+      "전부 False 로 나온다" in LA)
+
+#  ⑤ 진짜 위험은 **그대로 막는다**
+check("★발행 중이면 여전히 잠근다", "or bool(_busy)" in APP)
+check("★큐를 못 읽으면 여전히 잠근다",
+      '_unknown = bool(stt.get("read_error"))' in APP and "or _unknown" in APP)
+check("  왜 잠그는지 알려 준다(모르는 것과 없는 것을 구분)",
+      "확인하지 못했습니다** — 로그아웃을 잠급니다" in APP)
+
+#  ⑥ 보류·재개와 쿠키 취급은 그대로
+check("대기 작업 자동 보류가 그대로다", "held = store_obj.hold_account(" in APP)
+check("재개가 그대로다", "do_resume(store_obj," in APP)
+check("★확인 전 쿠키 초기화로 성공을 오판하지 않는다(수동 경로는 안 지운다)",
+      "clear_cookies" not in src and "clear_state" not in src)
+check("수동이 기본 · --auto 로 자동 보존", session.parse_args(
+    ["--logout", "x"]).auto is False and hasattr(session, "_server_logout"))
+
 print("")
 print("=" * 76)
 if fails:

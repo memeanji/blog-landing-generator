@@ -622,6 +622,26 @@ LOGOUT_VERDICT = {
 }
 
 
+def logout_peers(account) -> tuple[list, str]:
+    """이 등록과 **세션을 공유할 수 있는** 다른 등록 → `(목록, 실패사유)`.
+
+    ★화면이 직접 본다 — 영향 범위를 보여 주고 **사용자 확인을 받기** 위해서다.
+      판정 자체는 Agent 가 다시 한다(여기서는 보여 줄 거리만 만든다).
+    ★계정 목록은 `load_accounts()` 가 **원격(Supabase) 우선**으로 가져온다 —
+      이 PC 의 `accounts.json` 8건이 아니라 **등록 전체**를 본다.
+    ★`has_session`(쿠키 보유)은 **PC 에서만** 알 수 있다. 화면(클라우드)에는
+      세션 파일이 없어 전부 False 로 나온다 — 그래서 그 숫자는 쓰지 않는다.
+    ★조회에 실패해도 **로그아웃을 막지 않는다**(막는 것은 발행 중·큐 조회 실패뿐).
+      다만 '확인 못 했다' 는 사실은 그대로 알린다.
+    """
+    try:
+        from v2 import login_state as _ls
+
+        return list(_ls.session_peers(account) or []), ""
+    except Exception as exc:                                   # noqa: BLE001
+        return [], f"{type(exc).__name__}: {exc}"
+
+
 def logout_verdict(store_obj, rec: dict | None) -> tuple[str, str, str] | None:
     """끝난 로그아웃 작업의 결과를 `(상태키, 제목, 설명)` 으로 돌려준다.
 
@@ -644,8 +664,9 @@ def logout_verdict(store_obj, rec: dict | None) -> tuple[str, str, str] | None:
             break
         if (ev or {}).get("event") == "logout_blocked":
             return ("blocked", "⛔ 로그아웃하지 않았습니다",
-                    "영향 범위가 확인되지 않아 PC 가 중단했습니다. 아래 "
-                    "'공유 세션 확인' 을 읽고 체크한 뒤 다시 눌러 주세요.")
+                    "PC 가 **이 화면에서는 안 보이는 공유 후보**를 찾아 중단했습니다"
+                    "(PC 에만 있는 별칭 기록 등). 아래 버튼이 **확인 단계**로 "
+                    "바뀌었으니, 영향 범위를 확인하고 한 번 더 눌러 주세요.")
     key = got if got in LOGOUT_VERDICT else "unknown"
     title, desc = LOGOUT_VERDICT[key]
     return (key, title, desc)
@@ -1604,14 +1625,13 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                 f"**{_title}** — {_desc}")
 
         if not stt["pending"]:
-            #   세션을 공유하는 계정이 있어 **불분명한 경우**에만 체크가 필요하다.
-            #   판정은 계정 목록이 있는 PC(Agent)가 하고, 여기서는 그 결과를 보여 준다.
-            shared_ok = st.checkbox(
-                "공유 세션 확인 — 같은 세션을 쓰는 다른 계정도 재로그인이 필요함을 "
-                "확인했습니다", key=f"_shared_{aid or lid}",
-                help="PC 에서 '이 세션을 함께 쓰는 계정' 이 발견되면 로그아웃이 "
-                     "중단됩니다. 영향 범위를 확인하셨다면 이걸 체크하고 다시 "
-                     "눌러 주세요")
+            #  ★2026-11-05 정책 — 같은 네이버 ID 를 브랜드별로 나눠 쓰는 것이
+            #    의도된 운영 구조다. 그래서 '같은 blog_id 등록이 있다'·
+            #    'login_id 가 미등록이다' 를 **차단 사유로 쓰지 않는다.**
+            #    전에는 '공유 세션 확인' 체크박스를 **매번 체크해야** 넘어갔다.
+            #    이제는 안내만 하고, 체크는 요구하지 않는다.
+            #    ※`confirm_shared=True` 를 그대로 보낸다 — Agent 쪽 안전망
+            #      (`logout_allowed`)이 혹시 막더라도 이 정책대로 통과시키기 위해서다.
             #  ★순차 운영 — 한 계정 발행을 **다 끝낸 뒤** 로그아웃하고 다음
             #    계정으로 넘어간다. 그래서 그 계정이 **실행 중**이면 막는다.
             #    (대기 작업은 기존대로 로그아웃이 **보류**로 옮긴다 — 보류·재개
@@ -1624,15 +1644,77 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                     f"{chr(10)}{chr(10)}발행 도중에 로그아웃하면 그 배치가 중간에서 "
                     f"끊깁니다. 지금 멈춰야 한다면 위 **[진행 중인 작업]** 에서 "
                     f"중단한 뒤 다시 눌러 주세요.")
-            if st.button("선택 계정 로그아웃", use_container_width=True,
-                         disabled=not (device_id and (lid or aid) and can_logout)
-                         or bool(_busy),
+            #  ★큐를 못 읽었으면 막는다 — 돌고 있는 작업이 있는지 **모르는** 것이지
+            #    '없다' 가 아니다. 모르는 채로 로그아웃하면 발행 중인 배치를 끊는다.
+            _unknown = bool(stt.get("read_error"))
+            if _unknown:
+                st.warning("⚠ **작업 큐를 읽지 못해 발행 중인 작업이 있는지 "
+                           "확인하지 못했습니다** — 로그아웃을 잠급니다."
+                           f"{chr(10)}{chr(10)}잠시 뒤 화면을 다시 그려 주세요.")
+            #  ★공유 후보가 있으면 **한 번 더 눌러야** 나간다(2026-11-05).
+            #    체크박스를 없애면서 `confirm_shared=True` 를 **묻지도 않고**
+            #    보냈는데, 그건 Agent 의 보호 조건을 조용히 넘기는 것이라
+            #    그대로 둘 수 없다. 이제 영향 범위를 **보여 준 뒤** 사용자가
+            #    그것을 보고 누른 경우에만 보낸다.
+            _peers, _peers_err = logout_peers(account)
+            _ckey = f"_logout_ok_{aid or lid}"
+            #  ★PC 가 막은 적이 있으면 **확인 단계를 연다**(2026-11-05).
+            #    후보 탐지가 양쪽에서 다를 수 있다 — 별칭 기록처럼 **PC 에만
+            #    있는 근거**로 Agent 가 후보를 더 찾아내면, 화면은 후보가 없다고
+            #    보고 `confirm_shared` 를 안 보내 **영원히 막힌다**.
+            #    그때는 사용자가 확인하고 한 번 더 누르면 넘어갈 수 있어야 한다.
+            _was_blocked = bool(_ver and _ver[0] == "blocked")
+            _need = bool(_peers) or _was_blocked   # 확인을 받아야 하는가
+            _ready = bool(st.session_state.get(_ckey))   # 이미 확인했는가
+            _off = (not (device_id and (lid or aid) and can_logout)
+                    or bool(_busy) or _unknown)
+
+            if _peers_err:
+                st.caption(f"※ 같은 세션을 쓰는 등록이 있는지 **확인하지 "
+                           f"못했습니다**(`{_peers_err}`). 로그아웃을 막지는 "
+                           f"않지만, 같은 네이버 ID 로 등록된 다른 계정이 있으면 "
+                           f"그 계정도 다시 로그인해야 할 수 있습니다.")
+            if _need and not _ready:
+                if _peers:
+                    _names = " · ".join(
+                        f"{p.get('label') or p.get('id')}(id={p.get('id')}, "
+                        f"login_id={p.get('login_id') or '없음'})"
+                        for p in _peers[:5])
+                    _more = f"  외 {len(_peers) - 5}건" if len(_peers) > 5 else ""
+                    _head = (f"🔗 **같은 네이버 계정일 수 있는 등록이 "
+                             f"{len(_peers)}건 있습니다.**{chr(10)}{chr(10)}"
+                             f"{_names}{_more}")
+                else:
+                    #  ★화면에서는 후보가 안 보이는데 PC 가 막은 경우
+                    #    (PC 에만 있는 별칭 기록 등). 건수를 지어내지 않는다.
+                    _head = ("🔗 **PC 가 같은 세션을 쓰는 등록을 찾아 "
+                             "중단했습니다.** 이 화면에서는 그 근거가 보이지 "
+                             "않습니다(PC 에만 있는 기록). 자세한 목록은 아래 "
+                             "작업 로그에 적혀 있습니다.")
+                st.warning(
+                    f"{_head}{chr(10)}{chr(10)}네이버에서 로그아웃하면 **이 "
+                    f"등록들도 다시 로그인해야 할 수 있습니다**(브랜드가 달라도 "
+                    f"같은 ID 면 그렇습니다). 선택한 등록 외의 쿠키·프로필·계정 "
+                    f"정보는 건드리지 않습니다.")
+            if st.button(("영향 범위를 확인했습니다 — 계속"
+                          if (_need and not _ready) else "선택 계정 로그아웃"),
+                         use_container_width=True, disabled=_off,
                          help="이 PC 에서 그 계정의 브라우저 창이 열립니다. "
                               "네이버 화면에서 **직접 로그아웃**해 주세요"):
-                #  ★보류는 account.id 범위다 — login_id 를 넘기면 같은 네이버 ID 를
-                #    쓰는 **다른 등록**의 대기 작업까지 보류된다(2026-11-05).
-                do_logout(store_obj, brand, account, "", device_id,
-                          account_id=aid, confirm_shared=bool(shared_ok))
+                if _need and not _ready:
+                    st.session_state[_ckey] = True       # 확인만 하고 멈춘다
+                    st.rerun()
+                else:
+                    #  ★보류는 account.id 범위다 — login_id 를 넘기면 같은 네이버 ID 를
+                    #    쓰는 **다른 등록**의 대기 작업까지 보류된다(2026-11-05).
+                    #  ★`confirm_shared` 는 **사용자가 위 안내를 보고 누른 경우에만**
+                    #    True 다. 후보가 없으면 보낼 것이 없어 False 로 간다.
+                    st.session_state.pop(_ckey, None)
+                    do_logout(store_obj, brand, account, "", device_id,
+                              account_id=aid, confirm_shared=bool(_need))
+            if _need and _ready:
+                st.caption("※ 영향 범위를 확인하셨습니다 — 위 버튼을 누르면 "
+                           "로그아웃을 시작합니다.")
             st.caption("※ 로그아웃은 **수동**입니다 — 그 PC 에 브라우저 창이 뜨면 "
                        "네이버에서 직접 로그아웃해 주세요. 창을 닫거나 "
                        "로그아웃이 확인되면 PC 가 **실제 로그인 상태를 다시 "
@@ -1641,12 +1723,11 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                 st.caption("※ 계정을 특정할 수 없습니다(세션 폴더 이름도 비어 "
                            "있음) — 로그아웃 대상을 고르지 않습니다.")
             elif not lid:
-                st.caption("※ login_id 가 등록되지 않은 계정이라 **이 계정 전용 "
-                           "세션**만 초기화합니다. 다만 같은 blog_id 로 등록된 "
-                           "다른 계정이 있으면 **같은 네이버 계정일 수 있어** "
-                           "로그아웃을 먼저 막고 영향 범위를 보여 줍니다"
-                           "(2026-11-05). blog_id 만으로 같은 계정이라고 "
-                           "단정하지는 않습니다 — 확인은 login_id 로 합니다.")
+                st.caption("※ login_id 가 등록되지 않은 계정입니다. 초기화는 "
+                           "**이 등록 전용 세션**에만 합니다. login_id 가 없다는 "
+                           "이유로 로그아웃을 막지는 않습니다(2026-11-05 정책) — "
+                           "다만 같은 네이버 ID 를 쓰는 다른 등록이 있으면 그쪽도 "
+                           "다시 로그인해야 할 수 있습니다.")
             if device_id and not can_logout:
                 st.caption("※ 이 PC 의 Agent 가 "
                            f"{(device or {}).get('version') or '옛 버전'} 입니다 — "

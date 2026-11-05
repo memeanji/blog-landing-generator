@@ -269,7 +269,8 @@ check("다른 계정 이름으로도 그 작업이 보류되지 않는다(추측
 #   ★2026-11-03 변경: login_id 가 없어도 **account.id 기준으로 로그아웃 가능**.
 #     버튼은 더 이상 login_id 때문에 잠기지 않는다(사용자 요청).
 check("화면 버튼은 login_id 가 없어도 열린다(account.id 기준)",
-      "disabled=not (device_id and (lid or aid) and can_logout)" in app)
+      ("_off = (not (device_id and (lid or aid) and can_logout)" in app
+       and "disabled=_off" in app))
 check("login_id 없는 계정은 '이 계정 전용 세션' 기준임을 알린다",
       "이 계정 전용 세션" in app)
 print("     → 결론: PC 쪽 `v2.session --logout <계정>` 은 login_id 없이도 동작하고,")
