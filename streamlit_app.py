@@ -1371,7 +1371,8 @@ def _logout_state_read(store_obj, login_id: str, account_id: str = "") -> dict:
     return out
 
 
-def logout_block(store_obj, login_id: str, account_id: str = "") -> str:
+def logout_block(store_obj, login_id: str = "", account_id: str = "", *,
+                 who: str = "") -> str:
     """새 작업을 만들지 못하게 할 이유를 돌려준다(없으면 빈 문자열).
 
     막는 경우
@@ -1383,11 +1384,26 @@ def logout_block(store_obj, login_id: str, account_id: str = "") -> str:
       사용자 의도와 정반대가 된다. 모르면 막는 쪽이 안전하다.
     ★이 판단은 **그 계정 하나의 조회 결과**로만 한다. 다른 계정은 각자 자기
       조회로 판단하므로, 한 계정이 막혀도 나머지는 그대로 발행할 수 있다.
+    ★범위는 **account.id 하나**다(2026-11-05). 같은 네이버 ID 를 여러 등록으로
+      나눠 쓰므로 login_id 로 조회하면 다른 등록의 작업까지 보게 된다.
+      `login_id`·`who` 는 **표시에만** 쓴다.
+    ★③ 식별자가 없으면 **막는다** — 보류가 있는지 없는지 확인할 방법이 없는데
+      '없다' 로 단정하면 로그아웃 대기 계정에 발행이 나갈 수 있다.
     """
+    aid = (account_id or "").strip()
+    label = who or login_id or (f"계정 {aid}" if aid else "이 계정")
+    if not aid:
+        tail = f"{chr(10)}{chr(10)}대상: {label}" if (who or login_id) else ""
+        return (f"**계정을 특정할 수 없어 새 작업을 만들지 않았습니다** "
+                f"(안전을 위해 막았습니다).{tail}"
+                f"{chr(10)}{chr(10)}계정 식별자(account.id)가 비어 있어 보류 작업을 "
+                f"확인할 수 없습니다. 화면을 새로 고치고 계정을 다시 고른 뒤 "
+                f"시도해 주세요."
+                f"{chr(10)}{chr(10)}※ 다른 계정의 발행은 영향받지 않습니다.")
     #  ★제출 직전 판정은 **캐시를 쓰지 않는다**(2026-11-05). 렌더 시점 이후에
     #    걸린 보류를 놓치면 로그아웃 대기 계정에 발행이 그대로 나간다.
-    stt = logout_state(store_obj, login_id, account_id, fresh=True)
-    who = login_id or f"계정 {account_id}"
+    stt = logout_state(store_obj, "", aid, fresh=True)
+    who = label
     if stt.get("read_error"):
         return (f"**{who} 의 보류 작업을 확인하지 못해 새 작업을 만들지 "
                 f"않았습니다**(안전을 위해 막았습니다)."
@@ -1405,8 +1421,10 @@ def logout_block(store_obj, login_id: str, account_id: str = "") -> str:
         bits.append(f"끝나기를 기다리는 배치 {len(stt['running'])}건")
     if stt["logout_job"]:
         bits.append("로그아웃 작업 대기")
-    who = login_id or f"계정 {account_id}"
-    return (f"**{who} 는 로그아웃 대기 상태입니다** — 새 작업을 만들지 "
+    #  ★`label` 을 그대로 쓴다(2026-11-05). 여기서 다시 계산하면 호출한 쪽이
+    #    준 표시 이름(`who`)이 무시되고 **세션 폴더 이름(account.id)이 화면에
+    #    노출**된다(2026-09-17 결정 위반).
+    return (f"**{label} 는 로그아웃 대기 상태입니다** — 새 작업을 만들지 "
             f"않습니다({' · '.join(bits)})."
             f"{chr(10)}{chr(10)}재로그인(**[실행 준비]**) 뒤 **[보류 작업 재개]** 를 "
             f"누르면 이어서 진행됩니다. 다른 계정의 작업은 영향받지 않습니다.")
@@ -1449,10 +1467,17 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
     device_id = (device or {}).get("device_id") or ""
     can_logout = agent_can_logout(device)
     lid = (getattr(account, "login_id", "") or "").strip()
-    #   ★login_id 가 없는 기존 계정(tab_… 등)도 로그아웃할 수 있어야 한다.
-    #     그 계정의 유일한 정확한 식별자는 **세션 폴더 이름(account.id)** 이다.
-    aid = "" if lid else (getattr(account, "id", "") or "").strip()
-    stt = logout_state(store_obj, lid, aid)
+    #  ★발행 작업(조회·보류·재개)의 식별자는 **account.id 하나**다(2026-11-05).
+    #    왜 login_id 를 쓰지 않나 — 같은 네이버 ID 를 브랜드별로 나눠 등록해 쓴다
+    #    (`…_re` / `…_dn`). 그건 오류가 아니라 **의도된 운영 구조**다. 그래서
+    #      · login_id 로 조회하면 **다른 등록의 작업까지** 끌어온다(과도)
+    #      · 등록 전에 만든 작업은 payload.login_id 가 비어 **놓친다**(누락)
+    #    `payload.account` 는 발행·세션 작업 **모두에 항상** 채워지므로
+    #    account.id 하나로 누락도 침범도 없다.
+    #  ★login_id 는 **표시**와 **공유 세션 영향 분석**(Agent 쪽 logout_allowed)에
+    #    쓴다 — 거기서는 같은 네이버 계정 전체를 봐야 맞다(층이 다르다).
+    aid = (getattr(account, "id", "") or "").strip()
+    stt = logout_state(store_obj, "", aid)
 
     st.markdown("##### 🔐 네이버 계정 관리")
     st.markdown(f"**{account.label or account.id}**")
@@ -1534,7 +1559,9 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                          disabled=not (device_id and (lid or aid) and can_logout),
                          help="이 계정만 로그아웃합니다. 실행 중인 10건 배치는 "
                               "끝까지 발행한 뒤 로그아웃합니다"):
-                do_logout(store_obj, brand, account, lid, device_id,
+                #  ★보류는 account.id 범위다 — login_id 를 넘기면 같은 네이버 ID 를
+                #    쓰는 **다른 등록**의 대기 작업까지 보류된다(2026-11-05).
+                do_logout(store_obj, brand, account, "", device_id,
                           account_id=aid, confirm_shared=bool(shared_ok))
             if not (lid or aid):
                 st.caption("※ 계정을 특정할 수 없습니다(세션 폴더 이름도 비어 "
@@ -1557,7 +1584,8 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
         elif st.button("보류 작업 재개", type="primary", use_container_width=True,
                        disabled=not (lid or aid),
                        help="보류해 둔 작업을 다시 대기 상태로 돌립니다"):
-            do_resume(store_obj, lid, device_id, account_id=aid)
+            #  ★재개도 같은 범위(account.id)로 되돌린다.
+            do_resume(store_obj, "", device_id, account_id=aid)
     st.caption("※ 여기서 하는 일은 **이 계정에만** 적용됩니다. 다른 로그인 계정·"
                "다른 PC 의 세션과 작업은 건드리지 않습니다.")
 
@@ -1721,8 +1749,12 @@ def submit_guarded(store_obj, job, *, kind: str = "run", title: str = "",
     #   로그인·세션확인·로그아웃(session)은 복구 수단이므로 막지 않는다.
     #   아직 아무것도 보내지 않았으므로 '실패 확정' 이 맞다(중복 위험 없음).
     if kind == "run":
-        why = logout_block(store_obj, getattr(job, "login_id", "") or "",
-                           getattr(job, "account", "") or "")
+        #  ★발행 직전 확인도 **account.id 기준**이다(2026-11-05).
+        #    `payload.account` 는 언제나 채워지므로 login_id 등록 여부와 무관하게
+        #    그 등록의 보류 작업을 빠짐없이 본다.
+        why = logout_block(store_obj, "",
+                           getattr(job, "account", "") or "",
+                           who=getattr(job, "account_name", "") or "")
         if why:
             st.error(why)
             return queue_store.SubmitResult(queue_store.SUBMIT_FAILED, message=why)

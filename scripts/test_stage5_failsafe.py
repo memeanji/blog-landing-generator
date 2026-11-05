@@ -110,9 +110,13 @@ def logout_state(store_obj, login_id, account_id="", **kw):
     return _raw_logout_state(store_obj, login_id, account_id, **kw)
 
 
-def logout_block(store_obj, login_id, account_id="", **kw):
+#  ★설계 ④(2026-11-05) — 발행 작업 범위는 **account.id** 다. 같은 네이버 ID 를
+#    여러 등록(`…_re`/`…_dn`)으로 나눠 쓰므로 login_id 로 범위를 정하면 다른
+#    등록의 작업까지 끌어오고, 등록 전 작업은 놓친다. 상세는 stage11.
+def logout_block(store_obj, login_id="", account_id="", **kw):
+    #  식별자 하나만 주면 그것을 account.id 로 본다(제품 계약에 맞춘다).
     _new_render()
-    return _raw_logout_block(store_obj, login_id, account_id, **kw)
+    return _raw_logout_block(store_obj, "", (account_id or login_id), **kw)
 
 
 def _wire_range(s, counter=None):
@@ -207,7 +211,7 @@ class FlakyOnce:
 
 for label, store in (("5xx", Down()), ("타임아웃", Timeout())):
     stt = logout_state(store, "loginW", "")
-    why = logout_block(store, "loginW", "")
+    why = logout_block(store, account_id="acc_w")
     check(f"[{label}] 읽기 실패가 기록된다", bool(stt["read_error"]),
           stt["read_error"][:50])
     check(f"[{label}] '보류 0건' 과 구분된다",
@@ -231,7 +235,7 @@ check(f"빠른 실패는 {FAST_EXTRA}회 더 시도한다(일시 오류 복구)"
       f"extra={FAST_EXTRA} · 기준 {FAST_SEC}초")
 
 tries_seen["n"] = 0
-logout_block(Down(), "loginW", "")          # 즉시 503 = 빠른 실패
+logout_block(Down(), account_id="acc_w")    # 즉시 503 = 빠른 실패
 check("빠른 실패는 그 횟수만 시도한다(무한 재시도 아님)",
       tries_seen["n"] == TRIES + FAST_EXTRA,
       f"{tries_seen['n']}회 (기대 {TRIES + FAST_EXTRA})")
@@ -253,7 +257,7 @@ class SlowDown:
 
 SlowDown.calls = 0
 t_slow = time.monotonic()
-why_slow = logout_block(SlowDown(), "loginW", "")
+why_slow = logout_block(SlowDown(), account_id="acc_w")
 slow_el = time.monotonic() - t_slow
 check("★느린 실패는 재시도하지 않는다(요청 1회로 끝)", SlowDown.calls == 1,
       f"{SlowDown.calls}회 · {slow_el:.2f}초")
@@ -261,22 +265,27 @@ check("  그래도 신규 발행은 막는다(fail-safe 유지)",
       "확인하지 못해 새 작업을 만들지 않았습니다" in why_slow)
 
 flaky = FlakyOnce()
-why_flaky = logout_block(flaky, "loginW", "")
+why_flaky = logout_block(flaky, account_id="acc_w")
 check("★일시 오류는 재시도로 복구되어 **막지 않는다**",
       why_flaky == "" and flaky.calls >= 2, f"calls={flaky.calls}")
 
 good = LocalStore(SANDBOX / "q_ok")
-check("정상 계정(보류 0건)은 막지 않는다", logout_block(good, "loginOK", "") == "")
+check("정상 계정(보류 0건)은 막지 않는다",
+      logout_block(good, account_id="acc_ok") == "")
 mixed = LocalStore(SANDBOX / "q_mixed")
 jb = mixed.submit(Job(brand="repurely", account="acc_b", login_id="loginB",
                       flow="production", count=10), title="b", target_agent="PC1")
-mixed.hold_account("loginB", device="PC1")
+mixed.hold_account("", device="PC1", account_id="acc_b")   # ★account.id 범위
 check("보류된 계정만 막고 다른 계정은 통과한다",
-      "보류된 작업 1건" in logout_block(mixed, "loginB", "")
-      and logout_block(mixed, "loginC", "") == "")
+      "보류된 작업 1건" in logout_block(mixed, account_id="acc_b")
+      and logout_block(mixed, account_id="acc_c") == "")
+#  ★창 크기(1200자)에 기대지 않는다 — 함수가 길어지면 조용히 통과/실패한다
+#    (2026-11-05: 설계 ④ 의 fail-safe 가 추가되자 창 밖으로 밀렸다).
+_lb_src = APP.split("def logout_block")[1].split(chr(10) + "def ")[0]
+_ls_src = APP.split("def _logout_state_read")[1].split(chr(10) + "def ")[0]
 check("조회 실패는 **그 계정 조회 결과**로만 판단한다(전역 플래그 없음)",
-      "read_error" in APP.split("def logout_block")[1][:1200]
-      and "global " not in APP.split("def logout_state")[1][:2000])
+      "read_error" in _lb_src and "global " not in _ls_src,
+      f"logout_block {len(_lb_src)}자 · _logout_state_read {len(_ls_src)}자")
 
 guard = APP.split("def submit_guarded")[1].split("def render_pending_submit")[0]
 check("제출 가드가 run 작업에 걸린다(수동·자동 공통 통로)",
@@ -294,7 +303,7 @@ class BlockedSubmit:
 
     def __call__(self, batch):
         self.calls += 1
-        why = logout_block(self.store, "loginW", "")
+        why = logout_block(self.store, account_id="acc_w")
         if why:
             raise RuntimeError(why)
         return "job-new"
@@ -400,7 +409,8 @@ check("  화면은 그것을 '읽기 실패' 로 받아 pending 을 단정하지
       bool(stt_short["read_error"]) and stt_short["pending"] is False)
 check("  그래서 신규 발행도 막힌다",
       "확인하지 못해 새 작업을 만들지 않았습니다"
-      in logout_block(sup(short_rest, count=lambda q: 50), "loginW", ""))
+      in logout_block(sup(short_rest, count=lambda q: 50),
+                      account_id="acc_w"))
 
 #  일시적인 수 불일치는 한 번 더 읽어 통과한다
 state = {"n": 0}
@@ -594,7 +604,7 @@ after = race.submit(Job(brand="repurely", account="acc_w", login_id="loginW",
 check("2차 스윕 뒤에 들어온 작업은 pending 으로 남는다(창이 완전히 닫히지는 않는다)",
       (race.get(after) or {}).get("status") == PENDING)
 check("  그래도 그 계정의 **다음** 제출은 막힌다(보류가 있으므로)",
-      "로그아웃 대기 상태입니다" in logout_block(race, "loginW", ""))
+      "로그아웃 대기 상태입니다" in logout_block(race, account_id="acc_w"))
 check("  DB 수준 원자적 처리 방안이 문서로 남아 있다",
       "account_holds" in (ROOT / "supabase" / "schema_account_holds.sql"
                           ).read_text(encoding="utf-8"))
@@ -652,7 +662,8 @@ class OldStore:
 
 
 check("  그 폴백으로도 보류를 찾아 차단한다",
-      "로그아웃 대기 상태입니다" in logout_block(OldStore(), "loginW", ""))
+      "로그아웃 대기 상태입니다" in logout_block(OldStore(),
+                                              account_id="acc_w"))
 
 
 # ══════════════════════════════════════════════════════════════════

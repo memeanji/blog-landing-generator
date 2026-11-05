@@ -314,17 +314,22 @@ def _render_reset() -> None:
 
 _rls, _rlb = ns["logout_state"], ns["logout_block"]
 ns["logout_state"] = lambda s, l, a="", **k: (_render_reset(), _rls(s, l, a, **k))[1]
-ns["logout_block"] = lambda s, l, a="", **k: (_render_reset(), _rlb(s, l, a, **k))[1]
+#  ★설계 ④(2026-11-05) — 발행 작업 범위는 **account.id** 다. 같은 네이버 ID 를
+#    여러 등록(`…_re`/`…_dn`)으로 나눠 쓰므로 login_id 로 범위를 정하면 다른
+#    등록의 작업까지 끌어오고, 등록 전 작업은 놓친다. 상세는 stage11.
+ns["logout_block"] = (lambda s, l="", a="", **k:
+                      (_render_reset(), _rlb(s, "", (a or l), **k))[1])
 
 stt = ns["logout_state"](store, "loginW", "")
 check("★화면이 보류를 본다(작업 201건 뒤에 있어도)",
       len(stt["held"]) == 1 and stt["pending"] is True,
       f"held={len(stt['held'])} pending={stt['pending']}")
 check("화면 상태에 읽기 오류 표시가 없다", stt.get("read_error") == "")
-block = ns["logout_block"](store, "loginW", "")
+block = ns["logout_block"](store, "acc_w")       # ★account.id 범위
 check("★새 발행 작업을 막는다(차단 누락 해소)",
       "로그아웃 대기 상태입니다" in block and "보류된 작업 1건" in block)
-check("다른 계정은 막지 않는다", ns["logout_block"](store, "other1", "") == "")
+check("다른 등록은 막지 않는다",
+      ns["logout_block"](store, "acc_other1") == "")
 
 logout_job = store.submit(Job(brand="repurely", account="acc_w",
                               login_id="loginW",

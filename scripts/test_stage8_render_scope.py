@@ -126,6 +126,15 @@ begin_render = NS["begin_render"]
 render_scope, render_seq = NS["render_scope"], NS["render_seq"]
 query_deadline = NS["query_deadline"]
 logout_state, logout_block = NS["logout_state"], NS["logout_block"]
+
+#  ★설계 ④(2026-11-05) — 운영 코드는 발행 작업 범위를 **account.id** 로 정한다.
+#    테스트가 식별자 하나만 주면 그것을 account.id 로 본다(옛 호출부를 그대로 둔다).
+_raw_lb = logout_block
+
+
+def logout_block(store_obj, login_id="", account_id="", **kw):
+    return _raw_lb(store_obj, "", (account_id or login_id), **kw)
+
 BUDGET = NS["RENDER_QUERY_BUDGET"]
 SEQ_KEY = NS["RENDER_SEQ_KEY"]
 
@@ -242,7 +251,7 @@ check("캐시는 옛 값을 준다", logout_state(q_f, "loginW", "")["held"] == 
 check("★fresh=True 는 다시 읽어 보류를 본다",
       len(logout_state(q_f, "loginW", "", fresh=True)["held"]) == 1)
 check("  제출 판정이 fresh=True 를 쓴다",
-      "logout_state(store_obj, login_id, account_id, fresh=True)" in APP)
+      'logout_state(store_obj, "", aid, fresh=True)' in APP)
 
 head("⑥ session_state 를 못 쓰는 환경 폴백")
 saved = NS["st"]

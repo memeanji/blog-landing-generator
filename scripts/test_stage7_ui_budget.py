@@ -87,6 +87,15 @@ for _n in TREE.body:
             "logout_block"):
         exec(compile(ast.Module([_n], []), "streamlit_app.py", "exec"), NS)
 logout_state, logout_block = NS["logout_state"], NS["logout_block"]
+
+#  ★설계 ④(2026-11-05) — 운영 코드는 발행 작업 범위를 **account.id** 로 정한다.
+#    테스트가 식별자 하나만 주면 그것을 account.id 로 본다(옛 호출부를 그대로 둔다).
+_raw_lb = logout_block
+
+
+def logout_block(store_obj, login_id="", account_id="", **kw):
+    return _raw_lb(store_obj, "", (account_id or login_id), **kw)
+
 render_scope, query_deadline = NS["render_scope"], NS["query_deadline"]
 
 BUDGET = NS["RENDER_QUERY_BUDGET"]
@@ -278,10 +287,16 @@ check("★fresh=True 는 다시 읽어 보류를 본다", len(fresh["held"]) == 
       f"held {len(fresh['held'])}건")
 check("  그래서 그 계정의 신규 발행이 차단된다",
       "로그아웃 대기 상태입니다" in logout_block(st7, "loginW", ""))
+#  ★정책 변경(2026-11-05 · 설계 ④) — 발행 작업의 조회·보류·재개 범위는
+#    **account.id 하나**다. 같은 네이버 ID 를 여러 등록(`…_re`/`…_dn`)으로
+#    나눠 쓰는 운영 구조에서 login_id 로 조회하면 다른 등록의 작업까지
+#    끌어오고(과도), 등록 전 작업은 놓친다(누락). 상세 검증은 stage11.
 check("★제출 판정(logout_block)이 fresh=True 를 쓴다",
-      "logout_state(store_obj, login_id, account_id, fresh=True)" in APP)
+      'logout_state(store_obj, "", aid, fresh=True)' in APP)
 check("  표시 경로(render_account_tools)는 캐시를 쓴다(fresh 아님)",
-      "stt = logout_state(store_obj, lid, aid)" in APP)
+      'stt = logout_state(store_obj, "", aid)' in APP)
+check("  두 경로가 **같은 식별자(account.id)** 를 쓴다",
+      'logout_state(store_obj, "", aid' in APP)
 
 head("⑦ 실패와 '보류 0건' 구분 — 기존 동작 유지")
 new_render()

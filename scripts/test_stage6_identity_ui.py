@@ -116,9 +116,11 @@ def logout_state(store_obj, login_id, account_id="", **kw):
     return _raw_logout_state(store_obj, login_id, account_id, **kw)
 
 
-def logout_block(store_obj, login_id, account_id="", **kw):
+def logout_block(store_obj, login_id="", account_id="", **kw):
+    #  ★설계 ④(2026-11-05) — 발행 작업 범위는 account.id 다. 식별자 하나만 주면
+    #    그것을 account.id 로 본다.
     _new_render()
-    return _raw_logout_block(store_obj, login_id, account_id, **kw)
+    return _raw_logout_block(store_obj, "", (account_id or login_id), **kw)
 
 
 def panel_src() -> str:
@@ -299,14 +301,18 @@ check("★조회 호출 수가 상한 안이다(상태 3종 × 재시도 2회 = 
 
 good = LocalStore(SANDBOX / "q_other")
 check("같은 화면에서 다른 정상 계정은 막히지 않는다",
-      logout_block(good, "otheraccount", "") == "")
+      logout_block(good, account_id="other_acc") == "")
 mine = good.submit(Job(brand="b", account="acc_m", login_id="test01",
                        flow="production", count=10), title="t",
                    target_agent="PC1")
-good.hold_account("test01", device="PC1")
-check("보류된 계정만 막힌다",
-      "로그아웃 대기 상태입니다" in logout_block(good, "test01", "")
-      and logout_block(good, "test010", "") == "")
+#  ★보류도 account.id 로 한다(설계 ④) — login_id 로 하면 같은 네이버 ID 를 쓰는
+#    다른 등록의 작업까지 보류된다.
+good.hold_account("", device="PC1", account_id="acc_m")
+check("★보류된 등록만 막힌다(account.id 기준)",
+      "로그아웃 대기 상태입니다" in logout_block(good, account_id="acc_m")
+      and logout_block(good, account_id="acc_m_re") == "")
+check("  같은 login_id 를 쓰는 **다른 등록**은 막히지 않는다(섞이지 않는다)",
+      logout_block(good, account_id="acc_m_dn") == "")
 
 stt_err = logout_state(Flaky(), "test01", "")
 check("★API 오류를 '보류 0건' 으로 표시하지 않는다",
@@ -356,15 +362,22 @@ head("④ 로그인 상태 확인 ↔ 로그아웃의 계정 참조 일치")
 panel = APP.split("def render_account_tools")[1].split("def do_logout")[0]
 check("식별자를 한 번만 정한다(lid=login_id, aid=없을 때만 account.id)",
       'lid = (getattr(account, "login_id", "") or "").strip()' in panel
-      and 'aid = "" if lid else (getattr(account, "id", "") or "").strip()' in panel)
+      and 'aid = (getattr(account, "id", "") or "").strip()' in panel)
 check("상태확인은 그 account 객체를 그대로 넘긴다",
       'submit_session_job(store_obj, brand, account, "--check"' in panel)
-check("로그아웃도 같은 lid·aid 를 넘긴다",
-      "do_logout(store_obj, brand, account, lid, device_id," in panel
+check("★로그아웃(보류)도 account.id 로만 한다(설계 ④)",
+      'do_logout(store_obj, brand, account, "", device_id,' in panel
       and "account_id=aid" in panel)
-check("재개도 같은 lid·aid 를 넘긴다",
-      "do_resume(store_obj, lid, device_id, account_id=aid)" in panel)
-check("상태 조회도 같은 lid·aid 로 한다", "logout_state(store_obj, lid, aid)" in panel)
+check("★재개도 account.id 로만 한다(설계 ④)",
+      'do_resume(store_obj, "", device_id, account_id=aid)' in panel)
+#  ★정책 변경(2026-11-05 · 설계 ④) — 발행 작업의 조회·보류·재개 범위는
+#    **account.id 하나**다. 같은 네이버 ID 를 여러 등록(`…_re`/`…_dn`)으로
+#    나눠 쓰는 운영 구조에서 login_id 로 조회하면 다른 등록의 작업까지
+#    끌어오고(과도), 등록 전 작업은 놓친다(누락). 상세 검증은 stage11.
+check("★상태 조회는 account.id 로만 한다(설계 ④)",
+      'logout_state(store_obj, "", aid)' in panel)
+check("  login_id 는 표시·공유세션 분석용으로만 남는다",
+      'lid = (getattr(account, "login_id", "") or "").strip()' in panel)
 check("식별 불가면 버튼이 잠긴다",
       "disabled=not (device_id and (lid or aid) and can_logout)" in panel)
 check("식별 불가 사유를 화면에 적는다", "계정을 특정할 수 없습니다" in panel)
