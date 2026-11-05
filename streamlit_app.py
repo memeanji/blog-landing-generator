@@ -1001,22 +1001,56 @@ QUEUE_FAST_RETRY_SEC, QUEUE_FAST_EXTRA = 1.5, 1
 QUEUE_PERMANENT_STATUS = (400, 401, 403, 404, 405, 422)
 
 #  렌더 1회가 **조회에 쓸 수 있는 전체 시간**(초, 2026-11-05).
-#    ★Streamlit 은 렌더마다 이 파일을 처음부터 다시 실행하므로 아래 모듈 변수는
-#      렌더마다 새로 만들어진다 = 렌더 스코프.
 #    ★이 예산은 '조회 경로' 에만 적용된다. 진행 중인 HTTP 요청은 끊을 수 없으므로
 #      실제 상한은 `예산 + 요청 1회`(≈18+8=26초)이고, 구글 시트·그림 그리기 등
 #      **렌더 전체의 절대 상한은 아니다**(2026-11-05 실측 근거).
 RENDER_QUERY_BUDGET = 18.0
 
+#  렌더 번호를 남겨 두는 자리 — 경계가 **눈에 보이게** 한다(테스트·디버깅용).
+RENDER_SEQ_KEY = "_render_seq"
+
+
+def begin_render() -> int:
+    """이 렌더의 조회 캐시·예산을 **새로** 시작한다. 모듈 본문에서 한 번만 부른다.
+
+    ★왜 이렇게 바꿨나(2026-11-05) — 처음에는 "Streamlit 은 렌더마다 모듈을 다시
+      실행하므로 모듈 변수가 저절로 비워진다" 는 **전제**에 기댔다. 그 전제가
+      틀리면 `deadline` 이 살아남아 **예산이 영구히 소진**되고, 그러면 모든 계정의
+      조회가 '확인 불가' 가 되어 **발행이 전부 차단**된다. 전제에 기대지 않고
+      렌더 시작점에서 **직접 비운다.**
+    ★여기서 의존하는 것은 "본문이 렌더마다 처음부터 실행된다" 하나뿐이다 —
+      그건 Streamlit 의 기본 동작이고 AppTest 로 확인할 수 있다
+      (`scripts/test_stage8_render_scope.py`).
+    ★`st.session_state` 에 렌더 번호를 남긴다. 쓸 수 없는 환경(bare 실행·일부
+      테스트)에서는 모듈 변수로 센다 — 어느 쪽이든 **비우는 것은 똑같이** 한다.
+    """
+    try:
+        seq = int(st.session_state.get(RENDER_SEQ_KEY, 0) or 0) + 1
+        st.session_state[RENDER_SEQ_KEY] = seq
+    except Exception:                                          # noqa: BLE001
+        seq = int(globals().get("_render_seq_fallback", 0) or 0) + 1
+        globals()["_render_seq_fallback"] = seq
+    globals()["_render_box"] = {RENDER_SEQ_KEY: seq}
+    return seq
+
 
 def render_scope() -> dict:
     """렌더 1회 동안만 사는 저장소(조회 캐시 + 공용 deadline).
 
-    ★`globals()` 에 담는다 — Streamlit 은 렌더마다 모듈을 다시 실행하므로
-      렌더가 끝나면 통째로 버려진다. 세션 상태가 아니라서 사용자 사이에
-      섞이지도 않는다.
+    ★`begin_render()` 가 렌더 시작에서 새로 만들어 둔다. 여기서는 받아 쓰기만
+      한다 — 본문보다 먼저 불린 경우에도 터지지 않게 빈 칸만 만들어 준다.
+    ★세션 상태가 아니라 모듈 변수에 담는다 — 사용자 사이에 섞이지 않는다.
     """
-    return globals().setdefault("_render_box", {})
+    box = globals().get("_render_box")
+    if not isinstance(box, dict):
+        box = {}
+        globals()["_render_box"] = box
+    return box
+
+
+def render_seq() -> int:
+    """지금 몇 번째 렌더인가(0 = 아직 시작 표시가 없음)."""
+    return int(render_scope().get(RENDER_SEQ_KEY, 0) or 0)
 
 
 def query_deadline() -> float:
@@ -1030,6 +1064,15 @@ def query_deadline() -> float:
         budget = globals().get("RENDER_QUERY_BUDGET", 18.0)
         box["deadline"] = time.monotonic() + float(budget)
     return box["deadline"]
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ★렌더 경계 — 여기가 이 렌더의 시작점이다.
+#    조회 캐시와 조회 예산(deadline)을 **반드시 여기서** 새로 만든다.
+#    아래 본문에서 큐를 조회하는 코드(render_account_tools · logout_block)보다
+#    먼저 실행되어야 한다. 새 조회 코드를 이 위로 올리지 말 것.
+# ══════════════════════════════════════════════════════════════════
+begin_render()
 
 
 def store_takes_deadline(store_obj) -> bool:
