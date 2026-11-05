@@ -1075,6 +1075,159 @@ def query_deadline() -> float:
 begin_render()
 
 
+# ══════════════════════════════════════════════════════════════════
+#  B1 — 로그인(세션) 작업 자동 새로고침 예산 (2026-11-05)
+#    ★무엇을 막나 — 로그인 작업이 `pending`/`running` 으로 남아 있으면 화면이
+#      2초마다 영원히 다시 그려졌다(= 무한 로딩). 그 갱신을 **끝나게** 한다.
+#    ★무엇을 하지 않나 — 로그인 작업을 **취소하지 않는다.** `cancel_requested`
+#      를 쓰지 않고 큐·작업 상태를 바꾸지 않는다. 15분은 작업 실패 판정이 아니라
+#      **화면 자동 새로고침의 최대 유지시간**이다.
+#    ★발행 작업 감시(`_auto_refresh`)는 건드리지 않는다 — 거기엔 예산이 없다.
+# ══════════════════════════════════════════════════════════════════
+WATCH_WANT_KEY = "_watch_login"            # 로그인 경로가 이 렌더에 갱신을 요청했나
+WATCH_BUDGET_KEY = "_watch_login_budget"   # 예산 상태(렌더 사이에 이어진다)
+WATCH_HARD_SEC = 900.0                     # 하드 상한 15분 — 다섯 등급 공통
+
+#  등급 → (ticks, 무변화 경과 초)
+#    ★ticks 는 그물이다. 운영 주기는 `time.sleep(2.0)` 이라 2초 이상이고,
+#      그러면 시간 예산이 항상 먼저 걸린다(2026-11-05 시뮬레이션 28조합 확인).
+#      누가 sleep 을 줄이거나 없애면 ticks 가 대신 잡는다.
+#      ticks = ceil(시간 / 2.0 x 1.5)
+WATCH_BUDGET = {
+    "pending_idle":   (90,  120.0),   # PC 는 살아 있고 이 작업을 집기만 하면 된다
+    "pending_busy":   (675, 900.0),   # ★PC 가 다른 작업(10건 배치 등) 중 = 정당한 대기
+    "pending_dead":   (23,  30.0),    # PC 무응답 — 집어갈 사람이 없다
+    "running_mine":   (540, 720.0),   # 사람이 로그인하는 중(Agent 대기 600초 + 여유)
+    "running_orphan": (45,  60.0),    # PC 무응답이거나 다른 작업을 들고 있다(고아)
+}
+WATCH_LABEL = {
+    "pending_idle": "PC 가 이 작업을 아직 집지 않았습니다",
+    "pending_busy": "PC 가 다른 작업을 처리하는 중입니다 — 끝나면 이어집니다",
+    "pending_dead": "PC 가 응답하지 않습니다",
+    "running_mine": "PC 가 이 로그인 작업을 처리하는 중입니다",
+    "running_orphan": "PC 가 응답하지 않거나 다른 작업을 들고 있습니다",
+}
+
+
+def agent_of(alive_list, device_id: str) -> dict:
+    """이 PC 의 Agent 현황 한 줄(없으면 빈 dict).
+
+    ★`live_agents()` 가 매 렌더 이미 받아 온 목록을 나눠 쓴다 — 추가 조회 0회.
+    ★목록에 없으면 무응답이다(`live_agents` 는 하트비트가 싱싱한 것만 담는다).
+    """
+    want = str(device_id or "").strip()
+    if not want:
+        return {}
+    for a in alive_list or []:
+        if str(a.get("device_id") or a.get("agent") or "") == want:
+            return dict(a)
+    return {}
+
+
+def watch_grade(rec: dict | None, agent: dict | None) -> str:
+    """로그인 작업 감시 등급 — 연결 상태로 **고르기만** 한다.
+
+    ★이 함수는 예산을 리셋하지 않는다. 등급이 느슨해져도 이미 흐른 시간은 그대로
+      남는다 — 연결 상태는 진행 신호가 아니다.
+    ★무응답이면 무응답 등급이 **먼저**다. 'PC 가 다른 작업 중' 은 Agent 가 실제로
+      살아 있고(`alive`) 다른 **유효한** 작업 번호를 들고 있을 때만 준다.
+    """
+    status = ((rec or {}).get("status") or "").strip()
+    job_id = str((rec or {}).get("id") or "").strip()
+    alive = bool((agent or {}).get("alive"))
+    cur = str((agent or {}).get("job") or "").strip()
+    if status == queue_store.RUNNING:
+        if alive and cur and cur == job_id:
+            return "running_mine"
+        return "running_orphan"
+    if not alive:
+        return "pending_dead"
+    if cur and cur != job_id:
+        return "pending_busy"
+    return "pending_idle"
+
+
+def watch_signal(rec: dict | None) -> tuple:
+    """진행 신호 — 작업 레코드의 **실제 변화**만 본다.
+
+    ★시간이 흐르는 것만으로는 예산을 리셋하지 않는다. 연결 상태(alive·state)도
+      여기에 넣지 않는다 — 하트비트가 2초마다 와도 진행이 아니다.
+    """
+    r = rec or {}
+    return (r.get("status"), r.get("started_at"), r.get("made"), r.get("total"),
+            len(r.get("published") or []), r.get("error"))
+
+
+def watch_login(rec: dict | None, agent: dict | None) -> tuple[bool, str, str]:
+    """`(갱신을 계속할까, 등급, 멈춘 이유)`.
+
+    ★ticks · 무변화 경과 · 하드 상한을 **독립**으로 본다(어느 하나라도 소진되면
+      중단). 진행 신호는 ticks 와 무변화 경과만 리셋하고 **하드 상한은 리셋하지
+      않는다** — 대상이 바뀌거나 [상태 다시 확인] 을 눌렀을 때만 새로 시작한다.
+    """
+    job_id = str((rec or {}).get("id") or "").strip()
+    if not job_id:
+        return False, "", ""
+    grade = watch_grade(rec, agent)
+    ticks_max, stale_max = WATCH_BUDGET[grade]
+    now = time.monotonic()
+    sig = watch_signal(rec)
+
+    box = st.session_state.get(WATCH_BUDGET_KEY)
+    if not isinstance(box, dict) or box.get("job") != job_id:
+        #  대상이 바뀌었다 → 예산과 하드 상한을 모두 새로 시작한다
+        box = {"job": job_id, "sig": sig, "ticks": 0, "since": now,
+               "hard_since": now, "stopped": ""}
+    elif box.get("sig") != sig:
+        #  ★진행 신호 — ticks·무변화 경과만 리셋(하드 상한은 그대로)
+        box.update(sig=sig, ticks=0, since=now, stopped="")
+    st.session_state[WATCH_BUDGET_KEY] = box
+
+    if box.get("stopped"):
+        return False, grade, str(box["stopped"])
+
+    why = ""
+    if int(box.get("ticks") or 0) >= ticks_max:
+        why = f"자동 확인을 {ticks_max}번 했는데 진행 변화가 없었습니다"
+    elif now - float(box.get("since") or now) >= stale_max:
+        why = (f"{stale_max / 60:.0f}분 동안 진행 변화가 없었습니다"
+               if stale_max >= 60 else
+               f"{stale_max:.0f}초 동안 진행 변화가 없었습니다")
+    elif now - float(box.get("hard_since") or now) >= WATCH_HARD_SEC:
+        why = f"자동 확인을 {WATCH_HARD_SEC / 60:.0f}분 동안 계속했습니다"
+    if why:
+        box["stopped"] = why
+        return False, grade, why
+
+    box["ticks"] = int(box.get("ticks") or 0) + 1
+    return True, grade, ""
+
+
+def watch_login_reset() -> None:
+    """[상태 다시 확인] — 로그인 감시 예산과 하드 상한을 새로 시작한다.
+
+    ★조회 예산(`deadline`)은 따로 비우지 않아도 된다 — 버튼을 누르면 렌더가 다시
+      돌고 `begin_render()` 가 새 예산을 만든다.
+    ★로그인 작업은 건드리지 않는다(취소·큐 변경 없음).
+    """
+    st.session_state.pop(WATCH_BUDGET_KEY, None)
+    st.session_state[WATCH_WANT_KEY] = 0
+
+
+def watch_login_wanted() -> bool:
+    """로그인 경로가 **이 렌더에서** 갱신을 요청했는가.
+
+    ★렌더 번호를 함께 적어 둔다 — 지난 렌더의 요청이 남아 갱신이 이어지는 일이
+      없다(따로 비우는 코드가 필요 없다).
+    """
+    try:
+        want = st.session_state.get(WATCH_WANT_KEY)
+    except Exception:                                          # noqa: BLE001
+        return False
+    seq = render_seq()
+    return bool(seq) and want == seq
+
+
 def store_takes_deadline(store_obj) -> bool:
     """이 저장소의 `list_by_status` 가 `deadline` 을 받는가(렌더당 1회만 확인).
 
@@ -2047,9 +2200,28 @@ with left:
         elif job_state in RUNNING_STATES:
             # 로그인이 끝나면 저절로 바뀌도록, 이 화면을 잠시 뒤 다시 그린다
             #   (아래 맨 끝에서 한 번만 건다 — 그리는 도중에 걸면 화면이 깨진다)
-            st.session_state["_auto_refresh"] = True
+            #  ★B1(2026-11-05) — 예산이 남아 있을 때만 갱신을 요청한다.
+            #    `_auto_refresh`(발행 경로)는 건드리지 않는다.
+            _keep, _grade, _why = watch_login(
+                last_login,
+                agent_of(alive, (device or {}).get("device_id") or ""))
+            st.session_state[WATCH_WANT_KEY] = render_seq() if _keep else 0
             st.info("▶ 로그인 창이 열렸습니다 — 네이버 로그인을 직접 마쳐 주세요."
                     f"{chr(10)}로그인이 끝나면 세션이 저장되고 자동으로 준비 완료가 됩니다.")
+            if not _keep:
+                st.warning(
+                    f"**자동 확인을 멈췄습니다** — {_why}."
+                    f"{chr(10)}{chr(10)}★**로그인 작업은 취소되지 않았습니다.** "
+                    f"PC 에서 그대로 진행 중일 수 있습니다"
+                    f"(큐와 작업 상태를 바꾸지 않았습니다)."
+                    f"{chr(10)}{chr(10)}지금 상태: {WATCH_LABEL.get(_grade, _grade)}"
+                    f"{chr(10)}{chr(10)}아래 버튼을 누르면 다시 확인합니다.")
+                if st.button("상태 다시 확인", key="_watch_recheck",
+                             use_container_width=True,
+                             help="로그인 진행 상태를 지금 다시 읽고 자동 확인을 "
+                                  "처음부터 다시 시작합니다(작업은 건드리지 않습니다)"):
+                    watch_login_reset()
+                    st.rerun()
         else:
             st.warning("○ 준비 필요 — 아래 [실행 준비] 를 눌러 주세요")
 
@@ -2410,6 +2582,11 @@ else:
 #   ★반드시 **맨 끝에서 한 번만** 건다. 화면을 그리는 도중에 걸면 방금 그린
 #     것과 부딪혀 빨간 오류(removeChild)가 난다.
 # ══════════════════════════════════════════════════════════════════
-if st.session_state.get("_auto_refresh"):
+#   ★B1(2026-11-05) — 두 경로를 **구분**한다.
+#       `_auto_refresh`         = 발행 작업 감시가 요청(기존 그대로, **예산 없음**)
+#       `_watch_login`(렌더번호) = 로그인 작업 감시가 요청(예산이 남을 때만)
+#     발행 쪽이 요청했으면 **무조건** 갱신한다 — 로그인 예산과 무관하다.
+#     그래서 발행이 도는 동안은 예전과 100% 같게 동작한다.
+if st.session_state.get("_auto_refresh") or watch_login_wanted():
     time.sleep(2.0)
     st.rerun()
