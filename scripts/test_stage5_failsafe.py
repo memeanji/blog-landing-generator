@@ -69,21 +69,68 @@ for node in TREE.body:                      # 모듈 상수(재시도 횟수 등
         tgt = node.targets[0]
         names = ([getattr(e, "id", "") for e in tgt.elts]
                  if isinstance(tgt, ast.Tuple) else [getattr(tgt, "id", "")])
-        if "QUEUE_READ_TRIES" in names:
+        #  ★대문자 모듈 상수는 **전부** 그대로 집어온다(2026-11-05).
+        #    이름을 하나씩 적으면 상수가 늘 때 테스트가 옛 값을 쓴다.
+        if names and all(n.isupper() for n in names if n):
             try:
                 vals = ast.literal_eval(node.value)
             except Exception:                                  # noqa: BLE001
                 continue
-            vals = vals if isinstance(vals, tuple) else (vals,)
-            for n, v in zip(names, vals):
-                NS[n] = v
+            #  ★`A = (1, 2)` 처럼 **값이 튜플**인 상수는 풀어헤치면 안 된다
+            #    (2026-11-05: QUEUE_PERMANENT_STATUS 가 400 하나로 들어갔다).
+            #    여러 이름에 나눠 담는 것은 `A, B = 1, 2` 꼴뿐이다.
+            if isinstance(tgt, ast.Tuple):
+                vals = vals if isinstance(vals, tuple) else (vals,)
+                for n, v in zip(names, vals):
+                    NS[n] = v
+            else:
+                NS[names[0]] = vals
 TRIES = NS.get("QUEUE_READ_TRIES", 1)
 NS["QUEUE_READ_WAIT"] = 0.01                # 테스트는 실제로 기다리지 않는다
 for node in TREE.body:
     if isinstance(node, ast.FunctionDef) and node.name in (
-            "is_logout_job", "logout_state", "logout_block"):
+            "is_logout_job", "render_scope", "query_deadline",
+            "store_takes_deadline", "logout_state", "_logout_state_read",
+            "logout_block"):
         exec(compile(ast.Module([node], []), "streamlit_app.py", "exec"), NS)
-logout_state, logout_block = NS["logout_state"], NS["logout_block"]
+#  ★테스트에서는 **호출 1회 = 렌더 1회**로 본다(2026-11-05).
+#    운영 화면은 렌더마다 모듈을 다시 실행해 렌더 스코프(조회 캐시 + 예산
+#    deadline)가 새로 생긴다. 테스트는 한 프로세스에서 계속 도므로 직접
+#    비워 주지 않으면 **앞 시나리오의 캐시와 소진된 예산이 뒤로 샌다**.
+#    렌더 안에서의 캐시 동작 자체는 stage7 에서 따로 검증한다.
+def _new_render() -> None:
+    NS.setdefault("_render_box", {}).clear()
+
+
+_raw_logout_state, _raw_logout_block = NS["logout_state"], NS["logout_block"]
+
+
+def logout_state(store_obj, login_id, account_id="", **kw):
+    _new_render()
+    return _raw_logout_state(store_obj, login_id, account_id, **kw)
+
+
+def logout_block(store_obj, login_id, account_id="", **kw):
+    _new_render()
+    return _raw_logout_block(store_obj, login_id, account_id, **kw)
+
+
+def _wire_range(s, counter=None):
+    r"""`_rest_range`(행 + 총건수를 한 응답에서) 를 기존 픽스처로 흉내낸다.
+
+    ★2026-11-05 — deploy 판 병합으로 `list_by_status` 가 `_count` 대신
+      `_rest_range` 를 쓴다. 이걸 가로채지 않으면 테스트가 **실제 HTTP 를
+      시도한다**(가짜 주소라 ConnectionError 로 죽는다 = 조용히 통과하지 않는다).
+      `_rest`(행) + `counter`(총건수) 픽스처를 **그대로 재사용**한다.
+    ★총건수는 `count=True` 인 호출(= 첫 페이지)에서만 돌려준다 — 실제 구현과 같다.
+    """
+    def _range(query, count=False, timeout=None):
+        #  ★timeout 은 실제 구현이 넘기는 인자다(UI 예산). 가짜는 받기만 한다.
+        rows = s._rest("GET", query) or []                     # noqa: SLF001
+        total = counter(query) if (count and counter is not None) else None
+        return (rows if isinstance(rows, list) else []), total
+    s._rest_range = _range                                     # noqa: SLF001
+    return s
 
 
 def sup(rest=None, count=None) -> SupabaseStore:
@@ -91,7 +138,7 @@ def sup(rest=None, count=None) -> SupabaseStore:
     if rest is not None:
         s._rest = rest                                         # noqa: SLF001
     s._count = count if count is not None else (lambda q: None)  # noqa: SLF001
-    return s
+    return _wire_range(s, count)
 
 
 def row(jid, status="held", login="loginW", acct="acc_w", kind="run",
@@ -172,11 +219,46 @@ for label, store in (("5xx", Down()), ("타임아웃", Timeout())):
     check(f"[{label}] 다른 계정은 영향받지 않는다고 알린다",
           "다른 계정의 발행은 영향받지 않습니다" in why)
 
-check(f"일시 오류는 제한적으로 재시도한다(횟수 {TRIES})", TRIES >= 2, f"tries={TRIES}")
+#  ★재시도 정책 (2026-11-05 · 3단계)
+#      느린 실패(타임아웃) → 다시 시도하지 않는다. 예산을 두 배로 쓰고도 같은
+#                            결과일 가능성이 높다(실측 8초 → 16초).
+#      빠른 실패(503·DNS·SSL) → 한 번 더. 일시적인 경우가 많아 그대로 복구된다.
+FAST_EXTRA = NS.get("QUEUE_FAST_EXTRA", 1)
+FAST_SEC = NS.get("QUEUE_FAST_RETRY_SEC", 1.5)
+check(f"느린 실패는 1회만 시도한다(QUEUE_READ_TRIES={TRIES})", TRIES == 1,
+      f"tries={TRIES}")
+check(f"빠른 실패는 {FAST_EXTRA}회 더 시도한다(일시 오류 복구)", FAST_EXTRA >= 1,
+      f"extra={FAST_EXTRA} · 기준 {FAST_SEC}초")
+
 tries_seen["n"] = 0
-logout_block(Down(), "loginW", "")
-check("최종 실패까지 그 횟수만 시도한다(무한 재시도 아님)",
-      tries_seen["n"] == TRIES, f"{tries_seen['n']}회")
+logout_block(Down(), "loginW", "")          # 즉시 503 = 빠른 실패
+check("빠른 실패는 그 횟수만 시도한다(무한 재시도 아님)",
+      tries_seen["n"] == TRIES + FAST_EXTRA,
+      f"{tries_seen['n']}회 (기대 {TRIES + FAST_EXTRA})")
+
+
+class SlowDown:
+    """느리게 실패하는 큐 — 재시도하면 안 된다(예산 낭비)."""
+
+    calls = 0
+
+    def list_by_status(self, *_a, deadline=None, **_k):
+        SlowDown.calls += 1
+        time.sleep(FAST_SEC + 0.2)
+        raise SupabaseError("Read timed out (read timeout=8)")
+
+    def list_jobs(self, limit=30):
+        raise SupabaseError("Read timed out (read timeout=8)")
+
+
+SlowDown.calls = 0
+t_slow = time.monotonic()
+why_slow = logout_block(SlowDown(), "loginW", "")
+slow_el = time.monotonic() - t_slow
+check("★느린 실패는 재시도하지 않는다(요청 1회로 끝)", SlowDown.calls == 1,
+      f"{SlowDown.calls}회 · {slow_el:.2f}초")
+check("  그래도 신규 발행은 막는다(fail-safe 유지)",
+      "확인하지 못해 새 작업을 만들지 않았습니다" in why_slow)
 
 flaky = FlakyOnce()
 why_flaky = logout_block(flaky, "loginW", "")
@@ -285,8 +367,8 @@ def dup_rest(method, path, **kw):
     off = int(path.split("offset=")[1].split("&")[0])
     hit = [row(f"D{i}") for i in range(300)]
     page = hit[off:off + 200]
-    if off:                                   # 두 번째 페이지가 첫 행을 또 준다
-        page = [hit[0]] + page
+    if off and page:                          # 두 번째 페이지가 첫 행을 또 준다
+        page = [hit[0]] + page                #   ★끝(0행) 에는 덧붙이지 않는다
     return page[:200]
 
 
@@ -298,7 +380,11 @@ check("★페이지가 겹쳐도 중복이 생기지 않는다(job_id 로 합친
 def short_rest(method, path, **kw):
     if method != "GET":
         return []
-    return [row("S1")]                        # 1건만 주는데
+    #  ★offset 을 지키고 끝을 지나면 **0행** 을 준다(실제 PostgREST 와 같다).
+    #    2026-11-05: 병합한 `_page_all` 은 '0행' 또는 '총건수 도달' 만 끝으로
+    #    인정한다. 같은 행을 무한히 주는 가짜 서버는 현실에 없다.
+    off = int(path.split("offset=")[1].split("&")[0]) if "offset=" in path else 0
+    return [row("S1")] if off == 0 else []    # 1건만 주는데
 
 
 raised = None
@@ -339,6 +425,7 @@ big._count = lambda q: None                                    # noqa: SLF001
 big.MAX_PAGES = 2
 big._rest = lambda m, p, **k: ([row(f"Z{i}") for i in range(200)]  # noqa: SLF001
                                if m == "GET" else [])
+_wire_range(big, lambda q: None)        # ★_rest_range 도 가로챈다(실제 HTTP 금지)
 raised2 = None
 try:
     big.held_jobs("loginW", "")
@@ -550,8 +637,10 @@ check("Agent 는 새 API·예외를 쓰지 않는다(1.2.5 호환)",
 check("Agent 는 pending 만 집는다(스키마 무변경)",
       "where device_id = v_id and status = 'pending'" in
       (ROOT / "supabase" / "schema.sql").read_text(encoding="utf-8"))
+#  ★조회 본문은 `_logout_state_read` 로 옮겼다(2026-11-05 · 캐시 래퍼 도입).
+#    폴백은 그 안에 그대로 있다.
 check("옛 저장소(list_by_status 없음)도 화면이 받아 준다(폴백 유지)",
-      "except AttributeError:" in APP.split("def logout_state")[1][:2500])
+      "except AttributeError:" in APP.split("def _logout_state_read")[1][:3000])
 
 
 class OldStore:
@@ -564,6 +653,91 @@ class OldStore:
 
 check("  그 폴백으로도 보류를 찾아 차단한다",
       "로그아웃 대기 상태입니다" in logout_block(OldStore(), "loginW", ""))
+
+
+# ══════════════════════════════════════════════════════════════════
+head("⑦ 페이지네이션 — held 누락 방지 (P1~P4 · 2026-11-05 추가)")
+#   ★왜 필요한가 — 옛 판은 "요청한 limit 보다 적게 왔다" 를 '끝' 으로 믿었고
+#     offset 을 **요청한 크기만큼** 전진시켰다. 서버가 페이지를 잘라 주면
+#     그 사이 구간을 건너뛰어 **오래된 보류가 조용히 사라졌다**.
+#     병합한 판은 ①총건수 도달 ②0행 응답 만 '끝' 으로 인정하고,
+#     offset 을 **받은 행 수만큼** 전진시킨다.
+
+
+def capped_server(rows, cap_rows: int):
+    """`db-max-rows=cap_rows` 가 걸린 PostgREST. offset 은 정직하게 지킨다."""
+    seen = {"calls": 0}
+
+    def rest(method, path, **kw):
+        if method != "GET":
+            return []
+        seen["calls"] += 1
+        off = int(path.split("offset=")[1].split("&")[0]) if "offset=" in path else 0
+        lim = int(path.split("limit=")[1].split("&")[0]) if "limit=" in path else 200
+        want = ("held" if "status=eq.held" in path else
+                "pending" if "status=eq.pending" in path else "running")
+        hit = [r for r in rows if r["status"] == want]
+        return hit[off:off + min(lim, cap_rows)]
+    return rest, seen
+
+
+rows250 = [row(f"C{i:03d}", at=f"2026-11-04T09:{i // 60:02d}:{i % 60:02d}")
+           for i in range(250)]
+
+#  P1 — db-max-rows 재현: limit 200 을 요청해도 서버가 50행씩만 준다
+cap_rest, cap_seen = capped_server(rows250, 50)
+cap_got = sup(cap_rest, count=lambda q: 250).held_jobs("loginW", "")
+check("★P1 서버가 50행씩만 줘도 250건을 빠짐없이 받는다(held 누락 없음)",
+      len(cap_got) == 250, f"{len(cap_got)}건 · 요청 {cap_seen['calls']}회")
+check("  받은 행 수만큼 offset 을 전진시킨다(구간 건너뛰기 없음)",
+      {r["id"] for r in cap_got} == {r["job_id"] for r in rows250})
+
+#  P2 — 짧은 페이지 + 총건수 미제공(Content-Range 없음)
+cap_rest2, _ = capped_server(rows250, 50)
+no_total = sup(cap_rest2, count=lambda q: None).held_jobs("loginW", "")
+check("★P2 총건수를 못 받아도 0행이 올 때까지 계속 읽는다",
+      len(no_total) == 250, f"{len(no_total)}건")
+
+
+#  P3 — 0행 응답으로 정상 종료(예외 없음)
+def empty_server(method, path, **kw):
+    return []
+
+
+p3_err, p3 = None, None
+try:
+    p3 = sup(empty_server, count=lambda q: 0).held_jobs("loginW", "")
+except Exception as exc:                                       # noqa: BLE001
+    p3_err = exc
+check("★P3 0건이면 빈 목록으로 정상 종료한다(예외 아님)",
+      p3_err is None and p3 == [], str(p3_err)[:60])
+
+#  P4 — 상한 초과는 조용히 자르지 않고 예외
+p4 = SupabaseStore(mode="service", url="http://127.0.0.1:9", key="dummy")
+p4.MAX_PAGES = 3
+p4._rest = lambda m, pth, **k: ([row(f"M{i}") for i in range(200)]  # noqa: SLF001
+                                if m == "GET" else [])
+_wire_range(p4, lambda q: 10_000)
+p4_err = None
+try:
+    p4.held_jobs("loginW", "")
+except Exception as exc:                                       # noqa: BLE001
+    p4_err = exc
+check("★P4 상한을 넘으면 예외 — '보류 없음' 으로 단정하지 않는다",
+      isinstance(p4_err, SupabaseError) and "끝까지 읽지 못했습니다" in str(p4_err),
+      str(p4_err)[:60])
+
+#  잘린 페이지가 fail-safe 로 잘못 떨어지지 않는지(누락이 아니라 전수 수집)
+#    ★총건수는 **상태별로** 돌려줘야 한다 — held 만 250건이고 running·pending 은
+#      0건이다. 모든 상태에 250 을 주면 그 둘이 '잘렸다' 로 잡혀 읽기 실패가 된다
+#      (화면은 상태 3종을 모두 조회한다).
+cap_rest3, _ = capped_server(rows250, 50)
+stt_cap = logout_state(
+    sup(cap_rest3, count=lambda q: 250 if "status=eq.held" in q else 0),
+    "loginW", "")
+check("  잘린 페이지에서도 보류를 찾아낸다(읽기 실패로 떨어지지 않는다)",
+      not stt_cap["read_error"] and len(stt_cap["held"]) == 250,
+      f"held {len(stt_cap['held'])}건 · read_error={stt_cap['read_error'][:30]!r}")
 
 
 # ══════════════════════════════════════════════════════════════════

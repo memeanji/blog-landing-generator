@@ -70,13 +70,55 @@ def head(t: str) -> None:
 APP = (ROOT / "streamlit_app.py").read_text(encoding="utf-8")
 TREE = ast.parse(APP)
 NS: dict = {"queue_store": queue_store, "time": time, "chr": chr,
-            "RUNNING_STATES": (PENDING, RUNNING),
-            "QUEUE_READ_TRIES": 2, "QUEUE_READ_WAIT": 0.01}
+            "RUNNING_STATES": (PENDING, RUNNING)}
+#  ★대문자 모듈 상수를 **코드에서** 그대로 집어온다(2026-11-05). 값을 테스트에
+#    박아 두면 정책이 바뀔 때 옛 값으로 계산해 틀린 수를 보고한다.
+for _n in TREE.body:
+    if isinstance(_n, ast.Assign) and len(_n.targets) == 1:
+        _tg = _n.targets[0]
+        _names = ([getattr(e, "id", "") for e in _tg.elts]
+                  if isinstance(_tg, ast.Tuple) else [getattr(_tg, "id", "")])
+        if _names and all(x.isupper() for x in _names if x):
+            try:
+                _vals = ast.literal_eval(_n.value)
+            except Exception:                                   # noqa: BLE001
+                continue
+            #  ★`A = (1, 2)` 처럼 **값이 튜플**인 상수는 풀어헤치면 안 된다
+            #    (2026-11-05: QUEUE_PERMANENT_STATUS 가 400 하나로 들어갔다).
+            #    여러 이름에 나눠 담는 것은 `A, B = 1, 2` 꼴뿐이다.
+            if isinstance(_tg, ast.Tuple):
+                _vals = _vals if isinstance(_vals, tuple) else (_vals,)
+                for _k, _v in zip(_names, _vals):
+                    NS[_k] = _v
+            else:
+                NS[_names[0]] = _vals
+NS["QUEUE_READ_WAIT"] = 0.01                # 테스트는 실제로 기다리지 않는다
 for _n in TREE.body:
     if isinstance(_n, ast.FunctionDef) and _n.name in (
-            "is_logout_job", "logout_state", "logout_block"):
+            "is_logout_job", "render_scope", "query_deadline",
+            "store_takes_deadline", "logout_state", "_logout_state_read",
+            "logout_block"):
         exec(compile(ast.Module([_n], []), "streamlit_app.py", "exec"), NS)
-logout_state, logout_block = NS["logout_state"], NS["logout_block"]
+#  ★테스트에서는 **호출 1회 = 렌더 1회**로 본다(2026-11-05).
+#    운영 화면은 렌더마다 모듈을 다시 실행해 렌더 스코프(조회 캐시 + 예산
+#    deadline)가 새로 생긴다. 테스트는 한 프로세스에서 계속 도므로 직접
+#    비워 주지 않으면 **앞 시나리오의 캐시와 소진된 예산이 뒤로 샌다**.
+#    렌더 안에서의 캐시 동작 자체는 stage7 에서 따로 검증한다.
+def _new_render() -> None:
+    NS.setdefault("_render_box", {}).clear()
+
+
+_raw_logout_state, _raw_logout_block = NS["logout_state"], NS["logout_block"]
+
+
+def logout_state(store_obj, login_id, account_id="", **kw):
+    _new_render()
+    return _raw_logout_state(store_obj, login_id, account_id, **kw)
+
+
+def logout_block(store_obj, login_id, account_id="", **kw):
+    _new_render()
+    return _raw_logout_block(store_obj, login_id, account_id, **kw)
 
 
 def panel_src() -> str:
@@ -84,12 +126,30 @@ def panel_src() -> str:
     return APP.split("def render_account_tools")[1].split("def do_logout")[0]
 
 
+def _wire_range(s, counter=None):
+    r"""`_rest_range`(행 + 총건수를 한 응답에서) 를 기존 픽스처로 흉내낸다.
+
+    ★2026-11-05 — deploy 판 병합으로 `list_by_status` 가 `_count` 대신
+      `_rest_range` 를 쓴다. 이걸 가로채지 않으면 테스트가 **실제 HTTP 를
+      시도한다**(가짜 주소라 ConnectionError 로 죽는다 = 조용히 통과하지 않는다).
+      `_rest`(행) + `counter`(총건수) 픽스처를 **그대로 재사용**한다.
+    ★총건수는 `count=True` 인 호출(= 첫 페이지)에서만 돌려준다 — 실제 구현과 같다.
+    """
+    def _range(query, count=False, timeout=None):
+        #  ★timeout 은 실제 구현이 넘기는 인자다(UI 예산). 가짜는 받기만 한다.
+        rows = s._rest("GET", query) or []                     # noqa: SLF001
+        total = counter(query) if (count and counter is not None) else None
+        return (rows if isinstance(rows, list) else []), total
+    s._rest_range = _range                                     # noqa: SLF001
+    return s
+
+
 def sup(rest=None, count=None) -> SupabaseStore:
     s = SupabaseStore(mode="service", url="http://127.0.0.1:9", key="dummy")
     if rest is not None:
         s._rest = rest                                         # noqa: SLF001
     s._count = count if count is not None else (lambda q: None)  # noqa: SLF001
-    return s
+    return _wire_range(s, count)
 
 
 def row(jid, login="", acct="", status="held", kind="run", dev="PC1",
@@ -260,12 +320,34 @@ check("  그 경우 건수 metric 을 아예 그리지 않는다(0 으로 오해
       and 'm1.metric("대기"' in panel_src())
 
 #  응답 지연 — 요청 1건당 타임아웃(TIMEOUT)과 최악 조합을 기록한다
-from v2.supabase_store import TIMEOUT                           # noqa: E402
+from v2.supabase_store import TIMEOUT, UI_TIMEOUT              # noqa: E402
 
-worst = 3 * NS["QUEUE_READ_TRIES"] * 2 * 2 * TIMEOUT
-note(f"★최악 응답 지연 — 상태 3종 × 재시도 {NS['QUEUE_READ_TRIES']}회 × "
-     f"(count+페이지) × 총건수 재확인 × {TIMEOUT}초 = 최대 {worst}초",
-     "서버가 '응답 없이 매달리는' 상태에서만 발생한다(오류는 즉시 돌아온다)")
+#  ★`list_by_status` 1회가 보내는 요청 수는 구현에 따라 다르다(2026-11-05).
+#      `_rest_range` 있음 → 총건수를 **같은 응답**에서 받으므로 페이지 1회
+#      없음(옛 판)   → `_count` + 페이지로 2회
+#    상수로 박아 두면 구현이 바뀔 때 조용히 틀린 수를 보고하므로 코드에서 읽는다.
+from v2.supabase_store import SupabaseStore as _SS              # noqa: E402
+
+per_call = 1 if hasattr(_SS, "_rest_range") else 2
+check("★총건수를 같은 응답에서 받는다(요청 수 절감 · _rest_range)",
+      per_call == 1, f"list_by_status 1회당 {per_call}요청")
+
+#  ★화면 조회는 렌더 예산(deadline)으로 끊는다(2026-11-05 · 3단계).
+#    예산은 요청 **사이에서만** 확인되므로 진행 중인 요청 1회는 끝까지 간다
+#    → 조회 경로의 상한 = 예산 + UI_TIMEOUT. 렌더 전체의 절대 상한은 아니다.
+budget = NS.get("RENDER_QUERY_BUDGET", 0)
+check("★화면 조회에 렌더 예산이 있다(무한 로딩 차단)", budget > 0,
+      f"RENDER_QUERY_BUDGET={budget}")
+check("  화면 전용 타임아웃이 Agent 것보다 짧다",
+      0 < UI_TIMEOUT < TIMEOUT, f"UI {UI_TIMEOUT}초 / Agent {TIMEOUT}초")
+check("  예산을 저장소까지 넘긴다(list_by_status·_page_all 에 deadline)",
+      "deadline" in _SS.list_by_status.__doc__
+      and "deadline" in _SS._page_all.__code__.co_varnames)
+check("  Agent 경로는 예산 없이 그대로다(TIMEOUT 20초 유지)", TIMEOUT == 20)
+worst = budget + UI_TIMEOUT
+note(f"★조회 경로 상한 — 렌더 예산 {budget:.0f}초 + 진행 중 요청 1회 "
+     f"{UI_TIMEOUT}초 = {worst:.0f}초",
+     "진행 중인 동기 요청은 끊을 수 없다 — 렌더 전체의 절대 상한은 아니다")
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -984,11 +984,98 @@ def is_logout_job(rec: dict) -> bool:
 
 
 #  큐 조회가 일시적으로 실패할 때 다시 시도하는 횟수·간격(2026-11-04).
-#    ★`list_by_status` 자체도 안에서 한 번 더 확인하므로 여기선 짧게만 붙인다.
-QUEUE_READ_TRIES, QUEUE_READ_WAIT = 2, 0.6
+#    ★`list_by_status` 자체가 안에서 총건수를 한 번 더 확인하므로 **여기서
+#      다시 시도하면 비용만 2배**가 된다(2026-11-05 실측: 타임아웃 시 8초 → 16초).
+#      그래서 1회로 둔다. 일시 오류는 사용자가 다시 그리면 자연히 재시도된다.
+QUEUE_READ_TRIES, QUEUE_READ_WAIT = 1, 0.6
+
+#  ★빠르게 실패한 경우에만 한 번 더 시도한다(2026-11-05).
+#    느린 실패(타임아웃)를 다시 시도하면 예산을 두 배로 쓰고도 같은 결과일
+#    가능성이 높다(실측: 8초 → 16초). 반대로 503·DNS·SSL 처럼 **즉시** 실패한
+#    것은 일시적인 경우가 많아 한 번 더 시도하면 그대로 복구된다.
+QUEUE_FAST_RETRY_SEC, QUEUE_FAST_EXTRA = 1.5, 1
+
+#  ★다시 시도해도 결과가 같은 오류 — 인증·권한·요청 형식 문제(2026-11-05).
+#    401·403 은 키가 틀렸거나 권한이 없는 것이라 1초 뒤에 다시 물어도 같다.
+#    429(요청 과다)·409(충돌)·5xx 는 **넣지 않는다** — 일시적일 수 있다.
+QUEUE_PERMANENT_STATUS = (400, 401, 403, 404, 405, 422)
+
+#  렌더 1회가 **조회에 쓸 수 있는 전체 시간**(초, 2026-11-05).
+#    ★Streamlit 은 렌더마다 이 파일을 처음부터 다시 실행하므로 아래 모듈 변수는
+#      렌더마다 새로 만들어진다 = 렌더 스코프.
+#    ★이 예산은 '조회 경로' 에만 적용된다. 진행 중인 HTTP 요청은 끊을 수 없으므로
+#      실제 상한은 `예산 + 요청 1회`(≈18+8=26초)이고, 구글 시트·그림 그리기 등
+#      **렌더 전체의 절대 상한은 아니다**(2026-11-05 실측 근거).
+RENDER_QUERY_BUDGET = 18.0
 
 
-def logout_state(store_obj, login_id: str, account_id: str = "") -> dict:
+def render_scope() -> dict:
+    """렌더 1회 동안만 사는 저장소(조회 캐시 + 공용 deadline).
+
+    ★`globals()` 에 담는다 — Streamlit 은 렌더마다 모듈을 다시 실행하므로
+      렌더가 끝나면 통째로 버려진다. 세션 상태가 아니라서 사용자 사이에
+      섞이지도 않는다.
+    """
+    return globals().setdefault("_render_box", {})
+
+
+def query_deadline() -> float:
+    """이 렌더의 조회 예산 만료 시각(monotonic).
+
+    ★**렌더당 한 번만** 정해진다 — 호출할 때마다 다시 계산하면 예산이 끝없이
+      늘어나 무한 로딩을 막지 못한다(2026-11-05).
+    """
+    box = render_scope()
+    if "deadline" not in box:
+        budget = globals().get("RENDER_QUERY_BUDGET", 18.0)
+        box["deadline"] = time.monotonic() + float(budget)
+    return box["deadline"]
+
+
+def store_takes_deadline(store_obj) -> bool:
+    """이 저장소의 `list_by_status` 가 `deadline` 을 받는가(렌더당 1회만 확인).
+
+    ★`try: ... except TypeError:` 로 떠보지 않는다 — 조회 **안쪽**에서 난 진짜
+      TypeError 를 삼켜 '예산 없이 다시 조회' 로 넘어가 버린다.
+    """
+    box = render_scope()
+    key = ("takes_deadline", type(store_obj).__name__)
+    if key not in box:
+        try:
+            import inspect
+            box[key] = "deadline" in inspect.signature(
+                store_obj.list_by_status).parameters
+        except Exception:                                      # noqa: BLE001
+            box[key] = False
+    return box[key]
+
+
+def logout_state(store_obj, login_id: str, account_id: str = "", *,
+                 fresh: bool = False) -> dict:
+    """`_logout_state_read` 의 결과를 **렌더 안에서만** 재사용한다(2026-11-05).
+
+    ★왜 캐시하나 — 한 렌더에서 `render_account_tools`(표시)와 `logout_block`
+      (제출 판정)이 각각 불러 같은 조회가 **두 번** 나갔다(실측 6회 → 3회).
+    ★`fresh=True` 는 캐시를 **버리고 반드시 다시 읽는다.** 제출 직전 판정은
+      반드시 이것을 쓴다 — 렌더 시점 이후에 보류가 걸렸는데 캐시를 재사용하면
+      '보류 없음' 으로 오판해 발행이 그대로 나간다(실측으로 재현했다).
+    ★계정마다 키가 다르다(`lid`·`aid`) — 다른 계정의 결과를 쓰지 않는다.
+    """
+    lid, aid = (login_id or "").strip(), (account_id or "").strip()
+    if not lid and not aid:
+        return _logout_state_read(store_obj, lid, aid)
+    box = render_scope()
+    key = ("logout_state", lid, aid)
+    if fresh:
+        box.pop(key, None)
+    elif key in box:
+        return box[key]
+    out = _logout_state_read(store_obj, lid, aid)
+    box[key] = out
+    return out
+
+
+def _logout_state_read(store_obj, login_id: str, account_id: str = "") -> dict:
     """그 계정의 로그아웃 진행 상태. 큐를 한 번만 읽는다.
 
         {"login_id", "account_id", "held"(보류 작업),
@@ -1013,15 +1100,33 @@ def logout_state(store_obj, login_id: str, account_id: str = "") -> dict:
     #   화면을 그릴 때마다 불리는 함수라 길게 매달리면 화면이 멈춘다.
     def by_status(status: str, kind: str = "") -> list:
         last = None
-        for i in range(QUEUE_READ_TRIES):
+        for i in range(QUEUE_READ_TRIES + QUEUE_FAST_EXTRA):
             if i:
                 time.sleep(QUEUE_READ_WAIT)
+            started = time.monotonic()
             try:
+                #  ★렌더 예산을 저장소까지 넘긴다(2026-11-05). 받는 쪽은 요청
+                #    사이에서 남은 시간을 확인하고, 넘기면 **예외**를 던진다
+                #    (부분 결과를 성공으로 쓰지 않는다).
+                if store_takes_deadline(store_obj):
+                    return store_obj.list_by_status(
+                        status, lid, aid, kind=kind, deadline=query_deadline())
+                #  예산을 모르는 옛 저장소 — 기존 동작 그대로.
                 return store_obj.list_by_status(status, lid, aid, kind=kind)
             except AttributeError:
                 raise                      # 옛 저장소 → 아래 폴백으로 넘긴다
             except Exception as exc:                           # noqa: BLE001
                 last = exc
+                #  ★느리게 실패했으면 다시 시도하지 않는다(타임아웃 등).
+                if time.monotonic() - started >= QUEUE_FAST_RETRY_SEC:
+                    break
+                #  ★영구 오류(인증·권한·요청 형식)는 다시 시도하지 않는다.
+                #    같은 결과가 돌아올 뿐이고 예산만 쓴다.
+                if getattr(exc, "status", None) in QUEUE_PERMANENT_STATUS:
+                    break
+                #  ★남은 예산이 없으면 더 시도하지 않는다.
+                if time.monotonic() >= query_deadline():
+                    break
         raise last if last else RuntimeError("큐를 읽지 못했습니다")
 
     try:
@@ -1083,7 +1188,9 @@ def logout_block(store_obj, login_id: str, account_id: str = "") -> str:
     ★이 판단은 **그 계정 하나의 조회 결과**로만 한다. 다른 계정은 각자 자기
       조회로 판단하므로, 한 계정이 막혀도 나머지는 그대로 발행할 수 있다.
     """
-    stt = logout_state(store_obj, login_id, account_id)
+    #  ★제출 직전 판정은 **캐시를 쓰지 않는다**(2026-11-05). 렌더 시점 이후에
+    #    걸린 보류를 놓치면 로그아웃 대기 계정에 발행이 그대로 나간다.
+    stt = logout_state(store_obj, login_id, account_id, fresh=True)
     who = login_id or f"계정 {account_id}"
     if stt.get("read_error"):
         return (f"**{who} 의 보류 작업을 확인하지 못해 새 작업을 만들지 "

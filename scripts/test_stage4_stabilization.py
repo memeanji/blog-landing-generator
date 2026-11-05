@@ -260,7 +260,9 @@ head("C-2. 화면(logout_state) 이 그 보류를 보고 새 작업을 막는가
 #     에서 실패한다). 그래서 **운영 코드 본문 그대로** 세 함수만 꺼내 실행한다.
 src = (ROOT / "streamlit_app.py").read_text(encoding="utf-8")
 tree = ast.parse(src)
-want = {"is_logout_job", "logout_state", "logout_block"}
+want = {"is_logout_job", "render_scope", "query_deadline",
+        "store_takes_deadline", "logout_state", "_logout_state_read",
+        "logout_block"}
 #  ★운영 코드가 쓰는 모듈 수준 이름을 그대로 넣어 준다(새로 생기면 여기에 추가).
 #    `QUEUE_READ_TRIES/WAIT` = 큐 조회 재시도(2026-11-04).
 ns: dict = {"queue_store": queue_store, "time": time,
@@ -272,25 +274,47 @@ for _node in tree.body:                       # 상수는 소스에서 직접 �
     _t = _node.targets[0]
     _names = ([getattr(e, "id", "") for e in _t.elts]
               if isinstance(_t, ast.Tuple) else [getattr(_t, "id", "")])
-    if "QUEUE_READ_TRIES" not in _names:
+    #  ★대문자 모듈 상수는 전부 집어온다(2026-11-05) — 이름을 하나씩 적으면
+    #    상수가 늘 때 테스트가 옛 값을 쓴다.
+    if not (_names and all(x.isupper() for x in _names if x)):
         continue
     try:
         _vals = ast.literal_eval(_node.value)
     except Exception:                                          # noqa: BLE001
         continue
-    _vals = _vals if isinstance(_vals, tuple) else (_vals,)
-    for _n, _v in zip(_names, _vals):
-        ns[_n] = _v
+    #  ★값이 튜플인 상수는 풀어헤치지 않는다(2026-11-05).
+    if isinstance(_t, ast.Tuple):
+        _vals = _vals if isinstance(_vals, tuple) else (_vals,)
+        for _n, _v in zip(_names, _vals):
+            ns[_n] = _v
+    else:
+        ns[_names[0]] = _vals
 ns["QUEUE_READ_WAIT"] = 0.01                  # 테스트는 기다리지 않는다
-check("재시도 횟수를 운영 코드에서 그대로 읽어 왔다",
-      ns.get("QUEUE_READ_TRIES", 0) >= 2, f"tries={ns.get('QUEUE_READ_TRIES')}")
+#  ★3단계(2026-11-05) — 느린 실패는 1회, 빠른 실패만 한 번 더. 상세 검증은
+#    scripts/test_stage7_ui_budget.py 에 있다. 여기서는 값이 읽혔는지만 본다.
+check("재시도 정책을 운영 코드에서 그대로 읽어 왔다",
+      ns.get("QUEUE_READ_TRIES", 0) >= 1
+      and ns.get("QUEUE_FAST_EXTRA", 0) >= 1,
+      f"tries={ns.get('QUEUE_READ_TRIES')} · "
+      f"fast_extra={ns.get('QUEUE_FAST_EXTRA')}")
 picked = []
 for node in tree.body:
     if isinstance(node, ast.FunctionDef) and node.name in want:
         exec(compile(ast.Module([node], []), "streamlit_app.py", "exec"), ns)
         picked.append(node.name)
-check("화면 함수 3개를 운영 코드에서 그대로 꺼냈다", sorted(picked) == sorted(want),
+check("화면 함수를 운영 코드에서 그대로 꺼냈다", sorted(picked) == sorted(want),
       str(sorted(picked)))
+
+
+#  ★테스트에서는 호출 1회 = 렌더 1회로 본다(렌더 스코프를 비운다).
+#    운영은 렌더마다 모듈을 다시 실행해 캐시·예산이 새로 생긴다.
+def _render_reset() -> None:
+    ns.setdefault("_render_box", {}).clear()
+
+
+_rls, _rlb = ns["logout_state"], ns["logout_block"]
+ns["logout_state"] = lambda s, l, a="", **k: (_render_reset(), _rls(s, l, a, **k))[1]
+ns["logout_block"] = lambda s, l, a="", **k: (_render_reset(), _rlb(s, l, a, **k))[1]
 
 stt = ns["logout_state"](store, "loginW", "")
 check("★화면이 보류를 본다(작업 201건 뒤에 있어도)",
@@ -356,6 +380,32 @@ from v2.supabase_store import SupabaseStore                    # noqa: E402
 
 sup = SupabaseStore(mode="service", url="http://127.0.0.1:9", key="dummy-key")
 calls: list[tuple[str, str]] = []
+
+
+def _page(path: str, rows: list) -> list:
+    """가짜 서버가 offset/limit 을 **정직하게** 지키게 한다(2026-11-05).
+
+    ★병합한 `_page_all` 은 '0행 응답' 또는 '총건수 도달' 만 끝으로 인정하고
+      offset 을 받은 행 수만큼 전진시킨다. 같은 묶음을 매번 돌려주는 가짜 서버는
+      끝을 표현할 수 없어 상한 초과 예외가 난다(실제 PostgREST 는 끝에서 0행).
+    """
+    off = int(path.split("offset=")[1].split("&")[0]) if "offset=" in path else 0
+    lim = int(path.split("limit=")[1].split("&")[0]) if "limit=" in path else 200
+    return rows[off:off + lim]
+
+
+def _wire_range(s, counter=None):
+    """`_rest_range`(행+총건수를 한 응답에서) 를 `_rest` 픽스처로 흉내낸다.
+
+    ★가로채지 않으면 테스트가 **실제 HTTP 를 시도**한다(가짜 주소 → ConnectionError).
+    """
+    def _range(query, count=False, timeout=None):
+        #  ★timeout 은 실제 구현이 넘기는 인자다(UI 예산). 가짜는 받기만 한다.
+        rows = s._rest("GET", query) or []                     # noqa: SLF001
+        total = counter(query) if (count and counter is not None) else None
+        return (rows if isinstance(rows, list) else []), total
+    s._rest_range = _range                                     # noqa: SLF001
+    return s
 ROWS = [
     {"job_id": "J1", "status": "pending", "kind": "run", "device_id": "PC1",
      "payload": {"login_id": "loginW@naver.com", "account": "acc_w"}},
@@ -373,8 +423,8 @@ def fake_rest(method, path, **kw):
     if method == "GET":
         want = "pending" if "status=eq.pending" in path else "none"
         kind_run = "kind=eq.run" in path
-        return [r for r in ROWS if r["status"] == want
-                and (not kind_run or r["kind"] == "run")]
+        return _page(path, [r for r in ROWS if r["status"] == want
+                            and (not kind_run or r["kind"] == "run")])
     if method == "PATCH":
         ids = path.split("in.(")[1].split(")")[0].split(",")
         return [{"job_id": i} for i in ids]
@@ -382,6 +432,7 @@ def fake_rest(method, path, **kw):
 
 
 sup._rest = fake_rest                                          # noqa: SLF001
+_wire_range(sup)
 done = sup.hold_account("loginW", device="PC1")
 check("★표기가 다른 작업(loginW@naver.com)을 고른다 — 예전엔 0건이었다",
       done == ["J1"], str(done))
@@ -411,7 +462,7 @@ ROWS[:] = [{"job_id": f"K{i}", "status": "held", "kind": "run",
 def fake_rest2(method, path, **kw):
     calls.append((method, path))
     if method == "GET":
-        return [r for r in ROWS if "status=eq.held" in path]
+        return _page(path, [r for r in ROWS if "status=eq.held" in path])
     if method == "PATCH":
         ids = path.split("in.(")[1].split(")")[0].split(",")
         return [{"job_id": i} for i in ids]
@@ -419,6 +470,7 @@ def fake_rest2(method, path, **kw):
 
 
 sup._rest = fake_rest2                                         # noqa: SLF001
+_wire_range(sup)
 back2 = sup.resume_account("loginW", device="PC1")
 check("재개도 같은 경로로 동작한다(120건)", len(back2) == 120, f"{len(back2)}건")
 check("50건씩 나눠 보낸다(URL 길이 안전)",
