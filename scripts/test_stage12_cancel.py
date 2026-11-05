@@ -500,6 +500,44 @@ check("  조회 실패를 '진행 중 없음' 으로 바꾸지 않는다",
 check("  배너는 세션 상태가 아니라 큐를 본다",
       "render_active_banner(store, active" in APP)
 
+head("9. 취소 프로토콜 — 화면과 Agent 버전이 달라도 맞물린다")
+
+SCHEMA = (ROOT / "supabase" / "schema.sql").read_text(encoding="utf-8")
+check("★`claim_job` 은 pending 만 집는다",
+      "status = 'pending'" in SCHEMA)
+check("  → 화면이 조건부로 canceled 로 바꾼 작업은 **어느 버전 Agent 도 집지 않는다**",
+      "status = 'pending'" in SCHEMA)
+check("`cancel_requested` 는 이미 있는 열이다(스키마 변경 없음)",
+      "cancel_requested" in SCHEMA, "schema.sql")
+
+#  ① 새 화면 + 옛 Agent(1.3.1) — 대기 취소는 화면 프로세스가 하므로 그대로 된다
+s13 = store()
+j13 = put(s13)
+check("새 화면이 대기 작업을 취소하면 Agent 버전과 무관하게 확정된다",
+      cancel_job(s13, j13) == DONE_
+      and (s13.get(j13) or {}).get("status") == CANCELED)
+check("  취소된 작업은 claim 되지 않는다(옛 Agent 도 못 집는다)",
+      s13.claim("PC1") is None)
+
+#  ② 옛 화면 + 새 Agent — 요청만 보내도 새 Agent 가 실행 전에 걸러 준다
+s14 = store()
+j14 = put(s14)
+s14.request_cancel(j14)                    # 옛 화면이 할 수 있는 전부
+got = s14.claim("PC1")                     # 새 Agent 가 집는다
+check("옛 화면이 요청만 남겨도 집힌 뒤 취소가 보인다",
+      got is not None and s14.cancel_requested(j14) is True)
+check("  → 새 Agent 는 그걸 보고 **띄우기 전에** 끝낸다(5절에서 순서 확인됨)",
+      cancel_at < runner_at)
+
+#  ③ 실행 중 작업은 어느 쪽이든 '요청' 이다 — 상태를 서버에서 바꾸지 않는다
+s15 = store()
+j15 = put(s15)
+s15.claim("PC1")
+before = (s15.get(j15) or {}).get("status")
+cancel_job(s15, j15)
+check("실행 중 작업의 상태를 화면이 바꾸지 않는다(Agent 가 끝낸다)",
+      (s15.get(j15) or {}).get("status") == before == RUNNING)
+
 print("")
 print("=" * 76)
 if fails:
