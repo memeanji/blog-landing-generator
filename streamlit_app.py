@@ -605,6 +605,52 @@ def session_job_state(store, account) -> str:
     return (rec or {}).get("status") or ""
 
 
+#  수동 로그아웃 결과 3상태 — **창에서 무엇을 눌렀는지로 판단하지 않는다.**
+#    PC 가 쿠키 없이 그 프로필을 다시 열어 로그인되는지 본 결과(`auto_login`)가
+#    유일한 근거다. 'clean' 이 아니면 로그아웃됐다고 말하지 않는다.
+LOGOUT_VERDICT = {
+    "clean": ("✅ 로그아웃 확인됨",
+              "이 계정은 재로그인이 필요한 상태입니다. 다른 계정으로 로그인해도 "
+              "됩니다."),
+    "auto_login_detected": ("⚠ 아직 로그인돼 있습니다",
+                            "프로필만으로 다시 들어가집니다 — **로그아웃되지 "
+                            "않았습니다.** 창에서 로그아웃을 마쳤는지 확인하고 "
+                            "다시 눌러 주세요."),
+    "unknown": ("❓ 확인하지 못했습니다",
+                "로그아웃됐는지 **알 수 없습니다.** 로그아웃된 것으로 보지 마시고 "
+                "[로그인 상태 다시 확인] 을 눌러 주세요."),
+}
+
+
+def logout_verdict(store_obj, rec: dict | None) -> tuple[str, str, str] | None:
+    """끝난 로그아웃 작업의 결과를 `(상태키, 제목, 설명)` 으로 돌려준다.
+
+    ★`logout_done` 이벤트의 `auto_login` 값만 본다. 작업이 '완료' 로 끝났다는
+      것과 **로그아웃이 됐다는 것은 다른 이야기**다 — 섞으면 안 된다.
+    ★이벤트를 못 읽으면 `unknown` 이다(없는 것을 성공으로 만들지 않는다).
+    """
+    if not rec or not is_logout_job(rec):
+        return None
+    if (rec.get("status") or "") in RUNNING_STATES:
+        return None                       # 아직 진행 중 — 판정하지 않는다
+    try:
+        events, _ = store_obj.read_events(rec.get("id") or "")
+    except Exception:                                          # noqa: BLE001
+        events = []
+    got = ""
+    for ev in reversed(list(events or [])):
+        if (ev or {}).get("event") == "logout_done":
+            got = str(ev.get("auto_login") or "")
+            break
+        if (ev or {}).get("event") == "logout_blocked":
+            return ("blocked", "⛔ 로그아웃하지 않았습니다",
+                    "영향 범위가 확인되지 않아 PC 가 중단했습니다. 아래 "
+                    "'공유 세션 확인' 을 읽고 체크한 뒤 다시 눌러 주세요.")
+    key = got if got in LOGOUT_VERDICT else "unknown"
+    title, desc = LOGOUT_VERDICT[key]
+    return (key, title, desc)
+
+
 def render_progress(store, rec: dict, title: str = "진행 상황") -> None:
     """지금 무엇을 하고 있는지 짧게 보여 준다.
 
@@ -1548,6 +1594,15 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                 st.rerun()
 
     with c2:
+        #  ★직전 로그아웃 결과 — '작업 완료' 가 아니라 **실제 인증 상태**를 말한다.
+        _last = session_job(store_obj, account, getattr(account, "brand", None))
+        _ver = logout_verdict(store_obj, _last)
+        if _ver:
+            _key, _title, _desc = _ver
+            (st.success if _key == "clean" else
+             st.warning if _key == "auto_login_detected" else st.error)(
+                f"**{_title}** — {_desc}")
+
         if not stt["pending"]:
             #   세션을 공유하는 계정이 있어 **불분명한 경우**에만 체크가 필요하다.
             #   판정은 계정 목록이 있는 PC(Agent)가 하고, 여기서는 그 결과를 보여 준다.
@@ -1557,14 +1612,31 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                 help="PC 에서 '이 세션을 함께 쓰는 계정' 이 발견되면 로그아웃이 "
                      "중단됩니다. 영향 범위를 확인하셨다면 이걸 체크하고 다시 "
                      "눌러 주세요")
+            #  ★순차 운영 — 한 계정 발행을 **다 끝낸 뒤** 로그아웃하고 다음
+            #    계정으로 넘어간다. 그래서 그 계정이 **실행 중**이면 막는다.
+            #    (대기 작업은 기존대로 로그아웃이 **보류**로 옮긴다 — 보류·재개
+            #     동작은 바꾸지 않았다.)
+            _busy = list(stt.get("running") or [])
+            if _busy:
+                st.warning(
+                    f"⏳ **이 계정의 발행이 아직 돌고 있습니다({len(_busy)}건)** — "
+                    f"끝난 뒤에 로그아웃해 주세요."
+                    f"{chr(10)}{chr(10)}발행 도중에 로그아웃하면 그 배치가 중간에서 "
+                    f"끊깁니다. 지금 멈춰야 한다면 위 **[진행 중인 작업]** 에서 "
+                    f"중단한 뒤 다시 눌러 주세요.")
             if st.button("선택 계정 로그아웃", use_container_width=True,
-                         disabled=not (device_id and (lid or aid) and can_logout),
-                         help="이 계정만 로그아웃합니다. 실행 중인 10건 배치는 "
-                              "끝까지 발행한 뒤 로그아웃합니다"):
+                         disabled=not (device_id and (lid or aid) and can_logout)
+                         or bool(_busy),
+                         help="이 PC 에서 그 계정의 브라우저 창이 열립니다. "
+                              "네이버 화면에서 **직접 로그아웃**해 주세요"):
                 #  ★보류는 account.id 범위다 — login_id 를 넘기면 같은 네이버 ID 를
                 #    쓰는 **다른 등록**의 대기 작업까지 보류된다(2026-11-05).
                 do_logout(store_obj, brand, account, "", device_id,
                           account_id=aid, confirm_shared=bool(shared_ok))
+            st.caption("※ 로그아웃은 **수동**입니다 — 그 PC 에 브라우저 창이 뜨면 "
+                       "네이버에서 직접 로그아웃해 주세요. 창을 닫거나 "
+                       "로그아웃이 확인되면 PC 가 **실제 로그인 상태를 다시 "
+                       "확인**해 결과를 여기에 보여 줍니다.")
             if not (lid or aid):
                 st.caption("※ 계정을 특정할 수 없습니다(세션 폴더 이름도 비어 "
                            "있음) — 로그아웃 대상을 고르지 않습니다.")
