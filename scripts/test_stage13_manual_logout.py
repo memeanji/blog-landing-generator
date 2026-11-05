@@ -258,6 +258,77 @@ check("세션 폴더·토큰 경로 로직 무변경",
       "SESSIONS_ROOT = ROOT / \"sessions\"" in
       (ROOT / "v2" / "session_store.py").read_text(encoding="utf-8"))
 
+head("⑨ 공유 계정 차단 정책 변경 (2026-11-05) — 막지 않고 알린다")
+
+#  브랜드가 달라도 **같은 네이버 ID** 를 쓴다 → 그 자체는 차단 사유가 아니다.
+from v2 import login_state as LS                              # noqa: E402
+from v2.accounts import Account                               # noqa: E402
+import json                                                   # noqa: E402
+
+
+def _accounts(rows) -> Path:
+    p = SANDBOX / f"acc_{len(list(SANDBOX.glob('acc_*.json')))}.json"
+    p.write_text(json.dumps({"accounts": rows}, ensure_ascii=False),
+                 encoding="utf-8")
+    return p
+
+
+#  ① 같은 blog_id · 양쪽 다 login_id 미등록
+rows = [{"id": "x_re", "label": "브랜드A", "login_id": "", "blog_id": "same",
+         "brand": "repurely", "enabled": True},
+        {"id": "x_dn", "label": "브랜드B", "login_id": "", "blog_id": "same",
+         "brand": "doctor_nuscent", "enabled": True}]
+P1 = _accounts(rows)
+A1 = Account(id="x_re", label="브랜드A", blog_id="same", brand="repurely")
+ok1, pr1, why1 = LS.logout_allowed(A1, P1)
+check("★같은 blog_id · login_id 미등록 → **허용**", ok1 is True, str(ok1))
+check("  후보는 그대로 찾아낸다(안내용)", len(pr1) == 1, f"{len(pr1)}건")
+check("  영향 범위를 문구로 알린다", "같은 네이버 계정일 수 있는 등록이" in why1,
+      why1[:50])
+
+#  ② login_id 가 서로 다른 경우도 허용
+rows2 = [{"id": "y1", "label": "A", "login_id": "me", "blog_id": "sh2",
+          "brand": "repurely", "enabled": True},
+         {"id": "y2", "label": "B", "login_id": "someoneelse", "blog_id": "sh2",
+          "brand": "repurely", "enabled": True}]
+P2 = _accounts(rows2)
+ok2, _, why2 = LS.logout_allowed(
+    Account(id="y1", label="A", login_id="me", blog_id="sh2"), P2)
+check("★login_id 가 서로 달라도 **허용**", ok2 is True, str(ok2))
+check("  그 등록을 사유에 적는다", "someoneelse" in why2, why2[:60])
+
+#  ③ 후보가 없으면 예전처럼 조용히 허용
+P3 = _accounts([{"id": "z1", "label": "혼자", "login_id": "solo",
+                 "blog_id": "alone", "brand": "repurely", "enabled": True}])
+ok3, pr3, why3 = LS.logout_allowed(
+    Account(id="z1", label="혼자", login_id="solo", blog_id="alone"), P3)
+check("후보가 없으면 그대로 허용 · 안내 없음",
+      ok3 is True and pr3 == [] and why3 == "")
+
+#  ④ 화면 — 체크박스를 **요구하지 않는다**
+check("★'공유 세션 확인' 체크박스를 요구하지 않는다", "_shared_" not in APP)
+#  ★소스에서 문구가 여러 줄로 쪼개져 있다 — 줄바꿈을 건너뛰는 조각으로 본다.
+check("  대신 영향 안내만 보여 준다",
+      "같은 네이버 ID 로 등록된 다른 계정이 있으면" in APP
+      and "다시 로그인해야 할 수 있습니다" in APP)
+check("  선택한 등록 외는 건드리지 않는다고 적는다",
+      "선택한 등록 외의 쿠키·프로필·계정 정보는" in APP)
+
+#  ⑤ 진짜 위험은 **그대로 막는다**
+check("★발행 중이면 여전히 잠근다", "or bool(_busy)" in APP)
+check("★큐를 못 읽으면 여전히 잠근다",
+      '_unknown = bool(stt.get("read_error"))' in APP and "or _unknown" in APP)
+check("  왜 잠그는지 알려 준다(모르는 것과 없는 것을 구분)",
+      "확인하지 못했습니다** — 로그아웃을 잠급니다" in APP)
+
+#  ⑥ 보류·재개와 쿠키 취급은 그대로
+check("대기 작업 자동 보류가 그대로다", "held = store_obj.hold_account(" in APP)
+check("재개가 그대로다", "do_resume(store_obj," in APP)
+check("★확인 전 쿠키 초기화로 성공을 오판하지 않는다(수동 경로는 안 지운다)",
+      "clear_cookies" not in src and "clear_state" not in src)
+check("수동이 기본 · --auto 로 자동 보존", session.parse_args(
+    ["--logout", "x"]).auto is False and hasattr(session, "_server_logout"))
+
 print("")
 print("=" * 76)
 if fails:

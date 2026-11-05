@@ -193,18 +193,18 @@ for acc in (A, NOID, B, NOID2, TAX):
 #    그래서 같은 blog_id 를 **위험 후보**로 올리고, 로그인 계정이 같은지
 #    확인되지 않으면 막는다(모르면 막는다). 상세 검증은 stage10 에 있다.
 ok, peers, why = login_state.logout_allowed(NOID, path=ACCOUNTS)
-check("★같은 blog_id 인데 login_id 가 미등록이면 **막는다**(정책 변경)",
-      (not ok) and len(peers) == 1 and peers[0]["id"] == "seoyeon",
-      f"후보 {[q['id'] for q in peers]} · {why[:40]}")
+check("★같은 blog_id · login_id 미등록이어도 **막지 않는다**(2026-11-05 정책)",
+      ok and len(peers) == 1 and peers[0]["id"] == "seoyeon",
+      f"허용={ok} · 후보 {[q['id'] for q in peers]} · {why[:40]}")
 check("  사유에 blog_id 가 같다고 적힌다",
       peers and "blog_id" in peers[0]["why"], peers[0]["why"][:46])
 check("  같은 계정이라고 단정하지 않는다(확인되지 않음)",
       peers and "확인되지 않음" in peers[0]["why"])
 ok_a, peers_a, why_a = login_state.logout_allowed(A, path=ACCOUNTS)
-check("★login_id 가 있어도 상대가 미등록이면 막는다(한쪽만 알면 확인 불가)",
-      (not ok_a) and len(peers_a) == 1
+check("★상대가 미등록이어도 막지 않는다 — 후보로만 알린다(정책 변경)",
+      ok_a and len(peers_a) == 1
       and peers_a[0]["id"] == "tab_caa3dca8",
-      f"후보 {[q['id'] for q in peers_a]}")
+      f"허용={ok_a} · 후보 {[q['id'] for q in peers_a]}")
 check("  blog_id 가 없는 계정은 후보로 묶지 않는다(빈 값끼리 묶이면 안 된다)",
       login_state.logout_allowed(TAX, path=ACCOUNTS)[1] == [],
       str(login_state.logout_allowed(TAX, path=ACCOUNTS)[1]))
@@ -232,8 +232,8 @@ check("  blog_id 경로가 profile_dir 사유를 덮어쓰지 않는다",
 check("  같은 blog_id 인 계정도 함께 후보가 된다(2026-11-05)",
       "seoyeon" in _by, str(sorted(_by)))
 ok, peers, why = login_state.logout_allowed(NOID, path=SHARED)
-check("로그인 계정이 같은지 확인되지 않으면 **금지**", not ok, why[:56])
-check("금지 사유에 영향 계정이 나열된다", "shared_other" in why)
+check("확인되지 않아도 **허용**한다(정책 변경)", ok, why[:56])
+check("사유에 영향 계정이 나열된다", "shared_other" in why)
 check("영향 범위 목록을 함께 돌려준다", len(peers) == 2,
       f"{[q['id'] for q in peers]}")
 
@@ -254,9 +254,9 @@ check("화면이 '이 계정 전용 세션' 기준임을 안내한다",
       "이 계정 전용 세션" in app)
 check("내부 세션 폴더 이름은 화면에 노출하지 않는다(2026-09-17 결정)",
       "세션 폴더 `{aid}`" not in app)
-check("★화면이 blog_id 의 쓰임을 정확히 적는다(2026-11-05)",
-      "같은 네이버 계정일 수 있어" in app
-      and "단정하지는 않습니다" in app)
+check("★화면이 '막지 않는다' 는 정책을 분명히 적는다(2026-11-05)",
+      "로그아웃을 막지는 않습니다" in app
+      and "다시 로그인해야 할 수 있습니다" in app)
 accounts.refresh()
 
 

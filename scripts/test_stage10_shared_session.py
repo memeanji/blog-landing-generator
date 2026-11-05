@@ -123,11 +123,14 @@ check("  내 login_id 를 상대에게 복사하지 않는다",
 check("  판정은 logout_allowed 가 한다(session_peers 는 bool 을 내지 않는다)",
       isinstance(peers, list))
 
-head("③ login_id 가 다르거나 미확인이면 차단")
+head("③ 공유 후보가 있어도 **막지 않는다** — 안내만 한다(2026-11-05 정책)")
 allowed, got_peers, why = LS.logout_allowed(A, P)
-check("★login_id 미등록 후보가 있으면 **차단**", allowed is False, str(allowed))
-check("  사유에 '확인되지 않았습니다' 가 들어간다", "확인되지 않았습니다" in why,
+check("★login_id 미등록 후보가 있어도 **허용**(정책 변경)", allowed is True,
+      str(allowed))
+check("  그래도 영향 범위를 알려 준다", "같은 네이버 계정일 수 있는 등록이" in why,
       why[:60])
+check("  ★후보 탐지는 그대로다(막지 않을 뿐 찾아는 낸다)",
+      bool(got_peers), f"{len(got_peers)}건")
 check("  영향 건수를 적는다", "1건" in why, why[:60])
 
 D1 = acc("d1", blog="shared", login="same@naver.com")
@@ -142,13 +145,14 @@ F1 = acc("f1", blog="shared2", login="loginF")
 F2 = acc("f2", blog="shared2", login="someoneelse")   # 다른 로그인
 PF = write_accounts([F1, F2])
 ok3, _, why3 = LS.logout_allowed(F1, PF)
-check("★로그인 계정이 **다르면** 차단", ok3 is False, str(ok3))
+check("★로그인 계정이 달라도 **허용**(정책 변경)", ok3 is True, str(ok3))
+check("  그래도 그 등록을 사유에 적는다", "someoneelse" in why3, why3[:70])
 
 G1 = acc("g1", blog="shared3")                     # 내 login_id 도 미등록
 G2 = acc("g2", blog="shared3", login="loginG")
 PG = write_accounts([G1, G2])
 ok4, _, _ = LS.logout_allowed(G1, PG)
-check("  내 login_id 가 미등록이면(상대는 등록) 차단", ok4 is False)
+check("  내 login_id 가 미등록이어도 허용(정책 변경)", ok4 is True)
 
 head("④ 판정 규칙·기존 동작 유지")
 check("logout_allowed 의 세 분기가 그대로다(없음/같음/그 밖)",
@@ -185,12 +189,14 @@ check("★각 줄에 **세션(쿠키) 보유 여부**를 적는다 — 실제로
       and "이 PC 에 세션 없음" in blk)
 check("  세션 있는 건수를 머리에 요약한다",
       "그중 {len(_live)}건은 이 PC 에 세션이 저장돼 있습니다" in blk)
-check("★서버 로그아웃이 같은 네이버 계정 전체에 걸린다고 경고한다",
-      "같은 네이버 계정** 전체의 세션을" in blk)
+check("★같은 네이버 계정의 다른 등록도 재로그인이 필요할 수 있다고 알린다",
+      "다시 로그인해야 할 수 있습니다" in blk)
+check("  ★그것 때문에 막지는 않는다고 분명히 적는다",
+      "로그아웃을 막지 않습니다" in blk)
 check("  쿠키 폴더 분리로는 막지 못한다고 적는다",
       "분리돼 있어도 이 영향은 막지 못합니다" in blk)
-check("  차단 시 체크박스 안내를 그대로 한다",
-      "공유 세션 확인" in APP_SESSION)
+check("  ★체크박스를 **필수로 요구하지 않는다**(정책 변경)",
+      "_shared_" not in APP_SESSION)
 check("  진행하면 사용자가 확인했다고 기록한다",
       "사용자가 영향 범위를 확인했습니다" in APP_SESSION)
 
@@ -199,8 +205,8 @@ give_session("b_other", 18, blog="myblog")
 _, _, why_live = LS.logout_allowed(A, P)
 check("★사유 문구에 '저장된 세션 쿠키 N개' 가 들어간다",
       "저장된 세션 쿠키 18개" in why_live, why_live[-90:])
-check("  서버 로그아웃으로 함께 끊긴다고 적는다",
-      "함께 끊깁니다" in why_live)
+check("  함께 재로그인이 필요할 수 있다고 적는다",
+      "함께 재로그인이 필요해질 수 있습니다" in why_live)
 no_sess = LS.session_peers(A, P)
 check("  후보에 has_session·cookies 가 담긴다",
       no_sess and no_sess[0]["has_session"] is True
@@ -257,12 +263,14 @@ print(f"  전체 {len(SHAPE)}건 — 허용 {allowed_n} · 차단 {blocked}"
 check("혼자 쓰는 블로그는 후보가 없고 허용된다",
       LS.session_peers(rows[-1], PS) == []
       and LS.logout_allowed(rows[-1], PS)[0] is True)
-check("★같은 blog_id 인데 모두 login_id 미등록이면 차단된다(의도된 보수적 동작)",
-      LS.logout_allowed(rows[4], PS)[0] is False)
+check("★같은 blog_id 에 모두 login_id 미등록이어도 **허용**(2026-11-05 정책)",
+      LS.logout_allowed(rows[4], PS)[0] is True)
+check("  그래도 후보는 찾아낸다(안내용)",
+      bool(LS.session_peers(rows[4], PS)))
 check("★표기가 같은 login_id 끼리는 허용된다(합치지 않고 비교만)",
       LS.logout_allowed(D1, PD)[0] is True)
-check("차단이 전체의 과반이다(= login_id 등록 정리가 필요하다는 신호)",
-      blocked > allowed_n, f"차단 {blocked} / 허용 {allowed_n}")
+check("★이제 공유 후보 때문에 차단되는 경우가 없다(정책 변경)",
+      blocked == 0, f"차단 {blocked} / 허용 {allowed_n}")
 over = [i for a_row, (i, _b, _l, _c) in zip(rows, SHAPE)
         if not LS.logout_allowed(a_row, PS)[0]
         and not [p for p in LS.session_peers(a_row, PS) if p.get("has_session")]]
@@ -282,8 +290,10 @@ check("① profile_dir 가 같으면 후보다(blog_id 가 달라도)",
       [p["id"] for p in ph] == ["h2"], str([p["id"] for p in ph]))
 check("  사유가 profile_dir 로 적힌다",
       ph and "profile_dir" in ph[0]["why"], ph[0]["why"][:40] if ph else "")
-check("  그때도 login_id 가 다르면 차단",
-      LS.logout_allowed(H1, PH)[0] is False)
+check("  profile_dir 공유 + login_id 가 달라도 **허용**(정책 변경)",
+      LS.logout_allowed(H1, PH)[0] is True)
+check("  그래도 그 등록을 사유에 적는다",
+      "h2" in LS.logout_allowed(H1, PH)[2])
 check("④가 ①②를 **덮어쓰지 않는다**(먼저 걸린 사유를 유지)",
       "if not why and mine_blog" in APP_LS)
 check("별칭 경로 코드가 그대로 있다",

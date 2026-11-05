@@ -333,9 +333,13 @@ def cmd_logout(acc, log, hard: bool = False, confirm_shared: bool = False,
             log(f"           · {pr['label']} (id={pr['id']}, "
                 f"login_id={pr['login_id'] or '없음'}, 브랜드={pr['brand'] or '기본'}) "
                 f"— {pr['why']} · {_sess}")
-        log("           ★네이버 서버 로그아웃은 **같은 네이버 계정** 전체의 세션을 "
-            "끊습니다.")
+        log("           ★네이버에서 로그아웃하면 **같은 네이버 계정**으로 로그인한 "
+            "다른 등록도")
+        log("             다시 로그인해야 할 수 있습니다(브랜드가 달라도 같은 ID 를 "
+            "쓰면 그렇습니다).")
         log("             쿠키 폴더는 계정별로 분리돼 있어도 이 영향은 막지 못합니다.")
+        log("           ※안내일 뿐입니다 — 이것 때문에 로그아웃을 막지 않습니다"
+            "(2026-11-05 정책).")
     if not allowed and not confirm_shared:
         log(f"[로그아웃] ❌ 중단 — {why}")
         log("           영향 범위를 확인하신 뒤 다시 실행해 주세요"
