@@ -97,7 +97,11 @@ WANT_VER = re.search(r'AGENT_VERSION\s*=\s*"([0-9.]+)"',
 
 head("1. AGENT_VERSION")
 v = version_of(NEW_EXE)
-check(f"빌드된 EXE 의 AGENT_VERSION = {WANT_VER}", v == [WANT_VER], str(v))
+#  ★'한 개여야 한다' 를 따로 본다 — 버전처럼 보이는 문자열이 docstring 에 섞이면
+#    (docstring 은 `.pyc` 에 남는다) 여기서 두 개로 잡힌다. 실제로 겪었다.
+check(f"빌드된 EXE 의 버전 문자열이 **하나뿐**이다 ({WANT_VER})", v == [WANT_VER],
+      str(v) + ("  ← 여러 개면 pairing.py 의 docstring·상수에 버전 꼴 문자열이"
+                " 섞였는지 본다" if len(v) != 1 else ""))
 check(f"설치 프로그램 AppVer = {WANT_VER} (pairing.py 와 일치)",
       f'#define AppVer "{WANT_VER}"' in NEW_ISS.read_text(encoding="utf-8-sig"))
 #  ★게이트는 '최소 버전' 이다 — 번호를 올려도 로그아웃이 잠기지 않아야 한다.
