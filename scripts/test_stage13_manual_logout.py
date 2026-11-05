@@ -307,8 +307,9 @@ check("후보가 없으면 그대로 허용 · 안내 없음",
 
 #  ④ 화면 — 체크박스를 **요구하지 않는다**
 check("★'공유 세션 확인' 체크박스를 요구하지 않는다", "_shared_" not in APP)
+#  ★문구가 줄바꿈으로 쪼개져 있다 — 앞 조각으로 본다.
 check("  선택한 등록 외는 건드리지 않는다고 적는다",
-      "선택한 등록 외의 쿠키·프로필·계정 정보는" in APP)
+      "선택한 등록 외의 쿠키·프로필·계정 " in APP)
 
 #  ★가장 중요한 것 — `confirm_shared` 를 **묻지도 않고 True 로 보내지 않는다.**
 #    체크박스를 없애면서 한때 `shared_ok = True` 로 무조건 보냈는데, 그건
@@ -332,6 +333,41 @@ check("  영향 범위를 **목록으로** 보여 준다",
 check("  후보 조회가 실패해도 막지 않고 사실만 알린다",
       "_peers_err" in APP and "같은 세션을 쓰는 등록이 있는지 **확인하지 " in APP
       and "로그아웃을 막지는 " in APP)
+
+#  ★Agent 1.3.3 호환 — 그 설치본에는 **옛 차단 정책**이 들어 있다.
+#    화면이 보내는 `--confirm-shared` 로만 통과한다. 그래서 '후보를 못 봐서
+#    안 보냈는데 PC 는 막는' 경우가 **영구 차단**이 되면 안 된다.
+OLD_ALLOWED = """
+def logout_allowed_1_3_3(peers, mine, confirm_shared):
+    #  1.3.3 설치본의 판정을 그대로 옮긴 것(차단 분기 포함)
+    if not peers:
+        return True
+    odd = [p for p in peers if not (mine and p.get("login_id") == mine)]
+    allowed = not odd
+    return allowed or confirm_shared          # cmd_logout 의 통과 조건
+"""
+_ns: dict = {}
+exec(OLD_ALLOWED, _ns)
+old_ok = _ns["logout_allowed_1_3_3"]
+
+check("★[1.3.3] 후보 없음 → confirm 없이도 통과",
+      old_ok([], "me", False) is True)
+check("★[1.3.3] 후보 있고 login_id 같음 → confirm 없이도 통과",
+      old_ok([{"login_id": "me"}], "me", False) is True)
+check("★[1.3.3] 후보 있고 login_id 미등록 → confirm 없으면 **차단**",
+      old_ok([{"login_id": ""}], "me", False) is False)
+check("★[1.3.3] 그때 confirm 을 보내면 **통과**(화면 2단계가 이걸 보낸다)",
+      old_ok([{"login_id": ""}], "me", True) is True)
+check("★[1.3.3] login_id 가 서로 달라도 confirm 이면 통과",
+      old_ok([{"login_id": "other"}], "me", True) is True)
+
+check("★차단당한 뒤에는 화면이 **확인 단계를 연다**(영구 차단 방지)",
+      "_was_blocked = bool(_ver and _ver[0] == \"blocked\")" in APP
+      and "_need = bool(_peers) or _was_blocked" in APP)
+check("  차단 안내가 없어진 체크박스를 가리키지 않는다",
+      "'공유 세션 확인' 을 읽고 체크한 뒤" not in APP)
+check("  후보가 안 보이는데 막힌 경우 건수를 지어내지 않는다",
+      "PC 가 같은 세션을 쓰는 등록을 찾아 " in APP)
 
 #  후보 목록은 화면이 직접 본다 — 원격(Supabase) 포함
 LA = APP[APP.index("def logout_peers("):APP.index("def logout_verdict(")]

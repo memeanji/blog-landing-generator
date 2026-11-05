@@ -664,8 +664,9 @@ def logout_verdict(store_obj, rec: dict | None) -> tuple[str, str, str] | None:
             break
         if (ev or {}).get("event") == "logout_blocked":
             return ("blocked", "⛔ 로그아웃하지 않았습니다",
-                    "영향 범위가 확인되지 않아 PC 가 중단했습니다. 아래 "
-                    "'공유 세션 확인' 을 읽고 체크한 뒤 다시 눌러 주세요.")
+                    "PC 가 **이 화면에서는 안 보이는 공유 후보**를 찾아 중단했습니다"
+                    "(PC 에만 있는 별칭 기록 등). 아래 버튼이 **확인 단계**로 "
+                    "바뀌었으니, 영향 범위를 확인하고 한 번 더 눌러 주세요.")
     key = got if got in LOGOUT_VERDICT else "unknown"
     title, desc = LOGOUT_VERDICT[key]
     return (key, title, desc)
@@ -1657,7 +1658,13 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
             #    그것을 보고 누른 경우에만 보낸다.
             _peers, _peers_err = logout_peers(account)
             _ckey = f"_logout_ok_{aid or lid}"
-            _need = bool(_peers)                 # 확인을 받아야 하는가
+            #  ★PC 가 막은 적이 있으면 **확인 단계를 연다**(2026-11-05).
+            #    후보 탐지가 양쪽에서 다를 수 있다 — 별칭 기록처럼 **PC 에만
+            #    있는 근거**로 Agent 가 후보를 더 찾아내면, 화면은 후보가 없다고
+            #    보고 `confirm_shared` 를 안 보내 **영원히 막힌다**.
+            #    그때는 사용자가 확인하고 한 번 더 누르면 넘어갈 수 있어야 한다.
+            _was_blocked = bool(_ver and _ver[0] == "blocked")
+            _need = bool(_peers) or _was_blocked   # 확인을 받아야 하는가
             _ready = bool(st.session_state.get(_ckey))   # 이미 확인했는가
             _off = (not (device_id and (lid or aid) and can_logout)
                     or bool(_busy) or _unknown)
@@ -1668,17 +1675,27 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                            f"않지만, 같은 네이버 ID 로 등록된 다른 계정이 있으면 "
                            f"그 계정도 다시 로그인해야 할 수 있습니다.")
             if _need and not _ready:
-                _names = " · ".join(
-                    f"{p.get('label') or p.get('id')}(id={p.get('id')}, "
-                    f"login_id={p.get('login_id') or '없음'})" for p in _peers[:5])
-                _more = f"  외 {len(_peers) - 5}건" if len(_peers) > 5 else ""
+                if _peers:
+                    _names = " · ".join(
+                        f"{p.get('label') or p.get('id')}(id={p.get('id')}, "
+                        f"login_id={p.get('login_id') or '없음'})"
+                        for p in _peers[:5])
+                    _more = f"  외 {len(_peers) - 5}건" if len(_peers) > 5 else ""
+                    _head = (f"🔗 **같은 네이버 계정일 수 있는 등록이 "
+                             f"{len(_peers)}건 있습니다.**{chr(10)}{chr(10)}"
+                             f"{_names}{_more}")
+                else:
+                    #  ★화면에서는 후보가 안 보이는데 PC 가 막은 경우
+                    #    (PC 에만 있는 별칭 기록 등). 건수를 지어내지 않는다.
+                    _head = ("🔗 **PC 가 같은 세션을 쓰는 등록을 찾아 "
+                             "중단했습니다.** 이 화면에서는 그 근거가 보이지 "
+                             "않습니다(PC 에만 있는 기록). 자세한 목록은 아래 "
+                             "작업 로그에 적혀 있습니다.")
                 st.warning(
-                    f"🔗 **같은 네이버 계정일 수 있는 등록이 {len(_peers)}건 "
-                    f"있습니다.**{chr(10)}{chr(10)}{_names}{_more}"
-                    f"{chr(10)}{chr(10)}네이버에서 로그아웃하면 **이 등록들도 다시 "
-                    f"로그인해야 할 수 있습니다**(브랜드가 달라도 같은 ID 면 "
-                    f"그렇습니다). 선택한 등록 외의 쿠키·프로필·계정 정보는 "
-                    f"건드리지 않습니다.")
+                    f"{_head}{chr(10)}{chr(10)}네이버에서 로그아웃하면 **이 "
+                    f"등록들도 다시 로그인해야 할 수 있습니다**(브랜드가 달라도 "
+                    f"같은 ID 면 그렇습니다). 선택한 등록 외의 쿠키·프로필·계정 "
+                    f"정보는 건드리지 않습니다.")
             if st.button(("영향 범위를 확인했습니다 — 계속"
                           if (_need and not _ready) else "선택 계정 로그아웃"),
                          use_container_width=True, disabled=_off,
