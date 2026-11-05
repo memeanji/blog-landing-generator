@@ -13,7 +13,7 @@
 #define AppName "블로그 랜딩 Agent"
 ; ★이 번호는 v2/pairing.py 의 AGENT_VERSION 과 **같아야 한다**(검증 스크립트가 대조한다).
 ;   여기에 옛 번호를 적어 두지 않는다 — 올릴 때 같이 못 고치면 헷갈린다.
-#define AppVer "1.3.3"
+#define AppVer "1.3.4"
 #define AppExe "BlogLandingAgent.exe"
 
 [Setup]
