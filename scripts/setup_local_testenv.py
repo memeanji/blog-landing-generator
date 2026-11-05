@@ -25,7 +25,6 @@ import io
 import json
 import os
 import re
-import shutil
 import sys
 import tempfile
 from datetime import datetime, timedelta
@@ -192,53 +191,130 @@ print("""
    ★Agent 는 띄우지 않는다. 포트도 운영과 다르게 둔다.""")
 
 if BUILD:
-    import make_test_fixture
+    head("⑥ 생성 전 안전장치")
 
+    #  ── ① 기존 폴더가 있으면 **삭제하지 않고 중단**한다 ──────────
     if FIX.exists():
-        shutil.rmtree(FIX)
-    FIX.mkdir(parents=True)
-    make_test_fixture.build(FIX)
-    for sub in ("pending", "running", "held", "finished", "agents", "logs",
-                "cancel", "plans"):
-        (FIX / "queue" / sub).mkdir(parents=True, exist_ok=True)
-    (FIX / "sessions").mkdir(exist_ok=True)
+        print(NG + f" 테스트 폴더가 이미 있습니다 — {FIX}")
+        print("     ★덮어쓰거나 지우지 않습니다(승인 조건).")
+        print("     다시 만들려면 사용자가 직접 지운 뒤 실행해 주세요:")
+        print(f"       rmdir /s /q \"{FIX}\"")
+        sys.exit(2)
+    check("기존 테스트 폴더가 없다(덮어쓰기·삭제 없음)", not FIX.exists())
 
-    #  같은 login_id 를 쓰는 두 등록 + 다른 ID 하나(합성)
-    accs = json.loads((FIX / "accounts.json").read_text(encoding="utf-8"))
-    rows = accs.get("accounts") or []
-    tabs = json.loads((FIX / "out" / "tabs_repurely.json").read_text(
-        encoding="utf-8")).get("tabs") or [""]
-    rows += [
-        {"id": "tst_re", "label": "테스트 계정(리퓨어리)", "login_id": "tstlogin",
-         "blog_id": "tstblog", "ref_tab": tabs[0], "brand": "repurely",
-         "media": "", "enabled": True, "note": "테스트 전용"},
-        {"id": "tst_dn", "label": "테스트 계정(프리즈젯)", "login_id": "tstlogin",
-         "blog_id": "tstblog", "ref_tab": tabs[0], "brand": "repurely",
-         "media": "", "enabled": True, "note": "테스트 전용 — 같은 login_id"},
-        {"id": "tst_other", "label": "다른 테스트 계정", "login_id": "otherlogin",
-         "blog_id": "otherblog", "ref_tab": tabs[0], "brand": "repurely",
-         "media": "", "enabled": True, "note": "테스트 전용"},
-    ]
-    (FIX / "accounts.json").write_text(
-        json.dumps({"accounts": rows}, ensure_ascii=False, indent=1),
-        encoding="utf-8")
+    #  ── ② 운영 설정 상속 차단 ────────────────────────────────────
+    #     ★`v2` 를 import 하기 **전에** 환경변수를 박는다. appdir.ROOT 는
+    #       import 시점에 고정되므로 순서가 중요하다.
+    for _k, _v in ENVS.items():
+        os.environ[_k] = _v
+    #     구글·Supabase 인증정보가 프로세스 환경에 **남아 있으면 지운다**
+    #     (부모 셸에서 상속될 수 있다).
+    DROP = ("GOOGLE_SERVICE_ACCOUNT_JSON", "GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT",
+            "REFERENCE_SPREADSHEET_ID", "SUPABASE_URL", "SUPABASE_SERVICE_KEY",
+            "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_PUBLISHABLE_KEY",
+            "BLOG_DEVICE_TOKEN", "TEAM_PASSWORD", "BLOG_BRANDS_JSON")
+    dropped = [k for k in DROP if os.environ.pop(k, None) is not None]
+    check("운영 인증정보가 프로세스 환경에 남아 있지 않다",
+          True, f"지운 변수 {dropped or '없음'}")
+    check("  테스트 폴더에 .env 를 두지 않는다(구글 호출 불가)",
+          not (FIX / ".env").exists())
+    #     Streamlit secrets 도 상속되지 않게 — 이 스크립트는 streamlit 을
+    #     import 하지 않는다(화면을 띄우지 않으므로 필요가 없다).
+    check("이 스크립트는 streamlit 을 import 하지 않는다",
+          "streamlit" not in sys.modules)
 
-    #  가짜 하트비트 — Agent 를 띄우지 않는다
-    (FIX / "queue" / "agents" / "TESTPC.json").write_text(json.dumps({
-        "agent": "TESTPC", "host": "TESTPC", "state": "idle", "job": "",
-        "version": "1.2.5",          # ← 1.3.0 으로 바꾸면 로그아웃 게이트가 열린다
-        "pid": 0, "at": datetime.now().isoformat(timespec="seconds"),
-    }, ensure_ascii=False, indent=1), encoding="utf-8")
+    #  ── ③ 빌드 중 네트워크를 **차단**한다(증명용) ────────────────
+    import socket
 
-    print(f"\n   생성 완료 — {FIX}")
-    print("   ★하트비트의 `at` 은 30초면 만료된다. 화면 시험 직전에")
-    print("     scripts/setup_local_testenv.py --build 를 다시 돌려 갱신하면 된다.")
-    #  운영 폴더를 건드리지 않았는지 마지막 확인
-    check("운영 폴더에 테스트 흔적이 없다",
-          not (PROD / "accounts.json").exists()
-          or json.loads((PROD / "accounts.json").read_text(
-              encoding="utf-8")).get("accounts", [{}])[0].get("id")
-          != "tst_re")
+    net_calls: list[str] = []
+    _real_create = socket.create_connection
+    _real_connect = socket.socket.connect
+
+    def _blocked_create(address, *a, **k):
+        net_calls.append(f"create_connection{address}")
+        raise OSError("테스트 환경: 외부 네트워크 차단")
+
+    def _blocked_connect(self, address, *a, **k):
+        net_calls.append(f"connect{address}")
+        raise OSError("테스트 환경: 외부 네트워크 차단")
+
+    socket.create_connection = _blocked_create          # type: ignore[assignment]
+    socket.socket.connect = _blocked_connect            # type: ignore[assignment]
+
+    head("⑦ 생성")
+    try:
+        import make_test_fixture
+
+        FIX.mkdir(parents=True)
+        make_test_fixture.build(FIX)
+        for sub in ("pending", "running", "held", "finished", "agents",
+                    "logs", "cancel", "plans"):
+            (FIX / "queue" / sub).mkdir(parents=True, exist_ok=True)
+        (FIX / "sessions").mkdir(exist_ok=True)
+
+        #  같은 login_id 를 쓰는 두 등록 + 다른 ID 하나(합성)
+        accs = json.loads((FIX / "accounts.json").read_text(encoding="utf-8"))
+        rows = accs.get("accounts") or []
+        tabs = json.loads((FIX / "out" / "tabs_repurely.json").read_text(
+            encoding="utf-8")).get("tabs") or [""]
+        rows += [
+            {"id": "tst_re", "label": "테스트 계정(리퓨어리)",
+             "login_id": "tstlogin", "blog_id": "tstblog", "ref_tab": tabs[0],
+             "brand": "repurely", "media": "", "enabled": True,
+             "note": "테스트 전용"},
+            {"id": "tst_dn", "label": "테스트 계정(프리즈젯)",
+             "login_id": "tstlogin", "blog_id": "tstblog", "ref_tab": tabs[0],
+             "brand": "repurely", "media": "", "enabled": True,
+             "note": "테스트 전용 — 같은 login_id"},
+            {"id": "tst_other", "label": "다른 테스트 계정",
+             "login_id": "otherlogin", "blog_id": "otherblog",
+             "ref_tab": tabs[0], "brand": "repurely", "media": "",
+             "enabled": True, "note": "테스트 전용"},
+        ]
+        (FIX / "accounts.json").write_text(
+            json.dumps({"accounts": rows}, ensure_ascii=False, indent=1),
+            encoding="utf-8")
+
+        #  가짜 하트비트 — Agent 를 띄우지 않는다
+        (FIX / "queue" / "agents" / "TESTPC.json").write_text(json.dumps({
+            "agent": "TESTPC", "host": "TESTPC", "state": "idle", "job": "",
+            "version": "1.2.5",    # ← 1.3.0 으로 바꾸면 로그아웃 게이트가 열린다
+            "pid": 0, "at": datetime.now().isoformat(timespec="seconds"),
+        }, ensure_ascii=False, indent=1), encoding="utf-8")
+    finally:
+        socket.create_connection = _real_create         # type: ignore[assignment]
+        socket.socket.connect = _real_connect           # type: ignore[assignment]
+
+    head("⑧ 생성 결과 · 안전 확인")
+    check("★빌드 중 외부 네트워크 호출이 0건이다", not net_calls,
+          str(net_calls[:3]))
+    check("v2 모듈을 import 하지 않았다(운영 경로 접근 없음)",
+          not [m for m in sys.modules if m.startswith("v2")],
+          str([m for m in sys.modules if m.startswith("v2")])[:70])
+
+    made = sorted(q for q in FIX.rglob("*"))
+    files = [q for q in made if q.is_file()]
+    print(f"\n   폴더 {len([q for q in made if q.is_dir()])}개 · "
+          f"파일 {len(files)}개 — 전부 {FIX} 아래")
+    for q in files:
+        print(f"     {q.relative_to(FIX).as_posix():<42}{q.stat().st_size:>8} B")
+    outside = [q for q in files if FIX not in q.parents and q.parent != FIX]
+    check("★테스트 폴더 밖에 만든 파일이 없다", not outside, str(outside[:3]))
+    check("  .env 를 만들지 않았다", not (FIX / ".env").exists())
+    check("  sessions/ 가 비어 있다(운영 쿠키 복사 없음)",
+          not any((FIX / "sessions").rglob("*")))
+    acc_ids = [r.get("id") for r in json.loads(
+        (FIX / "accounts.json").read_text(encoding="utf-8")).get("accounts", [])]
+    check("  합성 계정만 들어 있다", all(
+        not str(i).startswith(("shin", "smile", "tab_0", "tab_7", "tab_c",
+                               "ggom", "rhks", "scwsc", "tax"))
+        for i in acc_ids), str(acc_ids))
+    hb = json.loads((FIX / "queue" / "agents" / "TESTPC.json").read_text(
+        encoding="utf-8"))
+    check("  가짜 하트비트가 1.2.5 로 들어갔다", hb.get("version") == "1.2.5",
+          str({k: hb[k] for k in ("agent", "version", "state")}))
+    print("\n   ★하트비트의 `at` 은 30초면 만료된다 — 화면 시험 직전에 이 스크립트를")
+    print("     (폴더를 지운 뒤) 다시 돌리거나 그 파일의 `at` 만 갱신하면 된다.")
 
 print("\n" + "=" * 76)
 if fails:
