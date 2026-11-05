@@ -249,7 +249,8 @@ check("사용자가 확인하면 진행한다",
 app = (ROOT / "streamlit_app.py").read_text(encoding="utf-8")
 check("화면에 '공유 세션 확인' 체크가 있다", "공유 세션 확인" in app)
 check("화면은 login_id 가 없어도 버튼을 연다",
-      "disabled=not (device_id and (lid or aid) and can_logout)" in app)
+      ("_off = (not (device_id and (lid or aid) and can_logout)" in app
+       and "disabled=_off" in app))
 check("화면이 '이 계정 전용 세션' 기준임을 안내한다",
       "이 계정 전용 세션" in app)
 check("내부 세션 폴더 이름은 화면에 노출하지 않는다(2026-09-17 결정)",

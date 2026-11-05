@@ -307,12 +307,41 @@ check("후보가 없으면 그대로 허용 · 안내 없음",
 
 #  ④ 화면 — 체크박스를 **요구하지 않는다**
 check("★'공유 세션 확인' 체크박스를 요구하지 않는다", "_shared_" not in APP)
-#  ★소스에서 문구가 여러 줄로 쪼개져 있다 — 줄바꿈을 건너뛰는 조각으로 본다.
-check("  대신 영향 안내만 보여 준다",
-      "같은 네이버 ID 로 등록된 다른 계정이 있으면" in APP
-      and "다시 로그인해야 할 수 있습니다" in APP)
 check("  선택한 등록 외는 건드리지 않는다고 적는다",
       "선택한 등록 외의 쿠키·프로필·계정 정보는" in APP)
+
+#  ★가장 중요한 것 — `confirm_shared` 를 **묻지도 않고 True 로 보내지 않는다.**
+#    체크박스를 없애면서 한때 `shared_ok = True` 로 무조건 보냈는데, 그건
+#    Agent 의 보호 조건을 조용히 넘기는 것이었다(2026-11-05 지적받아 고침).
+check("★confirm_shared 를 무조건 True 로 보내지 않는다",
+      "shared_ok = True" not in APP and "confirm_shared=bool(shared_ok)" not in APP)
+check("★후보가 있을 때만 confirm_shared 가 간다(= 사용자가 보고 누른 경우)",
+      "confirm_shared=bool(_need)" in APP)
+check("★후보가 있으면 **한 번 더 눌러야** 실행된다(2단계)",
+      "_need and not _ready" in APP
+      and "st.session_state[_ckey] = True" in APP)
+check("  1단계 버튼은 '확인' 이고 2단계에서 실행된다",
+      "영향 범위를 확인했습니다 — 계속" in APP)
+check("  확인 상태는 계정마다 따로 기억한다(다른 계정에 번지지 않는다)",
+      '_ckey = f"_logout_ok_{aid or lid}"' in APP)
+check("  실행하면 확인 상태를 지운다(다음에 또 묻는다)",
+      "st.session_state.pop(_ckey, None)" in APP)
+check("  영향 범위를 **목록으로** 보여 준다",
+      "같은 네이버 계정일 수 있는 등록이" in APP and "login_id=" in APP)
+#  ★문구가 여러 줄로 쪼개져 있다 — 이어지는 조각으로 본다.
+check("  후보 조회가 실패해도 막지 않고 사실만 알린다",
+      "_peers_err" in APP and "같은 세션을 쓰는 등록이 있는지 **확인하지 " in APP
+      and "로그아웃을 막지는 " in APP)
+
+#  후보 목록은 화면이 직접 본다 — 원격(Supabase) 포함
+LA = APP[APP.index("def logout_peers("):APP.index("def logout_verdict(")]
+check("★후보 조회는 session_peers 를 그대로 쓴다(판정을 베끼지 않는다)",
+      "_ls.session_peers(account)" in LA)
+check("  실패해도 빈 목록 + 사유로 돌려준다(터지지 않는다)", "return [], f" in LA)
+check("  원격 포함이라고 적어 둔다(로컬 파일만 보는 게 아니다)",
+      "원격(Supabase) 우선" in LA)
+check("  화면에서는 has_session 숫자를 쓰지 않는다(클라우드엔 세션 파일이 없다)",
+      "전부 False 로 나온다" in LA)
 
 #  ⑤ 진짜 위험은 **그대로 막는다**
 check("★발행 중이면 여전히 잠근다", "or bool(_busy)" in APP)
