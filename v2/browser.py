@@ -1,6 +1,7 @@
 """Chromium 실행 · 수동 로그인 대기 · 에디터 frame 탐색 (공통 저수준 헬퍼)."""
 from __future__ import annotations
 
+import asyncio
 import re
 
 NAVER_LOGIN_URL = "https://nid.naver.com/nidlogin.login"
@@ -383,43 +384,58 @@ async def confirm_login(ctx, blog_home_url: str, log) -> str:
 
 async def wait_manual_logout(ctx, log, timeout_sec: int = 600,
                              blog_home_url: str = "") -> str:
-    """사람이 **직접** 네이버에서 로그아웃할 때까지 기다린다.
+    """사람이 **창을 닫을 때까지** 기다린다. 그게 전부다.
 
-    돌려주는 값 — `ok`(로그아웃 확인) / `unknown`(시간 초과·창 닫힘·확인 실패)
-    ★`failed` 를 돌려주지 않는다. 여기서 '안 됐다' 고 단정할 근거가 없기 때문이다.
-      최종 판정은 호출한 쪽이 **쿠키 없이 프로필을 다시 열어** 하는 재확인이다.
+    돌려주는 값 — 언제나 `unknown`.
+    ★여기서는 **아무 판정도 하지 않는다.** 로그아웃됐는지는 호출한 쪽이 창을
+      닫은 뒤 **쿠키 없이 프로필을 다시 열어** 한 번 확인한다. 그것만이 근거다.
 
-    ★`wait_manual_login` 의 대칭형이다 — 2초마다 상태만 보고, 아이디·비밀번호를
-      다루지 않는다. 사용자가 2차 확인 화면을 거쳐도 끝까지 기다린다.
-    ★창을 먼저 닫으면 컨텍스트가 닫혀 예외가 난다 → `unknown` 으로 둔다.
-      '닫았으니 로그아웃했겠지' 라고 보지 않는다.
+    ★2026-11-05 — 예전에는 2초마다 `_confirm_logged_in` 을 불렀는데, 그 함수는
+      **페이지를 확인 주소로 이동시킨다**(`page.goto`). 사용자가 네이버에서
+      로그아웃하려는 중에 화면이 계속 튀어 쓸 수가 없었다. 그래서 폴링을 뺐다.
+      이제 **창을 건드리지 않는다** — 열어 두고 닫히기만 기다린다.
+      (`blog_home_url` 은 더 쓰지 않는다. 호출부 호환을 위해 인자만 남겨 둔다.)
+
+    ★타임아웃 — 사용자가 창을 닫지 않고 오래 두면 Agent 가 묶인다(작업이 직렬이다).
+      그래서 상한을 두고, 넘으면 호출부가 창을 닫고 재확인으로 넘어간다.
     """
-    home = blog_home_url or "https://blog.naver.com/MyBlog.naver"
-    log("[로그아웃] 브라우저 창을 띄웠습니다. **네이버 화면에서 직접 로그아웃**해 주세요.")
-    log("         로그아웃이 확인되면 자동으로 다음 단계로 넘어갑니다.")
-    waited = 0
+    log("[로그아웃] 브라우저 창을 띄웠습니다. **네이버 화면에서 직접 로그아웃**해 "
+        "주세요.")
+    log("         다 하셨으면 **창을 닫아** 주세요 — 그때 로그아웃됐는지 확인합니다.")
+    log("         (기다리는 동안 화면을 건드리지 않습니다. 자유롭게 쓰셔도 됩니다.)")
+    log(f"         ※ {timeout_sec // 60}분 안에 닫지 않으면 자동으로 창을 닫고 "
+        f"확인합니다. 급히 멈추려면 화면 맨 위 [진행 중인 작업] 에서 중단하세요.")
+
+    closed = asyncio.Event()
+    try:
+        ctx.on("close", lambda *_a: closed.set())
+    except Exception:                                          # noqa: BLE001
+        pass                                   # 이벤트를 못 걸면 아래 폴링으로 본다
+
+    waited = 0.0
     while waited < timeout_sec:
         try:
-            await (ctx.pages[0] if ctx.pages else await ctx.new_page()
-                   ).wait_for_timeout(2000)
-        except Exception as exc:                               # noqa: BLE001
-            log(f"[로그아웃] 창이 닫혔습니다({type(exc).__name__}) — "
-                f"로그아웃 여부는 아래 재확인으로 판단합니다")
+            await asyncio.wait_for(closed.wait(), timeout=2.0)
+            log(f"[로그아웃] 창이 닫혔습니다({waited:.0f}초) — 이제 로그아웃됐는지 "
+                f"확인합니다.")
             return "unknown"
-        waited += 2
+        except asyncio.TimeoutError:
+            waited += 2.0
+        #  ★페이지를 건드리지 않고 **열려 있는지만** 본다(이동·새로고침 없음).
         try:
-            got = await _confirm_logged_in(ctx, home, log)
-        except Exception as exc:                               # noqa: BLE001
-            log(f"[로그아웃] 상태를 읽지 못했습니다({type(exc).__name__}) — "
-                f"계속 기다립니다")
-            continue
-        if not got:
-            log(f"[로그아웃] 로그아웃을 확인했습니다 ✅ ({waited}초)")
-            return "ok"
-        if waited % 60 == 0:
-            log(f"[로그아웃] 아직 로그인 상태입니다({got}) — 기다리는 중 "
-                f"{waited}/{timeout_sec}초")
-    log(f"[로그아웃] {timeout_sec}초 안에 로그아웃이 확인되지 않았습니다 — 확인 불가")
+            if not ctx.pages:
+                log(f"[로그아웃] 창이 모두 닫혔습니다({waited:.0f}초) — 이제 "
+                    f"로그아웃됐는지 확인합니다.")
+                return "unknown"
+        except Exception:                                      # noqa: BLE001
+            log(f"[로그아웃] 창이 닫혔습니다({waited:.0f}초) — 이제 로그아웃됐는지 "
+                f"확인합니다.")
+            return "unknown"
+        if waited and waited % 120 == 0:
+            log(f"[로그아웃] 기다리는 중 {waited:.0f}/{timeout_sec}초 — "
+                f"끝나면 창을 닫아 주세요.")
+    log(f"[로그아웃] {timeout_sec}초 동안 창이 닫히지 않아 **자동으로 닫습니다** — "
+        f"그래도 로그아웃됐는지는 확인합니다.")
     return "unknown"
 
 

@@ -117,59 +117,92 @@ check("저장 쿠키를 **복원**한다", "_restore_cookies" in src)
 check("쿠키가 없어도 프로필 세션으로 연다", "프로필에 남은 세션으로 엽니다" in src)
 check("로컬 초기화는 뒤 단계(session_store.logout)가 한다",
       "session_store.logout(acc, hard=hard)" in SES)
+#  ★확인이 **먼저**다 — 쿠키를 지우고 확인하면 '지웠으니 됐겠지' 와 구분이 안 된다.
+check("★재확인이 로컬 초기화보다 **먼저** 온다",
+      SES.index("_auto_login_recheck(acc, log))")
+      < SES.index("session_store.logout(acc, hard=hard)"))
 
 
 # ══════════════════════════════════════════════════════════════════
-head("④ 기다리기 — '닫았으니 됐겠지' 가 없다")
+head("④ 기다리기 — 창을 닫을 때까지 **건드리지 않는다**")
 
 wsrc = BRW[BRW.index("async def wait_manual_logout"):
            BRW.index("async def wait_manual_login")]
 check("★failed 를 돌려주지 않는다(단정하지 않는다)", '"failed"' not in wsrc)
-check("로그아웃을 확인하면 ok", 'return "ok"' in wsrc)
-check("시간 초과면 unknown", wsrc.count('return "unknown"') >= 1
-      and "확인되지 않았습니다" in wsrc)
-check("창이 닫히면 unknown(성공으로 보지 않는다)", "창이 닫혔습니다" in wsrc)
+check("★여기서는 ok 도 돌려주지 않는다(판정은 재확인이 한다)",
+      'return "ok"' not in wsrc)
+#  ★docstring 이 '예전에는 _confirm_logged_in 을 불렀다' 고 설명하므로
+#    이름만 세면 안 된다 — **호출**(괄호)이 있는지로 본다.
+check("★로그인 상태를 폴링하지 않는다(_confirm_logged_in 호출 없음)",
+      "_confirm_logged_in(" not in wsrc)
+check("★페이지를 이동·새로고침하지 않는다", "goto(" not in wsrc
+      and "reload(" not in wsrc)
+check("창이 닫히면 넘어간다", "창이 닫혔습니다" in wsrc or "창이 모두 닫혔습니다" in wsrc)
+check("타임아웃이 있고 자동으로 닫는다고 알린다", "자동으로 닫습니다" in wsrc)
+check("중단 방법을 알려 준다", "진행 중인 작업" in wsrc)
 check("아이디·비밀번호를 다루지 않는다",
       "password" not in wsrc.lower() and "fill(" not in wsrc)
 
 
 class FakeCtx:
-    """`_confirm_logged_in` 이 보는 최소한의 가짜 — 네트워크를 내지 않는다."""
+    """창을 흉내 낸다 — 페이지를 건드리면 바로 드러나게 만든다."""
 
-    def __init__(self, seq):
-        self.seq = list(seq)
+    def __init__(self, close_after=None):
         self.pages = [self]
+        self.ticks = 0
+        self.close_after = close_after
+        self.touched = []
+        self._cb = None
 
-    async def wait_for_timeout(self, _ms):
-        return None
+    def on(self, name, cb):
+        if name == "close":
+            self._cb = cb
+
+    #  ★아래가 불리면 '창을 건드렸다' 는 뜻이다
+    async def goto(self, *a, **k):
+        self.touched.append("goto")
+
+    async def reload(self, *a, **k):
+        self.touched.append("reload")
 
     async def new_page(self):
+        self.touched.append("new_page")
         return self
 
 
-def run_wait(seq, timeout=6):
-    calls = {"n": 0}
+async def _drive(ctx, timeout):
+    import asyncio as _a
 
-    async def fake_confirm(_ctx, _home, _log):
-        calls["n"] += 1
-        return seq[min(calls["n"] - 1, len(seq) - 1)]
+    async def closer():
+        if ctx.close_after is None:
+            return
+        await _a.sleep(ctx.close_after)
+        ctx.pages = []                      # 사용자가 창을 닫았다
+        if ctx._cb:
+            ctx._cb()
 
-    old = browser._confirm_logged_in
-    browser._confirm_logged_in = fake_confirm
-    try:
-        return asyncio.run(browser.wait_manual_logout(
-            FakeCtx(seq), lambda *a, **k: None, timeout_sec=timeout))
-    finally:
-        browser._confirm_logged_in = old
-
-
-check("로그인 → 로그아웃으로 바뀌면 ok", run_wait(["myblog", ""]) == "ok")
-check("계속 로그인 상태면 unknown(시간 초과)",
-      run_wait(["myblog"], timeout=4) == "unknown")
-check("처음부터 로그아웃 상태면 ok", run_wait([""]) == "ok")
+    got, _ = await _a.gather(
+        browser.wait_manual_logout(ctx, lambda *a, **k: None,
+                                   timeout_sec=timeout),
+        closer())
+    return got
 
 
-# ══════════════════════════════════════════════════════════════════
+def run_wait(close_after=None, timeout=6):
+    ctx = FakeCtx(close_after)
+    got = asyncio.run(_drive(ctx, timeout))
+    return got, ctx
+
+
+got, ctx = run_wait(close_after=2.5)
+check("창을 닫으면 unknown 으로 넘어간다", got == "unknown", got)
+check("★그동안 창을 한 번도 건드리지 않았다", ctx.touched == [], str(ctx.touched))
+
+got2, ctx2 = run_wait(close_after=None, timeout=4)
+check("안 닫으면 타임아웃 뒤 unknown", got2 == "unknown", got2)
+check("★타임아웃까지도 창을 건드리지 않는다", ctx2.touched == [], str(ctx2.touched))
+
+
 head("⑤ 화면이 3상태를 구분한다")
 
 
@@ -311,63 +344,23 @@ check("★'공유 세션 확인' 체크박스를 요구하지 않는다", "_shar
 check("  선택한 등록 외는 건드리지 않는다고 적는다",
       "선택한 등록 외의 쿠키·프로필·계정 " in APP)
 
-#  ★가장 중요한 것 — `confirm_shared` 를 **묻지도 않고 True 로 보내지 않는다.**
-#    체크박스를 없애면서 한때 `shared_ok = True` 로 무조건 보냈는데, 그건
-#    Agent 의 보호 조건을 조용히 넘기는 것이었다(2026-11-05 지적받아 고침).
+#  ★2026-11-05 — **버튼 한 번**으로 실행한다. 추가 확인 단계를 두지 않는다.
+#    대신 `confirm_shared` 를 **보내지 않는다** — 우회가 아니라, Agent 쪽
+#    정책이 '공유 후보만으로는 막지 않는다' 로 바뀌었기 때문이다.
 check("★confirm_shared 를 무조건 True 로 보내지 않는다",
       "shared_ok = True" not in APP and "confirm_shared=bool(shared_ok)" not in APP)
-check("★후보가 있을 때만 confirm_shared 가 간다(= 사용자가 보고 누른 경우)",
-      "confirm_shared=bool(_need)" in APP)
-check("★후보가 있으면 **한 번 더 눌러야** 실행된다(2단계)",
-      "_need and not _ready" in APP
-      and "st.session_state[_ckey] = True" in APP)
-check("  1단계 버튼은 '확인' 이고 2단계에서 실행된다",
-      "영향 범위를 확인했습니다 — 계속" in APP)
-check("  확인 상태는 계정마다 따로 기억한다(다른 계정에 번지지 않는다)",
-      '_ckey = f"_logout_ok_{aid or lid}"' in APP)
-check("  실행하면 확인 상태를 지운다(다음에 또 묻는다)",
-      "st.session_state.pop(_ckey, None)" in APP)
-check("  영향 범위를 **목록으로** 보여 준다",
-      "같은 네이버 계정일 수 있는 등록이" in APP and "login_id=" in APP)
-#  ★문구가 여러 줄로 쪼개져 있다 — 이어지는 조각으로 본다.
-check("  후보 조회가 실패해도 막지 않고 사실만 알린다",
-      "_peers_err" in APP and "같은 세션을 쓰는 등록이 있는지 **확인하지 " in APP
-      and "로그아웃을 막지는 " in APP)
-
-#  ★Agent 1.3.3 호환 — 그 설치본에는 **옛 차단 정책**이 들어 있다.
-#    화면이 보내는 `--confirm-shared` 로만 통과한다. 그래서 '후보를 못 봐서
-#    안 보냈는데 PC 는 막는' 경우가 **영구 차단**이 되면 안 된다.
-OLD_ALLOWED = """
-def logout_allowed_1_3_3(peers, mine, confirm_shared):
-    #  1.3.3 설치본의 판정을 그대로 옮긴 것(차단 분기 포함)
-    if not peers:
-        return True
-    odd = [p for p in peers if not (mine and p.get("login_id") == mine)]
-    allowed = not odd
-    return allowed or confirm_shared          # cmd_logout 의 통과 조건
-"""
-_ns: dict = {}
-exec(OLD_ALLOWED, _ns)
-old_ok = _ns["logout_allowed_1_3_3"]
-
-check("★[1.3.3] 후보 없음 → confirm 없이도 통과",
-      old_ok([], "me", False) is True)
-check("★[1.3.3] 후보 있고 login_id 같음 → confirm 없이도 통과",
-      old_ok([{"login_id": "me"}], "me", False) is True)
-check("★[1.3.3] 후보 있고 login_id 미등록 → confirm 없으면 **차단**",
-      old_ok([{"login_id": ""}], "me", False) is False)
-check("★[1.3.3] 그때 confirm 을 보내면 **통과**(화면 2단계가 이걸 보낸다)",
-      old_ok([{"login_id": ""}], "me", True) is True)
-check("★[1.3.3] login_id 가 서로 달라도 confirm 이면 통과",
-      old_ok([{"login_id": "other"}], "me", True) is True)
-
-check("★차단당한 뒤에는 화면이 **확인 단계를 연다**(영구 차단 방지)",
-      "_was_blocked = bool(_ver and _ver[0] == \"blocked\")" in APP
-      and "_need = bool(_peers) or _was_blocked" in APP)
-check("  차단 안내가 없어진 체크박스를 가리키지 않는다",
-      "'공유 세션 확인' 을 읽고 체크한 뒤" not in APP)
-check("  후보가 안 보이는데 막힌 경우 건수를 지어내지 않는다",
-      "PC 가 같은 세션을 쓰는 등록을 찾아 " in APP)
+check("★confirm_shared 를 아예 보내지 않는다(우회가 아니다)",
+      "confirm_shared=False" in APP and "confirm_shared=bool(_need)" not in APP)
+check("★추가 확인 버튼이 없다(한 번에 실행)",
+      "영향 범위를 확인했습니다" not in APP and "_logout_ok_" not in APP)
+check("  버튼은 하나뿐이다", APP.count('st.button("선택 계정 로그아웃"') == 1)
+check("  공유 영향은 **참고 문구**로만 보여 준다",
+      "같은 네이버 계정일 수 **있는** 등록" in APP)
+check("  후보 조회가 실패해도 그대로 진행한다고 알린다",
+      "로그아웃은 그대로 진행됩니다" in APP)
+check("  창을 닫으라고 안내한다", "창을 닫아" in APP)
+check("  타임아웃·중단 방법을 알려 준다",
+      "10분 안에 닫지" in APP and "진행 중인 작업" in APP)
 
 #  후보 목록은 화면이 직접 본다 — 원격(Supabase) 포함
 LA = APP[APP.index("def logout_peers("):APP.index("def logout_verdict(")]

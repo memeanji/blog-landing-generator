@@ -369,13 +369,19 @@ def cmd_logout(acc, log, hard: bool = False, confirm_shared: bool = False,
             return 1
         log(f"[로그아웃] 브라우저 종료 확인 — {why}")
 
+    #  ★확인이 **먼저**다(2026-11-05). 쿠키를 지우고 나서 확인하면 "지웠으니
+    #    로그아웃됐겠지" 와 구분이 안 된다. 창을 닫은 **그 상태 그대로** 프로필을
+    #    한 번 열어 보고, 그 결과를 판정 근거로 삼는다.
+    #    ※`_auto_login_recheck` 는 쿠키를 심지 않고 프로필만 연다 — 저장 세션
+    #      파일(state.json)을 쓰지 않으므로 순서를 바꿔도 결과가 달라지지 않는다.
+    #      다만 '검증 전에 초기화하지 않는다' 를 코드 순서로도 분명히 해 둔다.
+    auto = asyncio.run(_auto_login_recheck(acc, log))
+
     res = session_store.logout(acc, hard=hard)
     login_state.clear_auth_state(acc)
     log(f"[로그아웃] 로컬 초기화 — 지운 항목 {res['local_cleared'] or '없음'}"
         + (f" · 건너뜀 {res['skipped']}" if res["skipped"] else "")
         + f" · 프로필 {'보존' if res['profile_kept'] else '삭제'}")
-
-    auto = asyncio.run(_auto_login_recheck(acc, log))
     if lid:
         login_state.clear_logout_pending(lid)
 
