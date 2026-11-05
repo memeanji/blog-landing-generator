@@ -265,11 +265,22 @@ def cmd_logout(acc, log, hard: bool = False, confirm_shared: bool = False) -> in
     # ── 세션 공유 영향 범위 — 불분명하면 **하지 않는다** ──────────
     allowed, peers, why = login_state.logout_allowed(acc)
     if peers:
-        log(f"[로그아웃] 이 세션을 함께 쓰는 등록 {len(peers)}건:")
+        #  ★무엇이 영향을 받을 수 있는지 **빠짐없이** 적는다(2026-11-05).
+        #    `--confirm-shared` 로 넘어갈지 사람이 판단하는 근거가 이 목록이다.
+        #    세션(쿠키)이 있는 등록만 서버 로그아웃으로 실제로 끊긴다.
+        _live = [p for p in peers if p.get("has_session")]
+        log(f"[로그아웃] 영향받을 수 있는 등록 {len(peers)}건"
+            + (f" (그중 {len(_live)}건은 이 PC 에 세션이 저장돼 있습니다)"
+               if _live else "") + ":")
         for pr in peers:
+            _sess = (f"쿠키 {pr.get('cookies', 0)}개 저장됨"
+                     if pr.get("has_session") else "이 PC 에 세션 없음")
             log(f"           · {pr['label']} (id={pr['id']}, "
                 f"login_id={pr['login_id'] or '없음'}, 브랜드={pr['brand'] or '기본'}) "
-                f"— {pr['why']}")
+                f"— {pr['why']} · {_sess}")
+        log("           ★네이버 서버 로그아웃은 **같은 네이버 계정** 전체의 세션을 "
+            "끊습니다.")
+        log("             쿠키 폴더는 계정별로 분리돼 있어도 이 영향은 막지 못합니다.")
     if not allowed and not confirm_shared:
         log(f"[로그아웃] ❌ 중단 — {why}")
         log("           영향 범위를 확인하신 뒤 다시 실행해 주세요"

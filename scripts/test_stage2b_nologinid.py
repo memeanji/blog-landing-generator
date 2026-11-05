@@ -186,11 +186,28 @@ for acc in (A, NOID, B, NOID2, TAX):
                                     "value": "v"}],
                              blog_id=acc.blog_id or "")
 
+#  ★정책 변경 (2026-11-05 · 4-3 A안) — 예전에는 `blog_id` 를 보지 않아
+#    "같은 blog_id 라도 세션을 공유하지 않으면 바로 로그아웃 가능" 이었다.
+#    그런데 `_server_logout` 은 네이버 **서버** 세션을 끊고, 그건 같은 네이버
+#    계정 전체에 걸린다 — 쿠키 폴더가 분리돼 있어도 막지 못한다.
+#    그래서 같은 blog_id 를 **위험 후보**로 올리고, 로그인 계정이 같은지
+#    확인되지 않으면 막는다(모르면 막는다). 상세 검증은 stage10 에 있다.
 ok, peers, why = login_state.logout_allowed(NOID, path=ACCOUNTS)
-check("같은 blog_id 라도 **세션을 공유하지 않으면** 바로 로그아웃 가능",
-      ok and peers == [], f"공유 계정 {len(peers)}건")
-ok, peers, why = login_state.logout_allowed(A, path=ACCOUNTS)
-check("login_id 있는 계정도 공유 없으면 바로 가능", ok and peers == [])
+check("★같은 blog_id 인데 login_id 가 미등록이면 **막는다**(정책 변경)",
+      (not ok) and len(peers) == 1 and peers[0]["id"] == "seoyeon",
+      f"후보 {[q['id'] for q in peers]} · {why[:40]}")
+check("  사유에 blog_id 가 같다고 적힌다",
+      peers and "blog_id" in peers[0]["why"], peers[0]["why"][:46])
+check("  같은 계정이라고 단정하지 않는다(확인되지 않음)",
+      peers and "확인되지 않음" in peers[0]["why"])
+ok_a, peers_a, why_a = login_state.logout_allowed(A, path=ACCOUNTS)
+check("★login_id 가 있어도 상대가 미등록이면 막는다(한쪽만 알면 확인 불가)",
+      (not ok_a) and len(peers_a) == 1
+      and peers_a[0]["id"] == "tab_caa3dca8",
+      f"후보 {[q['id'] for q in peers_a]}")
+check("  blog_id 가 없는 계정은 후보로 묶지 않는다(빈 값끼리 묶이면 안 된다)",
+      login_state.logout_allowed(TAX, path=ACCOUNTS)[1] == [],
+      str(login_state.logout_allowed(TAX, path=ACCOUNTS)[1]))
 
 # ── profile_dir 로 같은 폴더를 가리키는 경우(공유) ─────────────────
 shared_rows = list(ROWS) + [{
@@ -202,20 +219,31 @@ SHARED.write_text(json.dumps({"accounts": shared_rows}, ensure_ascii=False),
                   encoding="utf-8")
 accounts.refresh()
 peers = login_state.session_peers(NOID, path=SHARED)
-check("같은 프로필 폴더를 쓰는 계정을 찾아낸다", len(peers) == 1
-      and peers[0]["id"] == "shared_other", str([p["id"] for p in peers]))
+_by = {q["id"]: q for q in peers}
+#  ★이제 후보가 둘이다 — `shared_other`(profile_dir 공유) + `seoyeon`(같은 blog_id).
+#    ①번 경로(profile_dir)가 그대로 동작하는지가 여기서 볼 것이다.
+check("같은 프로필 폴더를 쓰는 계정을 찾아낸다", "shared_other" in _by,
+      str(sorted(_by)))
 check("왜 공유로 보는지 사유가 붙는다",
-      "profile_dir" in peers[0]["why"], peers[0]["why"][:40])
+      "profile_dir" in _by.get("shared_other", {}).get("why", ""),
+      _by.get("shared_other", {}).get("why", "")[:40])
+check("  blog_id 경로가 profile_dir 사유를 덮어쓰지 않는다",
+      "blog_id" not in _by.get("shared_other", {}).get("why", ""))
+check("  같은 blog_id 인 계정도 함께 후보가 된다(2026-11-05)",
+      "seoyeon" in _by, str(sorted(_by)))
 ok, peers, why = login_state.logout_allowed(NOID, path=SHARED)
 check("로그인 계정이 같은지 확인되지 않으면 **금지**", not ok, why[:56])
 check("금지 사유에 영향 계정이 나열된다", "shared_other" in why)
-check("영향 범위 목록을 함께 돌려준다", len(peers) == 1)
+check("영향 범위 목록을 함께 돌려준다", len(peers) == 2,
+      f"{[q['id'] for q in peers]}")
 
 sess = (ROOT / "v2" / "session.py").read_text(encoding="utf-8")
 check("CLI 는 공유가 불분명하면 중단한다(--confirm-shared 없이는)",
       "logout_blocked" in sess and "shared_session_unverified" in sess)
 check("CLI 는 영향 범위를 로그에 먼저 적는다",
-      "이 세션을 함께 쓰는 등록" in sess)
+      "영향받을 수 있는 등록" in sess)
+check("  각 줄에 세션(쿠키) 보유 여부를 적는다(2026-11-05)",
+      "이 PC 에 세션 없음" in sess and "개 저장됨" in sess)
 check("사용자가 확인하면 진행한다",
       "confirm_shared" in sess and "영향 범위를 확인했습니다" in sess)
 app = (ROOT / "streamlit_app.py").read_text(encoding="utf-8")
@@ -226,8 +254,9 @@ check("화면이 '이 계정 전용 세션' 기준임을 안내한다",
       "이 계정 전용 세션" in app)
 check("내부 세션 폴더 이름은 화면에 노출하지 않는다(2026-09-17 결정)",
       "세션 폴더 `{aid}`" not in app)
-check("blog_id 를 쓰지 않는다고 화면에 적는다",
-      "blog_id 는 기준으로 쓰지 " in app)
+check("★화면이 blog_id 의 쓰임을 정확히 적는다(2026-11-05)",
+      "같은 네이버 계정일 수 있어" in app
+      and "단정하지는 않습니다" in app)
 accounts.refresh()
 
 

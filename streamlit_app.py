@@ -1541,9 +1541,11 @@ def render_account_tools(store_obj, brand, account, ready_info: dict,
                            "있음) — 로그아웃 대상을 고르지 않습니다.")
             elif not lid:
                 st.caption("※ login_id 가 등록되지 않은 계정이라 **이 계정 전용 "
-                           "세션**만 초기화합니다. blog_id 는 기준으로 쓰지 "
-                           "않습니다 — 같은 blog_id 에 다른 로그인 계정이 있을 수 "
-                           "있기 때문입니다.")
+                           "세션**만 초기화합니다. 다만 같은 blog_id 로 등록된 "
+                           "다른 계정이 있으면 **같은 네이버 계정일 수 있어** "
+                           "로그아웃을 먼저 막고 영향 범위를 보여 줍니다"
+                           "(2026-11-05). blog_id 만으로 같은 계정이라고 "
+                           "단정하지는 않습니다 — 확인은 login_id 로 합니다.")
             if device_id and not can_logout:
                 st.caption("※ 이 PC 의 Agent 가 "
                            f"{(device or {}).get('version') or '옛 버전'} 입니다 — "
